@@ -91,7 +91,7 @@ $(OBJ): | $(INGOT_LIB)
 # test_ingot needs no model: it pins the container-layer contract (block
 # geometry, dequant coverage) so a bad subtree update fails here and not
 # three modules later.
-TESTS := tests/test_ingot tests/test_inspect
+TESTS := tests/test_ingot tests/test_inspect tests/test_model
 
 tests/%: build/tests/%.o $(OBJ) $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)

@@ -28,6 +28,24 @@ extern "C" {
 /* Build string from `git describe`, informational. */
 const char *mynah_slm_version(void);
 
+/* ── loading a checkpoint ───────────────────────────────────────────────────
+ * Opaque handle; the internals live in src/model.h and are not part of the
+ * public surface. `mynah_slm_load` returns NULL on failure with the reason in
+ * `err` — nothing is written to stderr. */
+
+typedef struct mynah_slm_model mynah_slm_model_t;
+
+mynah_slm_model_t *mynah_slm_load(const char *path, char *err, size_t errsz);
+void               mynah_slm_free(mynah_slm_model_t *m);
+
+/* A read-only view of the architecture, for callers that want to size buffers
+ * or print a banner. Fields mirror src/model.h's config; the struct is opaque
+ * here on purpose, so accessors rather than layout. */
+const char *mynah_slm_arch(const mynah_slm_model_t *m);
+uint32_t    mynah_slm_n_layers(const mynah_slm_model_t *m);
+uint32_t    mynah_slm_n_ctx(const mynah_slm_model_t *m);
+uint32_t    mynah_slm_vocab_size(const mynah_slm_model_t *m);
+
 /* ── checkpoint introspection ───────────────────────────────────────────────
  * What is inside a checkpoint, before deciding whether we can run it. Backs
  * `mynah-slm inspect` and, later, the config extraction the loader needs. */
