@@ -13,17 +13,36 @@ Reproduce with `mynah-slm run ...`; every run prints its own line to stderr.
 ```
 $ mynah-slm run -m models-local/Qwen3-0.6B-Q4_K_M.gguf -p "Ciao! Come stai?" -n 24 --temp 0
 Ciao! Sto bene! Cosa ne hai?
-[load 0.02s | prompt 19 tok, prefill 25.0 tok/s | gen 12 tok, decode 24.0 tok/s | TTFT 802 ms | 8 threads]
+[load 0.02s | prompt 19 tok, prefill 28.9 tok/s | gen 12 tok, decode 27.1 tok/s | TTFT 697 ms | 8 threads]
 ```
 
-**24.0 tok/s decode, from 4.1 where this started** — 5.9x, in two steps that
-were found by measuring rather than by guessing:
+**27.1 tok/s decode, from 4.1 where this started** — 6.6x, in steps that were
+each found by measuring rather than by guessing:
 
 | | decode tok/s | TTFT |
 |---|---|---|
 | single-threaded, stock ingot | 4.1 | 5680 ms |
 | + threading (8) | 14.6 | 1326 ms |
-| + fused Q6_K kernel upstreamed to ingot | **24.0** | **802 ms** |
+| + fused Q6_K kernel (ingot) | 24.0 | 802 ms |
+| + fused Q4_K kernel (ingot) | **27.1** | **697 ms** |
+
+The last two were the same bug in two places, and the second only became
+visible once the first was fixed: Q6_K went from 2.8x slower per element than
+Q4_K to nearly 2x faster, which is what made Q4_K worth looking at at all.
+
+### The pattern, twice
+
+Both kernels decoded a super-block into a 256-float scratch array and then
+dotted it — 1 KB written and re-read per block. Q6_K did it for every row
+(it had no kernel of its own at all and fell through to the shared
+decode-then-dot helper). Q4_K's "dual" kernel did it for half of them: two rows
+per iteration, but only the second went straight into accumulators, and the
+fused path it needed already existed in the same file, used only for the odd
+tail row.
+
+Neither showed up as a missing kernel, because `ingot_has_kernel()` answered 1
+for Q4_K and Q6_K alike. What exposed it was a per-tensor measurement showing
+Q6_K moving 1.46x the bytes of Q4_K in 2.84x the time.
 
 ### Threading scales as measured, not as hoped
 
@@ -68,12 +87,12 @@ other. Clean under ThreadSanitizer.
 Per-matvec, averaged over repeated calls, weights warm, **single-threaded** —
 these are the ratios threading then divides, and they still hold:
 
-| tensor | type | shape | per call | throughput |
+| tensor | type | shape | before | after |
 |---|---|---|---|---|
-| `attn_q` | Q4_K | 2048 x 1024 | 0.65 ms | 3.20 G elem/s |
-| `ffn_up` | Q4_K | 3072 x 1024 | 0.87 ms | 3.60 G elem/s |
-| `ffn_down` | Q6_K | 1024 x 3072 | 2.47 ms | 1.27 G elem/s |
-| **`lm_head`** (= `token_embd`, tied) | Q6_K | **151936 x 1024** | **126.75 ms** | 1.23 G elem/s |
+| `attn_q` | Q4_K | 2048 x 1024 | 0.55 ms | **0.46 ms** |
+| `ffn_up` | Q4_K | 3072 x 1024 | 0.84 ms | **0.70 ms** |
+| `ffn_down` | Q6_K | 1024 x 3072 | 2.47 ms | **0.54 ms** |
+| **`lm_head`** (= `token_embd`, tied) | Q6_K | **151936 x 1024** | 126.75 ms | **42.55 ms** |
 
 Adding it up: ~6.2 ms per layer x 28 layers = ~173 ms, plus ~127 ms for the LM
 head, gives ~300 ms per token — the 4.1 tok/s that was observed on one thread,
@@ -136,9 +155,17 @@ there". It is a real prerequisite now.
   parity gate's 1e-4 tolerance at layer 0, so the parity path must keep using
   the exact twins or `INGOT_SDOT=0`. **Not yet wired** — noting it before it
   becomes a confusing test failure.
-- **SIMD in our own kernels.** RMSNorm, RoPE, SwiGLU and attention are scalar.
-  They are not the bottleneck at these sizes, but they will matter once the
-  matvecs get faster.
+- **SIMD in our own kernels.** RMSNorm, RoPE, SwiGLU and attention are still
+  scalar. They were not the bottleneck when a decode step was 300 ms; now that
+  it is ~37 ms they are a larger share, and this is the next thing to measure
+  rather than assume.
+- **Q4_0 has a kernel now** (NEON + AVX2, 7-10x over the generic path), which
+  changes nothing for Qwen3 — it is Q4_K/Q6_K — and everything for Gemma 4,
+  whose QAT checkpoints ship as Q4_0. Untested end to end until that model is
+  downloaded.
+- **x86 is compile-verified only.** `make check-x86` in ingot passes at
+  AVX2+F16C and AVX-512, but this machine is aarch64: the AVX2 paths have never
+  executed. That is a limitation, not a claim.
 
 ## Method notes
 
