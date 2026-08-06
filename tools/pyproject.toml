@@ -1,0 +1,26 @@
+[project]
+name = "mynah-slm-tools"
+version = "0.1.0"
+description = "Offline tooling for mynah-slm: the numpy oracle, converters, eval. Never required at inference time."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    # Reads GGUF and dequantizes the K-quants. Same files the C engine reads,
+    # on purpose: when the oracle and the engine consume identical weights, a
+    # numeric mismatch is our bug and not a quantization difference.
+    "gguf>=0.10",
+    # HF tokenizers, used as the ground truth our C tokenizer must match.
+    "tokenizers>=0.20",
+]
+
+[project.optional-dependencies]
+# Only for proving the ORACLE itself right against transformers. Never needed
+# to run the oracle, and never installed in CI.
+check = [
+    "torch>=2.4",
+    "transformers>=4.51",
+    "safetensors>=0.4",
+]
+
+[tool.uv]
+package = false
