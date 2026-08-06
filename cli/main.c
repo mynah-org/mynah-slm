@@ -15,7 +15,9 @@ static void usage(FILE *f) {
         "mynah-slm %s — CPU-first SLM inference engine\n"
         "\n"
         "usage:\n"
-        "  mynah-slm inspect <model.gguf>   what is inside a checkpoint\n"
+        "  mynah-slm inspect <model.gguf>            per-type census\n"
+        "  mynah-slm inspect <model.gguf> --tensors  ... plus every tensor\n"
+        "  mynah-slm inspect <model.gguf> --tensors Q6_K   ... only that type\n"
         "  mynah-slm --version\n"
         "\n"
         "Weights live on the NAS (models/ is a symlink); see CLAUDE.md.\n",
@@ -30,7 +32,17 @@ static void human(uint64_t bytes, char *buf, size_t n) {
     snprintf(buf, n, "%.1f %s", v, unit[u]);
 }
 
-static int cmd_inspect(const char *path) {
+/* "[1024 x 151936]" — row-major, the way a model card writes it. */
+static void shape_str(const mynah_slm_tensor_info *t, char *buf, size_t n) {
+    size_t off = 0;
+    off += (size_t)snprintf(buf + off, n - off, "[");
+    for (uint32_t d = 0; d < t->rank && off < n; d++)
+        off += (size_t)snprintf(buf + off, n - off, "%s%llu",
+                                d ? " x " : "", (unsigned long long)t->shape[d]);
+    if (off < n) snprintf(buf + off, n - off, "]");
+}
+
+static int cmd_inspect(const char *path, int list_tensors, const char *only_type) {
     mynah_slm_report r;
     char err[256];
 
@@ -62,6 +74,26 @@ static int cmd_inspect(const char *path) {
     }
     printf("\n");
 
+    if (list_tensors) {
+        uint64_t shown_bytes = 0;
+        size_t   shown = 0;
+        printf("  %-34s %-6s %-22s %10s\n", "tensor", "type", "shape", "size");
+        for (size_t i = 0; i < r.n_tensor_info; i++) {
+            const mynah_slm_tensor_info *t = &r.tensors[i];
+            if (only_type && strcmp(t->type_name, only_type) != 0) continue;
+            char shape[64], sz[32];
+            shape_str(t, shape, sizeof shape);
+            human(t->nbytes, sz, sizeof sz);
+            printf("  %-34s %-6s %-22s %10s\n", t->name, t->type_name, shape, sz);
+            shown_bytes += t->nbytes;
+            shown++;
+        }
+        char sub[32];
+        human(shown_bytes, sub, sizeof sub);
+        printf("\n  %zu tensors listed, %s (%.1f%% of the file)\n\n", shown, sub,
+               r.total_bytes ? 100.0 * (double)shown_bytes / (double)r.total_bytes : 0.0);
+    }
+
     if (!r.runnable)
         printf("  NOT RUNNABLE: at least one type above has no decoder.\n");
 
@@ -82,7 +114,19 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[1], "inspect")) {
         if (argc < 3) { fprintf(stderr, "mynah-slm: inspect needs a path\n"); return 2; }
-        return cmd_inspect(argv[2]);
+        int list = 0;
+        const char *only = NULL;
+        for (int i = 3; i < argc; i++) {
+            if (!strcmp(argv[i], "--tensors")) {
+                list = 1;
+                /* an optional bare type name may follow */
+                if (i + 1 < argc && argv[i + 1][0] != '-') only = argv[++i];
+            } else {
+                fprintf(stderr, "mynah-slm: unknown option '%s'\n", argv[i]);
+                return 2;
+            }
+        }
+        return cmd_inspect(argv[2], list, only);
     }
 
     fprintf(stderr, "mynah-slm: unknown command '%s'\n", argv[1]);

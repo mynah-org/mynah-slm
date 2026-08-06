@@ -32,6 +32,23 @@ const char *mynah_slm_version(void);
  * What is inside a checkpoint, before deciding whether we can run it. Backs
  * `mynah-slm inspect` and, later, the config extraction the loader needs. */
 
+/* GGUF tensors are rank 4 at most (ggml's limit); this is our own constant so
+ * the public header never needs an ingot include. */
+#define MYNAH_SLM_MAX_RANK 4
+
+/* One tensor as stored. `shape` is ROW-MAJOR — ne reversed — which is what
+ * everything outside ggml expects, and what the config in a model card is
+ * written in. */
+typedef struct {
+    char        name[128];
+    int         type;          /* INGOT_TYPE_* */
+    const char *type_name;     /* static storage, safe to keep */
+    uint32_t    rank;
+    uint64_t    shape[MYNAH_SLM_MAX_RANK];
+    uint64_t    nelem;
+    uint64_t    nbytes;
+} mynah_slm_tensor_info;
+
 /* One row of the per-type census: how much of a checkpoint is stored in a
  * given ggml block type, and whether this build can actually use it. */
 typedef struct {
@@ -60,6 +77,11 @@ typedef struct {
     int                  runnable;     /* 0 when some tensor cannot be decoded */
     mynah_slm_type_use  *types;
     size_t               n_types;
+    /* Every tensor, in file order. Always filled — a few hundred KB even for a
+     * large checkpoint, and the name list is what the weight mapping is built
+     * from, so making it optional would only add a flag nobody passes. */
+    mynah_slm_tensor_info *tensors;
+    size_t                 n_tensor_info;
 } mynah_slm_report;
 
 /* Open a GGUF (single file or `-00001-of-000NN` split) and fill `out`.

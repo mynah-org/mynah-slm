@@ -66,6 +66,12 @@ int mynah_slm_inspect_gguf(mynah_slm_report *out, const char *path,
     out->n_kv         = ingot_gguf_kv_count(g);
     out->runnable     = 1;
 
+    out->tensors = calloc(out->n_tensors ? out->n_tensors : 1, sizeof *out->tensors);
+    if (!out->tensors) {
+        ingot_gguf_close(g);
+        return fail(err, errsz, "out of memory listing tensors");
+    }
+
     uint64_t total_elems = 0;
     for (size_t i = 0; i < out->n_tensors; i++) {
         const ingot_tensor *t = ingot_gguf_at(g, i);
@@ -75,6 +81,19 @@ int mynah_slm_inspect_gguf(mynah_slm_report *out, const char *path,
             mynah_slm_report_free(out);
             return fail(err, errsz, "out of memory building the type census");
         }
+
+        mynah_slm_tensor_info *info = &out->tensors[out->n_tensor_info++];
+        strncpy(info->name, t->name, sizeof info->name - 1);
+        info->type      = t->type;
+        info->type_name = ingot_type_name(t->type);
+        info->rank      = t->rank < MYNAH_SLM_MAX_RANK ? t->rank : MYNAH_SLM_MAX_RANK;
+        info->nelem     = t->nelem;
+        info->nbytes    = t->nbytes;
+        /* ne is ggml order (fastest first); reverse it so callers read the
+         * shape the way the model card writes it. */
+        for (uint32_t d = 0; d < info->rank; d++)
+            info->shape[d] = t->ne[info->rank - 1 - d];
+
         row->tensors++;
         row->elements += t->nelem;
         row->bytes    += t->nbytes;
@@ -98,6 +117,9 @@ int mynah_slm_inspect_gguf(mynah_slm_report *out, const char *path,
 void mynah_slm_report_free(mynah_slm_report *r) {
     if (!r) return;
     free(r->types);
-    r->types   = NULL;
-    r->n_types = 0;
+    free(r->tensors);
+    r->types         = NULL;
+    r->n_types       = 0;
+    r->tensors       = NULL;
+    r->n_tensor_info = 0;
 }

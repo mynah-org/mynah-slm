@@ -129,6 +129,31 @@ int main(void) {
     if (r.bits_per_weight <= 4.5 || r.bits_per_weight >= 8.0)
         fail("bits_per_weight", "outside the plausible range for this mix");
 
+    /* ── the tensor list ────────────────────────────────────────────────── */
+    printf("\n-- tensor list --\n");
+    if (r.n_tensor_info != r.n_tensors) fail("tensor list", "length != n_tensors");
+
+    const mynah_slm_tensor_info *down = NULL;
+    for (size_t i = 0; i < r.n_tensor_info; i++)
+        if (strcmp(r.tensors[i].name, "blk.0.ffn_down.weight") == 0)
+            down = &r.tensors[i];
+
+    if (!down) {
+        fail("tensor list", "blk.0.ffn_down.weight is missing");
+    } else {
+        printf("ok   %s %s [%llu x %llu]\n", down->name, down->type_name,
+               (unsigned long long)down->shape[0], (unsigned long long)down->shape[1]);
+        if (down->type != INGOT_TYPE_Q6_K) fail("ffn_down type", "expected Q6_K");
+        if (down->rank != 2)               fail("ffn_down rank", "expected 2");
+        /* Written with ne = {512, 256} in ggml order (fastest first), so a
+         * row-major reader must see {256, 512}. Getting this backwards is a
+         * transposed weight matrix and a model that produces fluent nonsense,
+         * which is exactly the kind of bug that is expensive to find later. */
+        if (down->shape[0] != 256 || down->shape[1] != 512)
+            fail("ffn_down shape", "ne was not reversed into row-major order");
+        if (down->nelem != 256 * 512) fail("ffn_down nelem", "wrong element count");
+    }
+
     mynah_slm_report_free(&r);
     unlink(path);
 

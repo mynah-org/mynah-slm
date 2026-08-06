@@ -41,10 +41,10 @@ dominated by things that are not 4-bit.
 
 > **Open question for M1.** Which 29 tensors are they? 28 layers + 1 suggests
 > "one per layer plus the embedding", but the census counts types, not names,
-> so this is arithmetic and not evidence. Resolve it while building the
-> GGUF⇄safetensors name map — and if the embedding really is 167 MiB of a
-> 372 MiB file, then embedding quantization, not weight quantization, is where
-> the size budget actually lives.
+> so this is arithmetic and not evidence. `mynah-slm inspect <file> --tensors
+> Q6_K` now answers it in one command — **it has not been run yet**, because the
+> NAS dropped its SMB authentication right after the census was taken. Run it
+> and replace this box with the answer.
 
 ### `Qwen3-0.6B-Q8_0.gguf` — the parity build
 
@@ -91,6 +91,31 @@ The QAT checkpoint is plain **`Q4_0`**, which ingot decodes but only through its
 *generic* kernel. See TASKS.md 0.4: the fast NEON kernel already exists in
 qwen-tts and needs porting upstream into ingot before this model's performance
 means anything.
+
+---
+
+### The size budget is in the lookup tables
+
+Derived from `text_config`, to be confirmed against the file. With
+`vocab_size_per_layer_input: 262144`, `hidden_size_per_layer_input: 256` and 35
+layers, the Per-Layer Embedding tables are
+
+```
+262144 × 256 × 35  ≈  2.35 B parameters
+```
+
+plus a `262144 × 1536` ≈ 0.4 B main embedding. That is ~2.75 B of the 5.1 B
+total, and it lands exactly on the "5.1 B total / 2.3 B effective" split the
+model card advertises — which is a good sign the derivation is right.
+
+So the majority of this checkpoint is **lookup tables, not GEMM operands**.
+They are read, never multiplied: no kernel, no accumulation error, just bytes.
+That makes them both the largest and the cheapest thing to quantize hard, and
+it inverts the inherited `mynah-asr` rule of keeping embeddings f32 — a rule
+that was correct for a 0.6B encoder with a small vocabulary.
+
+First thing to check once the file is on disk: does the shipped QAT GGUF
+already quantize its PLE tables, or leave them wide?
 
 ---
 
