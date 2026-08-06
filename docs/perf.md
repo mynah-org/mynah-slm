@@ -1,7 +1,8 @@
 # Performance — measured, not estimated
 
 All numbers from an M-series Mac, weights **staged locally** (`scripts/use_model.sh`),
-`Qwen3-0.6B-Q4_K_M.gguf`, single-threaded, `-O3 -march=native`, no `-ffast-math`.
+`Qwen3-0.6B-Q4_K_M.gguf`, `-O3 -march=native`, no `-ffast-math`. Thread count is
+stated per measurement — it is never implied.
 
 Reproduce with `mynah-slm run ...`; every run prints its own line to stderr.
 
@@ -58,11 +59,8 @@ other. Clean under ThreadSanitizer.
 
 ## Where the remaining time goes
 
-Measured before threading; the ratios still hold.
-
-## Where the time goes
-
-Per-matvec, averaged over repeated calls, weights warm:
+Per-matvec, averaged over repeated calls, weights warm, **single-threaded** —
+these are the ratios threading then divides, and they still hold:
 
 | tensor | type | shape | per call | throughput |
 |---|---|---|---|---|
@@ -72,12 +70,15 @@ Per-matvec, averaged over repeated calls, weights warm:
 | **`lm_head`** (= `token_embd`, tied) | Q6_K | **151936 x 1024** | **126.75 ms** | 1.23 G elem/s |
 
 Adding it up: ~6.2 ms per layer x 28 layers = ~173 ms, plus ~127 ms for the LM
-head, gives ~300 ms per token — which is the 4.1 tok/s observed, so nothing
-significant is hiding elsewhere.
+head, gives ~300 ms per token — the 4.1 tok/s that was observed on one thread,
+so nothing significant was hiding elsewhere.
 
 Two findings, both actionable:
 
 ### 1. The LM head is 42% of a decode step, on its own
+
+Threading divides it but does not change its share, so this stays the largest
+single item.
 
 One matvec, 151936 x 1024, every single token. This is the concrete cost of the
 tied embedding noted in `docs/models.md`: it is not a lookup table, it is the
