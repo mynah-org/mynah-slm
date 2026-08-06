@@ -5,9 +5,12 @@
  * `chat` at all.
  *
  * SPDX-License-Identifier: MIT */
+#include "model.h"
 #include "mynah_slm.h"
+#include "tokenizer.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static void usage(FILE *f) {
@@ -19,6 +22,7 @@ static void usage(FILE *f) {
         "  mynah-slm inspect <model.gguf> --tensors  ... plus every tensor\n"
         "  mynah-slm inspect <model.gguf> --tensors Q6_K   ... only that type\n"
         "  mynah-slm inspect <model.gguf> --meta     ... plus the metadata KV\n"
+        "  mynah-slm tokenize -m <model.gguf> [--special] < text\n"
         "  mynah-slm --version\n"
         "\n"
         "Weights live on the NAS (models/ is a symlink); see CLAUDE.md.\n",
@@ -110,6 +114,57 @@ static int cmd_inspect(const char *path, int list_tensors, const char *only_type
     return r.runnable ? 0 : 1;
 }
 
+/* Read all of stdin. Returns NULL on failure; caller frees. */
+static char *slurp(void) {
+    size_t cap = 4096, n = 0;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    for (;;) {
+        if (n + 1 >= cap) {
+            cap *= 2;
+            char *grown = realloc(buf, cap);
+            if (!grown) { free(buf); return NULL; }
+            buf = grown;
+        }
+        const size_t got = fread(buf + n, 1, cap - n - 1, stdin);
+        n += got;
+        if (got == 0) break;
+    }
+    buf[n] = '\0';
+    return buf;
+}
+
+/* Token ids for the text on stdin, one per line. Deliberately machine-readable:
+ * tools/eval/fuzz_tokenizer.py drives it against HF as an oracle. */
+static int cmd_tokenize(const char *model_path, int parse_special) {
+    char err[256];
+    mynah_slm_model_t *m = mynah_slm_load(model_path, err, sizeof err);
+    if (!m) { fprintf(stderr, "mynah-slm: %s\n", err); return 1; }
+
+    mynah_slm_tokenizer *tok = mynah_slm_tokenizer_load(m->gguf, err, sizeof err);
+    if (!tok) { fprintf(stderr, "mynah-slm: %s\n", err); mynah_slm_free(m); return 1; }
+
+    char *text = slurp();
+    if (!text) { fprintf(stderr, "mynah-slm: cannot read stdin\n"); return 1; }
+
+    const long n = mynah_slm_tokenize(tok, text, parse_special, NULL, 0);
+    int rc = 0;
+    if (n < 0) { fprintf(stderr, "mynah-slm: tokenize failed\n"); rc = 1; }
+    else {
+        uint32_t *ids = malloc((size_t)(n ? n : 1) * sizeof *ids);
+        if (!ids) rc = 1;
+        else {
+            mynah_slm_tokenize(tok, text, parse_special, ids, (size_t)n);
+            for (long i = 0; i < n; i++) printf("%u\n", ids[i]);
+            free(ids);
+        }
+    }
+    free(text);
+    mynah_slm_tokenizer_free(tok);
+    mynah_slm_free(m);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { usage(stderr); return 2; }
 
@@ -120,6 +175,17 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
         usage(stdout);
         return 0;
+    }
+    if (!strcmp(argv[1], "tokenize")) {
+        const char *model = NULL;
+        int special = 0;
+        for (int i = 2; i < argc; i++) {
+            if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
+            else if (!strcmp(argv[i], "--special")) special = 1;
+            else { fprintf(stderr, "mynah-slm: unknown option '%s'\n", argv[i]); return 2; }
+        }
+        if (!model) { fprintf(stderr, "mynah-slm: tokenize needs -m <model.gguf>\n"); return 2; }
+        return cmd_tokenize(model, special);
     }
     if (!strcmp(argv[1], "inspect")) {
         if (argc < 3) { fprintf(stderr, "mynah-slm: inspect needs a path\n"); return 2; }
