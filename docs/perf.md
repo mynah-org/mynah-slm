@@ -13,11 +13,17 @@ Reproduce with `mynah-slm run ...`; every run prints its own line to stderr.
 ```
 $ mynah-slm run -m models-local/Qwen3-0.6B-Q4_K_M.gguf -p "Ciao! Come stai?" -n 24 --temp 0
 Ciao! Sto bene! Cosa ne hai?
-[load 0.02s | prompt 19 tok, prefill 15.1 tok/s | gen 12 tok, decode 14.6 tok/s | TTFT 1326 ms | 8 threads]
+[load 0.02s | prompt 19 tok, prefill 25.0 tok/s | gen 12 tok, decode 24.0 tok/s | TTFT 802 ms | 8 threads]
 ```
 
-**14.6 tok/s decode, up from 4.1 single-threaded.** Still short of what this
-model should do here, but no longer in a different category.
+**24.0 tok/s decode, from 4.1 where this started** — 5.9x, in two steps that
+were found by measuring rather than by guessing:
+
+| | decode tok/s | TTFT |
+|---|---|---|
+| single-threaded, stock ingot | 4.1 | 5680 ms |
+| + threading (8) | 14.6 | 1326 ms |
+| + fused Q6_K kernel upstreamed to ingot | **24.0** | **802 ms** |
 
 ### Threading scales as measured, not as hoped
 
@@ -91,16 +97,34 @@ from one tensor. Whether that costs output quality is exactly what M5b has to
 measure; it sits in front of the softmax that picks the token, so the answer is
 not obvious in either direction.
 
-### 2. ingot's Q6_K matvec is 2.8x slower per element than Q4_K
+### 2. ingot's Q6_K matvec was 2.8x slower per element than Q4_K — FIXED upstream
 
-`ffn_up` (Q4_K) and `ffn_down` (Q6_K) are the same shape. Q6_K moves 1.46x the
-bytes and takes 2.84x the time, so it is not bandwidth — the kernel is leaving
-something on the table. `ingot_has_kernel()` reports 1 for both, so this is not
-the generic fallback path either.
+`ffn_up` (Q4_K) and `ffn_down` (Q6_K) are the same shape, yet Q6_K moved 1.46x
+the bytes and took 2.84x the time. Not bandwidth, then. `ingot_has_kernel()`
+reported 1 for both, which is what hid it: Q6_K had no kernel of its own at all
+and fell through to dequantize-into-a-256-float-scratch-then-dot, with a scalar
+decode loop. Q4_K and Q5_K both had hand-written NEON paths; Q6_K did not.
 
-Since Q6_K carries **45% of a Q4_K_M checkpoint** (`docs/models.md`), that gap
-is worth chasing, and it belongs **upstream in ingot** rather than here — the
-same rule that sends the missing Q4_0 NEON kernel there (TASKS 0.4).
+Fixed in ingot (`Q6_K: fused NEON matvec`), decoding straight into the
+accumulator and hoisting the scale multiply out of the element loop — each run
+of 16 outputs shares one scale:
+
+| | before | after | |
+|---|---|---|---|
+| `ffn_down` `[1024 x 3072]` | 2.47 ms | **0.54 ms** | 4.6x |
+| `lm_head` `[151936 x 1024]` | 126.75 ms | **43.96 ms** | 2.9x |
+
+Q6_K now runs at 5.87 G elem/s against Q4_K's ~2.9, i.e. faster per element
+than the type it was 2.8x behind. Correctness rests on ingot's own suite, which
+already checks every format's matvec against its own dequant; cross-checked
+separately against `ingot_dequant_matrix` at 6.7e-08 relative error, and the
+engine's 1e-6 parity gate is unchanged.
+
+**A build bug hid the win for one measurement.** `$(INGOT_LIB)` was only an
+order-only prerequisite, so the rebuilt archive did not relink the binaries:
+end-to-end tok/s did not move at all while the microbenchmark showed 2.9x,
+which reads as "the kernel does not matter" rather than "the kernel is not
+there". It is a real prerequisite now.
 
 ## What has not been done yet
 

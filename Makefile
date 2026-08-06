@@ -76,12 +76,17 @@ help:
 	@echo "  update-ingot refresh the vendored ingot subtree"
 	@echo "  install      PREFIX=$(PREFIX)"
 
-mynah-slm: $(OBJ) build/cli/main.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+# $(INGOT_LIB) is a real prerequisite, not just order-only. Without it a
+# `make update-ingot` (or any local ingot change) rebuilds the archive and
+# leaves every binary linked against the PREVIOUS one — silently. Cost an
+# entire benchmark that showed a 2.9x kernel win producing no end-to-end
+# change, which looked like the kernel being irrelevant rather than absent.
+mynah-slm: $(OBJ) build/cli/main.o $(INGOT_LIB)
+	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
 SERVER_OBJ := build/server/main.o build/server/http.o build/server/json.o
-mynah-slm-server: $(OBJ) $(SERVER_OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+mynah-slm-server: $(OBJ) $(SERVER_OBJ) $(INGOT_LIB)
+	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
 build/server/%.o: server/%.c $(HDR) $(wildcard server/*.h)
 	@mkdir -p $(@D)
