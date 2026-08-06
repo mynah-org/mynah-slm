@@ -39,12 +39,44 @@ at Q6_K account for **45% of the file**. A "4-bit" checkpoint of this model is
 nowhere near 4 bits, because a 0.6B model with a 151936-entry vocabulary is
 dominated by things that are not 4-bit.
 
-> **Open question for M1.** Which 29 tensors are they? 28 layers + 1 suggests
-> "one per layer plus the embedding", but the census counts types, not names,
-> so this is arithmetic and not evidence. `mynah-slm inspect <file> --tensors
-> Q6_K` now answers it in one command — **it has not been run yet**, because the
-> NAS dropped its SMB authentication right after the census was taken. Run it
-> and replace this box with the answer.
+**Which 29 tensors** (`inspect --tensors Q6_K`, answered 2026-08-06 — the
+"28 layers + 1" guess was wrong):
+
+| what | count | size |
+|---|---|---|
+| `token_embd.weight` `[151936 x 1024]` | 1 | **121.7 MiB — 32.7% of the file** |
+| `blk.N.ffn_down.weight` `[1024 x 3072]` | 14 | 2.5 MiB each |
+| `blk.N.attn_v.weight` `[1024 x 1024]` | 14 | 840 KiB each |
+
+The layer indices are 0, 1, 2, 5, 8, 11, 14, 17, 20, 23, 24, 25, 26, 27 — the
+llama.cpp `Q4_K_M` heuristic, which bumps `attn_v` and `ffn_down` on the first
+and last few layers plus every third one in between. Fourteen of twenty-eight.
+
+Everything else is `Q4_K`; the 113 F32 tensors are the norms, including
+`attn_q_norm` / `attn_k_norm` at `[128]` = head_dim, which is the per-head
+QK-RMSNorm confirmed on the real file rather than read off a config.
+
+### The embedding is the LM head — do not quantize it like a lookup table
+
+There is **no `output.weight` tensor** in this checkpoint. `tie_word_embeddings`
+is true, so `token_embd.weight` is used twice: as the input lookup *and* as the
+output projection.
+
+That matters, and it corrects an assumption worth stating plainly because the
+opposite is true for Gemma. An embedding table that is only ever *indexed* costs
+no kernel and no accumulation error, so it is cheap to quantize hard. A **tied**
+embedding is not that: it is multiplied against all 151936 rows on every single
+decode step. It is simultaneously
+
+- the largest single tensor (a third of the file), and
+- the hottest GEMV in the decode loop, and
+- directly in front of the softmax that picks the token.
+
+Which is exactly why llama.cpp leaves it at Q6_K while pushing the rest to Q4_K,
+and why a naive "quantize the big tables harder" pass would trade a third of the
+file size against output quality at the worst possible place. Measure this one
+per model; do not generalize it from Gemma's PLE tables, which really are
+lookup-only.
 
 ### `Qwen3-0.6B-Q8_0.gguf` — the parity build
 
