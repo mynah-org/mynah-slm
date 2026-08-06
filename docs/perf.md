@@ -155,10 +155,7 @@ there". It is a real prerequisite now.
   parity gate's 1e-4 tolerance at layer 0, so the parity path must keep using
   the exact twins or `INGOT_SDOT=0`. **Not yet wired** — noting it before it
   becomes a confusing test failure.
-- **SIMD in our own kernels.** RMSNorm, RoPE, SwiGLU and attention are still
-  scalar. They were not the bottleneck when a decode step was 300 ms; now that
-  it is ~37 ms they are a larger share, and this is the next thing to measure
-  rather than assume.
+- **SIMD in our own kernels: measured, and mostly not worth it.** See below.
 - **Q4_0 has a kernel now** (NEON + AVX2, 7-10x over the generic path), which
   changes nothing for Qwen3 — it is Q4_K/Q6_K — and everything for Gemma 4,
   whose QAT checkpoints ship as Q4_0. Untested end to end until that model is
@@ -166,6 +163,57 @@ there". It is a real prerequisite now.
 - **x86 is compile-verified only.** `make check-x86` in ingot passes at
   AVX2+F16C and AVX-512, but this machine is aarch64: the AVX2 paths have never
   executed. That is a limitation, not a claim.
+
+## The scalar kernels: one of them mattered, four did not
+
+The note here used to say our own kernels "will matter once the matvecs get
+faster". Measured, at a 19-token prompt, per token, single-threaded:
+
+| kernel | calls/token | per token |
+|---|---|---|
+| attention | 28 | 1.306 ms |
+| SwiGLU | 28 | 0.193 ms |
+| RMSNorm (plain + per-head) | 113 | 0.122 ms |
+| RoPE | 56 | 0.008 ms |
+| residual add | 56 | 0.004 ms |
+| **total non-matvec** | | **1.632 ms** |
+
+Against ~120 ms of matvec on one thread, that is **1.4%**. Vectorizing RMSNorm,
+RoPE or SwiGLU would have been effort spent on a rounding error.
+
+**Attention is the exception, and only because it grows with the context.**
+Per token across 28 layers, single-threaded:
+
+| n_kv | scalar | SIMD | share of a 37 ms step (scalar) |
+|---|---|---|---|
+| 32 | 1.42 ms | 0.47 ms | 4% |
+| 128 | 5.06 ms | 2.31 ms | 14% |
+| 512 | 20.17 ms | 5.97 ms | 55% |
+| 2048 | 106.18 ms | 41.43 ms | 287% |
+| 8192 | 564.27 ms | 299.07 ms | 1525% |
+
+Every benchmark above this section used a 19-token prompt — precisely where
+attention does not show. Summarizing a meeting transcript, which is what the
+ASR→SLM→TTS pipeline exists for, is a 2000-token prompt, where scalar attention
+costs nearly three times everything else combined.
+
+End to end, interleaved A/B, 60 generated tokens:
+
+| | prefill | decode |
+|---|---|---|
+| n_kv ~19, SIMD vs scalar | — | 27.1 vs 27.1 tok/s |
+| n_kv ~1189, SIMD | 22.7 / 22.5 | **20.5 / 19.7** tok/s |
+| n_kv ~1189, scalar | 20.9 / 20.7 | 17.1 / 16.2 tok/s |
+
+About +9% prefill and +20% decode at long context, nothing at short — which is
+what the profile predicted.
+
+**A caution about how that was nearly got wrong.** The first end-to-end A/B was
+a single non-interleaved run of 30 tokens, and it said SIMD was 11% SLOWER in
+decode. That was noise on a machine warm from an hour of benchmarking. Two
+interleaved runs of 60 tokens reversed it consistently. Measure differences,
+interleaved, with a sample big enough to survive the thermal state — a single
+number here would have led to reverting a real improvement.
 
 ## Method notes
 
