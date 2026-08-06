@@ -1,0 +1,10 @@
+# reference/ holds configs and tokenizer files extracted verbatim from upstream
+# checkpoints: vendored, not part of the runtime. Without this GitHub counts them
+# as project source and mislabels the repo's language.
+reference/** linguist-vendored
+
+# third_party/ingot is a vendored subtree, not code written here.
+third_party/** linguist-vendored
+
+# tools/ is offline Python tooling: never required at inference time.
+tools/** linguist-vendored

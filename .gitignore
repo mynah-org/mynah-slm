@@ -1,0 +1,63 @@
+# Local planning notes and agent instructions (not part of the public repo)
+PLAN.md
+TASKS.md
+TODO.md
+CLAUDE.md
+AGENTS.md
+PERF-LOG.md
+plan_*.md
+analisi_*.md
+audit_*.md
+
+# Build artifacts
+*.o
+*.d
+*.a
+*.so
+*.dylib
+*.dSYM/
+build/
+dist/
+mynah-slm
+mynah-slm-server
+examples/minimal
+tests/test_*
+!tests/test_*.c
+!tests/test_*.h
+bench_*
+!bench_*.c
+
+# Models & weights: never committed.
+# NB: no trailing slash — `models` is a SYMLINK to /Volumes/shared/mynah-slm/models
+# (the NAS), and `models/` would only match a real directory. Same gotcha as qwen-tts.
+models
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+*.npy
+
+# Golden dumps: derived from model+prompt, regenerable with `make golden-dump`
+tests/golden/
+
+# Python (offline tooling only)
+.venv/
+tools/.venv/
+__pycache__/
+*.py[cod]
+
+# Local-only infra/dev scripts (private LAN, never commit)
+scripts/local_*
+server_stderr.log
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+.claude/
+node_modules/
+package-lock.json
+
+# Reference PDFs and papers: stay local
+*.pdf
