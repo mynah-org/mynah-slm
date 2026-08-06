@@ -14,6 +14,7 @@
 #include "model.h"
 #include "mynah_slm.h"
 #include "npy.h"
+#include "threads.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -130,7 +131,12 @@ int main(int argc, char **argv) {
     st.on_final     = on_final;
     st.on_layer_ctx = &cap;
 
-    printf("running %u tokens through %s\n", seq, model_path);
+    /* Run the THREADED path. The whole bit-identical claim is worthless if the
+     * gate only ever sees one thread; MYNAH_SLM_THREADS=1 forces the serial
+     * path for an A/B. */
+    const char *env = getenv("MYNAH_SLM_THREADS");
+    const int nth = mynah_slm_threads_init(env ? atoi(env) : 0);
+    printf("running %u tokens through %s (%d threads)\n", seq, model_path, nth);
     for (uint32_t t = 0; t < seq; t++) {
         cap.t = t;
         if (mynah_slm_forward(&st, tokens[t], cap.logits + (size_t)t * c->vocab_size) != 0) {
@@ -163,5 +169,6 @@ int main(int argc, char **argv) {
     mynah_slm_state_free(&st);
     mynah_slm_free(m);
     free(tokens);
+    mynah_slm_threads_shutdown();
     return rc;
 }

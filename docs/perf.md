@@ -7,20 +7,58 @@ Reproduce with `mynah-slm run ...`; every run prints its own line to stderr.
 
 ---
 
-## Where it stands: v0.1, correct and slow
+## Where it stands
 
 ```
-$ mynah-slm run -m models-local/Qwen3-0.6B-Q4_K_M.gguf -p "Ciao! Come stai?" -n 40 --temp 0
+$ mynah-slm run -m models-local/Qwen3-0.6B-Q4_K_M.gguf -p "Ciao! Come stai?" -n 24 --temp 0
 Ciao! Sto bene! Cosa ne hai?
-[load 0.04s | prompt 19 tok, prefill 3.5 tok/s | gen 12 tok, decode 4.1 tok/s | TTFT 5663 ms | 1 threads]
+[load 0.02s | prompt 19 tok, prefill 15.1 tok/s | gen 12 tok, decode 14.6 tok/s | TTFT 1326 ms | 8 threads]
 ```
 
-**4.1 tok/s decode.** That is roughly 30x off what this model should do on this
-machine, and it is stated here rather than buried because the engine's whole
-claim is that CPU is enough. Correctness came first on purpose — the forward
-pass matches the numpy oracle at 1e-6 — but this number is not shippable.
+**14.6 tok/s decode, up from 4.1 single-threaded.** Still short of what this
+model should do here, but no longer in a different category.
 
-The cause is not mysterious, and it was measured rather than guessed.
+### Threading scales as measured, not as hoped
+
+M-series, 4 performance + 4 efficiency cores:
+
+| threads | prefill tok/s | decode tok/s | TTFT | vs 1 thread |
+|---|---|---|---|---|
+| 1 | 3.5 | 4.1 | 5680 ms | 1.00x |
+| 2 | 8.1 | 7.6 | 2475 ms | 1.85x |
+| 4 | 13.8 | 12.9 | 1456 ms | 3.15x |
+| 6 | 14.8 | 14.3 | 1349 ms | 3.49x |
+| 8 | 15.1 | 14.6 | 1326 ms | **3.56x** |
+
+The plausible rule — "performance cores only, or the region waits on the slow
+ones" — turns out to be wrong on this machine: 4 threads give 12.9 and 8 give
+14.6, a further 13%. Counter-based claiming in `parallel_for` is what saves it
+(a slow core simply claims fewer chunks), which is also why chunks outnumber
+threads 4:1. The default is therefore every online core, and `-t N` is how you
+find out whether that holds on yours.
+
+### The threading is bit-identical, and that is checked
+
+Every parallel region writes to a disjoint output slice: matvec splits by row,
+attention splits by head with per-head scratch. Nothing reduces across threads,
+so no summation order changes.
+
+That is verified rather than asserted — the same parity dump, serial and
+threaded, compared against each other:
+
+```
+embed/layer0/layer13/layer27/final_norm/logits   rel=0.00e+00  absmax=0.00e+00
+argmax                                           19/19 positions agree
+```
+
+Exactly zero, not "within tolerance". `MYNAH_SLM_THREADS=1` forces the serial
+path so the A/B stays reproducible, and `tests/test_parity` runs threaded by
+default — a gate that only ever sees one thread would prove nothing about the
+other. Clean under ThreadSanitizer.
+
+## Where the remaining time goes
+
+Measured before threading; the ratios still hold.
 
 ## Where the time goes
 
@@ -65,9 +103,6 @@ same rule that sends the missing Q4_0 NEON kernel there (TASKS 0.4).
 
 ## What has not been done yet
 
-- **Threading.** Everything above is one core. `ingot_matvec` is single-threaded
-  by design; `ingot_matmat` parallelizes over rows. The thread pool is the
-  single largest win available and has not been written.
 - **Batched prefill.** Prefill currently runs the same one-token path as decode
   (deliberately — see `arch_qwen3.c`), so it gets no batching benefit. Moving it
   to `ingot_matmat` should help substantially, with the caveat in ingot's

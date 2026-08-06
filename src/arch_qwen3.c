@@ -12,17 +12,74 @@
 #include "arch_qwen3.h"
 
 #include "ingot/quant.h"
+#include "threads.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Weights are [out, in] row-major, so a projection is out = W · x. ingot takes
- * rows and cols from the tensor's ne, so the ggml dimension flip happens once
- * inside ingot rather than at every call site here. */
+/* ── threaded projection ────────────────────────────────────────────────────
+ * ingot's matvec is single-threaded by design, so the parallelism has to come
+ * from splitting the OUTPUT ROWS here. Each chunk is an independent matvec
+ * over a contiguous slice of the weight matrix writing to a disjoint slice of
+ * the output, so the result is bit-identical to the serial call — no reduction
+ * crosses a thread, and no summation order changes. The parity gate still
+ * holds at 1e-4 with threading on, which is the point.
+ *
+ * A row is a whole number of blocks (cols is a multiple of the block size for
+ * every type we ship), so a chunk boundary never falls inside one. */
+typedef struct {
+    const uint8_t *base;
+    float         *out;
+    const float   *in;
+    size_t         cols, row_bytes, rows_per_chunk, rows;
+    int            type, rc;
+} matvec_job;
+
+static void matvec_chunk(void *ctx, int i) {
+    matvec_job *j = ctx;
+    const size_t first = (size_t)i * j->rows_per_chunk;
+    if (first >= j->rows) return;
+    size_t n = j->rows_per_chunk;
+    if (first + n > j->rows) n = j->rows - first;
+
+    if (ingot_matvec(j->type, j->base + first * j->row_bytes, n, j->cols,
+                     j->in, j->out + first) != 0)
+        j->rc = -1;              /* benign race: any failure sets the same -1 */
+}
+
+/* Weights are [out, in] row-major, so a projection is out = W · x. */
 static int project(const mynah_slm_model_t *m, const ingot_tensor *w,
                    const float *in, float *out) {
-    return ingot_gguf_matvec(m->gguf, w, in, out);
+    const int nth = mynah_slm_threads_count();
+
+    /* ne[0] is the INPUT width in ggml order; rank 1 is a single row. */
+    const size_t cols = (size_t)w->ne[0];
+    const size_t rows = (w->rank >= 2) ? (size_t)w->ne[1] : 1;
+
+    uint64_t block_elems = 0, block_bytes = 0;
+    if (nth <= 1 || rows < 64 ||
+        ingot_type_geometry(w->type, &block_elems, &block_bytes) != 0 ||
+        block_elems == 0 || cols % block_elems != 0)
+        return ingot_gguf_matvec(m->gguf, w, in, out);
+
+    const uint8_t *base = ingot_gguf_data(m->gguf, w);
+    if (!base) return -1;
+
+    /* Four chunks per thread: the cores are not equally fast (and on a Mac the
+     * pool is pinned to the performance cores for exactly that reason), so a
+     * few extra chunks let the counter balance the tail. */
+    int chunks = nth * 4;
+    if ((size_t)chunks > rows) chunks = (int)rows;
+
+    matvec_job j = {
+        .base = base, .out = out, .in = in,
+        .cols = cols, .row_bytes = (cols / block_elems) * block_bytes,
+        .rows_per_chunk = (rows + (size_t)chunks - 1) / (size_t)chunks,
+        .rows = rows, .type = w->type, .rc = 0,
+    };
+    mynah_slm_parallel_for(chunks, matvec_chunk, &j);
+    return j.rc;
 }
 
 static float *alloc_f32(size_t n) {
@@ -58,12 +115,14 @@ int mynah_slm_state_init(mynah_slm_state *s, const mynah_slm_model_t *m,
     s->proj    = alloc_f32(c->d_model);
     s->gate    = alloc_f32(c->d_ff);
     s->up      = alloc_f32(c->d_ff);
-    s->scores  = alloc_f32(n_ctx);
+    s->scores    = alloc_f32(n_ctx);
+    s->scores_mt = alloc_f32((size_t)n_ctx * c->n_heads);
     s->logits  = alloc_f32(c->vocab_size);
     s->embed_row = alloc_f32(c->d_model);
 
     if (!s->k_cache || !s->v_cache || !s->x || !s->h || !s->q || !s->attn ||
-        !s->proj || !s->gate || !s->up || !s->scores || !s->logits || !s->embed_row) {
+        !s->proj || !s->gate || !s->up || !s->scores || !s->scores_mt ||
+        !s->logits || !s->embed_row) {
         snprintf(err, errsz, "out of memory for a %u-position context", n_ctx);
         mynah_slm_state_free(s);
         return -1;
@@ -84,6 +143,7 @@ void mynah_slm_state_free(mynah_slm_state *s) {
     mynah_slm_aligned_free(s->gate);
     mynah_slm_aligned_free(s->up);
     mynah_slm_aligned_free(s->scores);
+    mynah_slm_aligned_free(s->scores_mt);
     mynah_slm_aligned_free(s->logits);
     mynah_slm_aligned_free(s->embed_row);
     memset(s, 0, sizeof *s);
@@ -157,8 +217,8 @@ int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
         mynah_slm_rope_apply(&s->rope, s->q,    c->n_heads,    pos);
         mynah_slm_rope_apply(&s->rope, k_slot,  c->n_kv_heads, pos);
 
-        mynah_slm_attention(s->attn, s->q, k_layer, v_layer, n_kv,
-                            c->n_heads, c->n_kv_heads, c->head_dim, s->scores);
+        mynah_slm_attention_mt(s->attn, s->q, k_layer, v_layer, n_kv,
+                               c->n_heads, c->n_kv_heads, c->head_dim, s->scores_mt);
 
         if (project(m, w->wo, s->attn, s->proj) != 0) return -1;
         mynah_slm_add(s->x, s->proj, c->d_model);

@@ -36,6 +36,10 @@ typedef struct {
     float *proj;       /* projection output        [d_model]  */
     float *gate, *up;  /*                          [d_ff]     */
     float *scores;     /* attention scores         [n_ctx]    */
+    /* Per-head scores, [n_heads][n_ctx]. Heads run concurrently and a shared
+     * scores buffer would be the single piece of state that makes them
+     * dependent — the classic way a threaded attention goes subtly wrong. */
+    float *scores_mt;
     float *logits;     /*                          [vocab]    */
     float *embed_row;  /* decoded embedding row    [d_model]  */
 

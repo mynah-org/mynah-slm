@@ -8,6 +8,8 @@
  * SPDX-License-Identifier: MIT */
 #include "kernels.h"
 
+#include "threads.h"
+
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -165,4 +167,52 @@ void mynah_slm_attention(float *out, const float *q, const float *k, const float
             for (uint32_t i = 0; i < head_dim; i++) oh[i] += w * vt[i];
         }
     }
+}
+
+/* One head of the loop above, factored out so it can be a task. */
+static void attention_head(float *out, const float *q, const float *k, const float *v,
+                           uint32_t h, uint32_t n_kv, uint32_t n_heads,
+                           uint32_t n_kv_heads, uint32_t head_dim, float *scratch) {
+    const uint32_t group  = n_heads / n_kv_heads;
+    const uint32_t kv_dim = n_kv_heads * head_dim;
+    const float    scale  = 1.0f / sqrtf((float)head_dim);
+
+    const float   *qh  = q + (size_t)h * head_dim;
+    const uint32_t kvh = h / group;
+
+    for (uint32_t t = 0; t < n_kv; t++) {
+        const float *kt = k + (size_t)t * kv_dim + (size_t)kvh * head_dim;
+        double dot = 0.0;
+        for (uint32_t i = 0; i < head_dim; i++) dot += (double)qh[i] * (double)kt[i];
+        scratch[t] = (float)dot * scale;
+    }
+    mynah_slm_softmax(scratch, n_kv);
+
+    float *oh = out + (size_t)h * head_dim;
+    for (uint32_t i = 0; i < head_dim; i++) oh[i] = 0.0f;
+    for (uint32_t t = 0; t < n_kv; t++) {
+        const float *vt = v + (size_t)t * kv_dim + (size_t)kvh * head_dim;
+        const float  w  = scratch[t];
+        for (uint32_t i = 0; i < head_dim; i++) oh[i] += w * vt[i];
+    }
+}
+
+typedef struct {
+    float *out, *scratch;
+    const float *q, *k, *v;
+    uint32_t n_kv, n_heads, n_kv_heads, head_dim;
+} attn_job;
+
+static void attn_task(void *ctx, int i) {
+    attn_job *j = ctx;
+    attention_head(j->out, j->q, j->k, j->v, (uint32_t)i, j->n_kv,
+                   j->n_heads, j->n_kv_heads, j->head_dim,
+                   j->scratch + (size_t)i * j->n_kv);
+}
+
+void mynah_slm_attention_mt(float *out, const float *q, const float *k, const float *v,
+                            uint32_t n_kv, uint32_t n_heads, uint32_t n_kv_heads,
+                            uint32_t head_dim, float *scratch) {
+    attn_job j = { out, scratch, q, k, v, n_kv, n_heads, n_kv_heads, head_dim };
+    mynah_slm_parallel_for((int)n_heads, attn_task, &j);
 }

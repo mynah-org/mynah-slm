@@ -11,6 +11,7 @@
 #include "mynah_slm.h"
 #include "sampler.h"
 #include "template.h"
+#include "threads.h"
 #include "timing.h"
 #include "tokenizer.h"
 
@@ -32,6 +33,7 @@ static void usage(FILE *f) {
         "  mynah-slm run -m <model.gguf> -p \"prompt\" [-n 128] [--think off|low|on]\n"
         "                [--temp T] [--top-k K] [--top-p P] [--min-p M] [--seed S]\n"
         "                [--raw] [--no-stream] [--quiet] [--ctx N] [--show-think]\n"
+        "                [-t N | --threads N]   (default: performance cores)\n"
         "\n"
         "  Reasoning NEVER reaches stdout: it is discarded, or written to stderr\n"
         "  with --show-think. stdout is the answer, so `| mynah-tts` is safe.\n"
@@ -216,7 +218,7 @@ static int collect_cb(void *ctx, uint32_t id, const char *text, size_t len) {
 
 typedef struct {
     const char *model, *prompt, *system;
-    int   max_new, raw, stream, quiet, think, ctx, show_think;
+    int   max_new, raw, stream, quiet, think, ctx, show_think, threads;
     mynah_slm_sampler_params sp;
 } run_opts;
 
@@ -224,7 +226,7 @@ static int cmd_run(run_opts *o) {
     char err[256];
     mynah_slm_timing tm;
     mynah_slm_timing_reset(&tm);
-    tm.n_threads = 1;                     /* single-threaded for now; say so */
+    tm.n_threads = mynah_slm_threads_init(o->threads);
 
     mynah_slm_timing_start(&tm);
     mynah_slm_model_t *m = mynah_slm_load(o->model, err, sizeof err);
@@ -308,6 +310,7 @@ static int cmd_run(run_opts *o) {
     mynah_slm_state_free(&st);
     mynah_slm_tokenizer_free(tok);
     mynah_slm_free(m);
+    mynah_slm_threads_shutdown();
     return n < 0 ? 1 : 0;
 }
 
@@ -334,6 +337,7 @@ int main(int argc, char **argv) {
             else if (!strcmp(a, "--system"))    { NEEDV(); o.system = v; }
             else if (!strcmp(a, "-n"))          { NEEDV(); o.max_new = atoi(v); }
             else if (!strcmp(a, "--ctx"))       { NEEDV(); o.ctx = atoi(v); }
+            else if (!strcmp(a, "-t") || !strcmp(a, "--threads")) { NEEDV(); o.threads = atoi(v); }
             else if (!strcmp(a, "--temp"))      { NEEDV(); o.sp.temp = (float)atof(v); }
             else if (!strcmp(a, "--top-k"))     { NEEDV(); o.sp.top_k = (uint32_t)atoi(v); }
             else if (!strcmp(a, "--top-p"))     { NEEDV(); o.sp.top_p = (float)atof(v); }

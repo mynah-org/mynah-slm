@@ -98,4 +98,12 @@ void mynah_slm_attention(float *out, const float *q, const float *k, const float
                          uint32_t n_kv, uint32_t n_heads, uint32_t n_kv_heads,
                          uint32_t head_dim, float *scratch);
 
+/* The same, one head per task. Heads are fully independent — separate scores,
+ * separate output slice — so this is bit-identical to the serial version, not
+ * merely close. `scratch` must hold n_heads * n_kv floats: a shared scores
+ * buffer would be the one piece of state that makes them dependent. */
+void mynah_slm_attention_mt(float *out, const float *q, const float *k, const float *v,
+                            uint32_t n_kv, uint32_t n_heads, uint32_t n_kv_heads,
+                            uint32_t head_dim, float *scratch);
+
 #endif /* MYNAH_SLM_KERNELS_H */
