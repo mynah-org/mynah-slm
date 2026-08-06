@@ -51,8 +51,12 @@ MYNAH_SLM_BUILD := $(shell git describe --always --dirty 2>/dev/null || echo dev
 CFLAGS += -DMYNAH_SLM_BUILD='"$(MYNAH_SLM_BUILD)"'
 
 # Weights live on the NAS (see CLAUDE.md): models/ is a symlink to
-# /Volumes/shared/mynah-slm/models. Never copy checkpoints to the internal disk.
-MODEL ?= models/qwen3-0.6b-q4_k_m.gguf
+# /Volumes/shared/mynah-slm/models. For anything that MEASURES, stage a copy
+# locally first with scripts/use_model.sh — reading weights over SMB is ~20x
+# slower on the I/O and, worse, unreproducible once page-cache pressure starts
+# re-faulting them mid-run. models-local/ wins automatically when populated.
+MODEL_NAME ?= Qwen3-0.6B-Q4_K_M.gguf
+MODEL      ?= $(firstword $(wildcard models-local/$(MODEL_NAME)) models/$(MODEL_NAME))
 
 all: mynah-slm
 

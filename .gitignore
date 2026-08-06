@@ -31,6 +31,9 @@ bench_*
 # NB: no trailing slash — `models` is a SYMLINK to /Volumes/shared/mynah-slm/models
 # (the NAS), and `models/` would only match a real directory. Same gotcha as qwen-tts.
 models
+# models-local/ is the one-at-a-time local staging cache used for benchmarks
+# (scripts/use_model.sh). Real directory, real weights, never committed.
+models-local
 *.gguf
 *.safetensors
 *.bin
