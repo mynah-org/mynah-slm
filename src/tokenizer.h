@@ -42,6 +42,11 @@ const char *mynah_slm_token_text(const mynah_slm_tokenizer *t, uint32_t id);
 /* Is this a control token (a chat delimiter rather than text)? */
 int mynah_slm_token_is_control(const mynah_slm_tokenizer *t, uint32_t id);
 
+/* The id whose stored text is exactly `text`, or -1. Used to resolve markers
+ * like "<think>" by name instead of hardcoding an id that is only right for
+ * one vocabulary. */
+long mynah_slm_token_find(const mynah_slm_tokenizer *t, const char *text);
+
 /* ── streaming detokenizer ──────────────────────────────────────────────────
  * A token's bytes can end mid-UTF-8-sequence: emoji and CJK routinely split
  * across two tokens. Emitting a partial codepoint to a terminal prints a

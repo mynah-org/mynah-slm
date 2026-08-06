@@ -23,8 +23,26 @@ typedef struct {
     const uint32_t *eos;          /* stop on ANY of these */
     size_t          n_eos;
 
+    /* The ANSWER channel. Everything a downstream TTS stage should speak, and
+     * nothing else. */
     mynah_slm_token_cb cb;
     void              *cb_ctx;
+
+    /* The THINKING channel, separate on purpose.
+     *
+     * Reasoning must never reach a TTS stage — being read the model's internal
+     * monologue out loud is not a cosmetic defect, it is the feature failing.
+     * So the split is structural rather than a filter the caller might forget
+     * to apply: text between the two markers below goes here, or nowhere when
+     * this is NULL. The markers are resolved by NAME at setup
+     * (mynah_slm_token_find), never hardcoded, and they are single tokens in
+     * Qwen3 — so the boundary is exact and cannot fall mid-string.
+     *
+     * Set think_open/think_close to -1 to disable the split entirely. */
+    mynah_slm_token_cb cb_think;
+    void              *cb_think_ctx;
+    long               think_open;
+    long               think_close;
 } mynah_slm_gen_params;
 
 /* Runs to completion. Returns the number of tokens generated, or -1.

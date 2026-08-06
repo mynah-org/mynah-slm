@@ -31,7 +31,10 @@ static void usage(FILE *f) {
         "\n"
         "  mynah-slm run -m <model.gguf> -p \"prompt\" [-n 128] [--think off|low|on]\n"
         "                [--temp T] [--top-k K] [--top-p P] [--min-p M] [--seed S]\n"
-        "                [--raw] [--no-stream] [--quiet] [--ctx N]\n"
+        "                [--raw] [--no-stream] [--quiet] [--ctx N] [--show-think]\n"
+        "\n"
+        "  Reasoning NEVER reaches stdout: it is discarded, or written to stderr\n"
+        "  with --show-think. stdout is the answer, so `| mynah-tts` is safe.\n"
         "\n"
         "  Timings go to stderr, so stdout stays pipeable into mynah-tts.\n"
         "  mynah-slm --version\n"
@@ -184,6 +187,16 @@ static int stream_cb(void *ctx, uint32_t id, const char *text, size_t len) {
     return 0;
 }
 
+/* Thinking goes to STDERR, never stdout. stdout is the answer channel and the
+ * thing that gets piped into mynah-tts; if reasoning could reach it, one
+ * forgotten flag would have the speech stage read the model's monologue out
+ * loud. Structural, not a filter. */
+static int think_cb(void *ctx, uint32_t id, const char *text, size_t len) {
+    (void)ctx; (void)id;
+    if (len) { fwrite(text, 1, len, stderr); fflush(stderr); }
+    return 0;
+}
+
 typedef struct { char *buf; size_t used, cap; } collect;
 
 static int collect_cb(void *ctx, uint32_t id, const char *text, size_t len) {
@@ -203,7 +216,7 @@ static int collect_cb(void *ctx, uint32_t id, const char *text, size_t len) {
 
 typedef struct {
     const char *model, *prompt, *system;
-    int   max_new, raw, stream, quiet, think, ctx;
+    int   max_new, raw, stream, quiet, think, ctx, show_think;
     mynah_slm_sampler_params sp;
 } run_opts;
 
@@ -268,6 +281,14 @@ static int cmd_run(run_opts *o) {
         .eos = eos, .n_eos = sizeof eos / sizeof *eos,
         .cb = o->stream ? stream_cb : collect_cb,
         .cb_ctx = o->stream ? NULL : (void *)&col,
+        /* Resolved by name: an id hardcoded here would be right for exactly
+         * one vocabulary. -1 when the model has no think markers at all, which
+         * simply disables the split. */
+        .think_open  = mynah_slm_token_find(tok, "<think>"),
+        .think_close = mynah_slm_token_find(tok, "</think>"),
+        /* NULL discards the channel — the right default for a speech pipeline. */
+        .cb_think     = o->show_think ? think_cb : NULL,
+        .cb_think_ctx = NULL,
     };
 
     const long n = mynah_slm_generate(&st, tok, sam, &gp, &tm);
@@ -325,6 +346,7 @@ int main(int argc, char **argv) {
                         : !strcmp(v, "low") ? MYNAH_SLM_THINK_LOW
                                             : MYNAH_SLM_THINK_OFF;
             }
+            else if (!strcmp(a, "--show-think")) o.show_think = 1;
             else if (!strcmp(a, "--raw"))       o.raw = 1;
             else if (!strcmp(a, "--no-stream")) o.stream = 0;
             else if (!strcmp(a, "--quiet"))     o.quiet = 1;

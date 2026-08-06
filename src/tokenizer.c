@@ -294,6 +294,11 @@ int mynah_slm_token_is_control(const mynah_slm_tokenizer *t, uint32_t id) {
     return id < t->n_tok && t->tok_type[id] == 3;
 }
 
+long mynah_slm_token_find(const mynah_slm_tokenizer *t, const char *text) {
+    if (!t || !text) return -1;
+    return vocab_lookup(t, text, strlen(text));
+}
+
 /* ── pre-tokenizer ────────────────────────────────────────────────────────── */
 
 /* The Qwen2 split, implemented directly rather than through a regex engine:
