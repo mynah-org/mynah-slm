@@ -103,6 +103,12 @@ int ingot_q2_k_dequant(const void *weights, size_t rows, size_t cols, float *out
 int ingot_q2_k_matmat(const void *weights, size_t rows, size_t cols,
                       const float *input, float *output, size_t tokens);
 
+/* Q4_0: 32 weights in 18 bytes, split-half nibbles biased by 8. What Gemma 4
+ * QAT checkpoints ship as, which is why it has a hand-written kernel. */
+int ingot_q4_0_matvec(const void *weights, size_t rows, size_t cols,
+                      const float *input, float *output);
+int ingot_q4_0_dequant(const void *weights, size_t rows, size_t cols, float *output);
+
 int ingot_q8_0_matvec(const void *weights, size_t rows, size_t cols,
                       const float *input, float *output);
 int ingot_q8_0_dequant(const void *weights, size_t rows, size_t cols, float *output);
