@@ -1,0 +1,9 @@
+-std=c11
+-Wall
+-Wextra
+-iquote
+src
+-Iinclude
+-Ithird_party/ingot/include
+-D_DEFAULT_SOURCE
+-DMYNAH_SLM_BUILD="dev"
