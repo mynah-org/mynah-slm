@@ -5,8 +5,13 @@
  * `chat` at all.
  *
  * SPDX-License-Identifier: MIT */
+#include "arch_qwen3.h"
+#include "generate.h"
 #include "model.h"
 #include "mynah_slm.h"
+#include "sampler.h"
+#include "template.h"
+#include "timing.h"
 #include "tokenizer.h"
 
 #include <stdio.h>
@@ -23,6 +28,12 @@ static void usage(FILE *f) {
         "  mynah-slm inspect <model.gguf> --tensors Q6_K   ... only that type\n"
         "  mynah-slm inspect <model.gguf> --meta     ... plus the metadata KV\n"
         "  mynah-slm tokenize -m <model.gguf> [--special] < text\n"
+        "\n"
+        "  mynah-slm run -m <model.gguf> -p \"prompt\" [-n 128] [--think off|low|on]\n"
+        "                [--temp T] [--top-k K] [--top-p P] [--min-p M] [--seed S]\n"
+        "                [--raw] [--no-stream] [--quiet] [--ctx N]\n"
+        "\n"
+        "  Timings go to stderr, so stdout stays pipeable into mynah-tts.\n"
         "  mynah-slm --version\n"
         "\n"
         "Weights live on the NAS (models/ is a symlink); see CLAUDE.md.\n",
@@ -165,6 +176,120 @@ static int cmd_tokenize(const char *model_path, int parse_special) {
     return rc;
 }
 
+/* Streaming: write each piece as it arrives and flush, or the pipeline
+ * downstream waits for a 4 KB buffer instead of a sentence. */
+static int stream_cb(void *ctx, uint32_t id, const char *text, size_t len) {
+    (void)ctx; (void)id;
+    if (len) { fwrite(text, 1, len, stdout); fflush(stdout); }
+    return 0;
+}
+
+typedef struct { char *buf; size_t used, cap; } collect;
+
+static int collect_cb(void *ctx, uint32_t id, const char *text, size_t len) {
+    (void)id;
+    collect *c = ctx;
+    if (c->used + len + 1 > c->cap) {
+        size_t cap = (c->used + len + 1) * 2;
+        char *g = realloc(c->buf, cap);
+        if (!g) return 1;
+        c->buf = g; c->cap = cap;
+    }
+    memcpy(c->buf + c->used, text, len);
+    c->used += len;
+    c->buf[c->used] = '\0';
+    return 0;
+}
+
+typedef struct {
+    const char *model, *prompt, *system;
+    int   max_new, raw, stream, quiet, think, ctx;
+    mynah_slm_sampler_params sp;
+} run_opts;
+
+static int cmd_run(run_opts *o) {
+    char err[256];
+    mynah_slm_timing tm;
+    mynah_slm_timing_reset(&tm);
+    tm.n_threads = 1;                     /* single-threaded for now; say so */
+
+    mynah_slm_timing_start(&tm);
+    mynah_slm_model_t *m = mynah_slm_load(o->model, err, sizeof err);
+    if (!m) { fprintf(stderr, "mynah-slm: %s\n", err); return 1; }
+
+    mynah_slm_tokenizer *tok = mynah_slm_tokenizer_load(m->gguf, err, sizeof err);
+    if (!tok) { fprintf(stderr, "mynah-slm: %s\n", err); mynah_slm_free(m); return 1; }
+
+    /* Render the chat turn unless --raw. The template inserts control tokens,
+     * so THIS text is tokenized with parse_special on; user content reaching it
+     * has already been escaped by being placed inside a turn. */
+    char *text = NULL;
+    if (o->raw) {
+        text = strdup(o->prompt);
+    } else {
+        mynah_slm_message msgs[2];
+        size_t n = 0;
+        if (o->system) { msgs[n].role = MYNAH_SLM_ROLE_SYSTEM; msgs[n].content = o->system; n++; }
+        msgs[n].role = MYNAH_SLM_ROLE_USER; msgs[n].content = o->prompt; n++;
+
+        const long need = mynah_slm_render_chat(msgs, n, o->think, NULL, 0);
+        if (need < 0) { fprintf(stderr, "mynah-slm: cannot render the prompt\n"); return 1; }
+        text = malloc((size_t)need + 1);
+        if (text) mynah_slm_render_chat(msgs, n, o->think, text, (size_t)need + 1);
+    }
+    if (!text) { fprintf(stderr, "mynah-slm: out of memory\n"); return 1; }
+
+    const long n_prompt = mynah_slm_tokenize(tok, text, 1, NULL, 0);
+    if (n_prompt <= 0) { fprintf(stderr, "mynah-slm: empty prompt\n"); return 1; }
+    uint32_t *ids = malloc((size_t)n_prompt * sizeof *ids);
+    if (!ids) return 1;
+    mynah_slm_tokenize(tok, text, 1, ids, (size_t)n_prompt);
+
+    mynah_slm_state st;
+    const uint32_t want_ctx = o->ctx > 0 ? (uint32_t)o->ctx
+                                         : (uint32_t)(n_prompt + o->max_new + 8);
+    if (mynah_slm_state_init(&st, m, want_ctx, err, sizeof err) != 0) {
+        fprintf(stderr, "mynah-slm: %s\n", err);
+        return 1;
+    }
+    mynah_slm_timing_end_load(&tm);
+
+    mynah_slm_sampler *sam = mynah_slm_sampler_new(&o->sp, mynah_slm_vocab_size(m));
+    if (!sam) { fprintf(stderr, "mynah-slm: out of memory\n"); return 1; }
+
+    /* Qwen3 has TWO terminators; the GGUF only names one. Stopping on a subset
+     * runs past the end of the turn. */
+    const uint32_t eos[] = { mynah_slm_tokenizer_eos(tok), 151643u };
+
+    collect col = {0};
+    mynah_slm_gen_params gp = {
+        .prompt = ids, .n_prompt = (size_t)n_prompt,
+        .max_new = (uint32_t)o->max_new,
+        .eos = eos, .n_eos = sizeof eos / sizeof *eos,
+        .cb = o->stream ? stream_cb : collect_cb,
+        .cb_ctx = o->stream ? NULL : (void *)&col,
+    };
+
+    const long n = mynah_slm_generate(&st, tok, sam, &gp, &tm);
+    if (!o->stream && col.buf) fputs(col.buf, stdout);
+    fputc('\n', stdout);
+
+    if (!o->quiet) {
+        char line[256];
+        mynah_slm_timing_format(&tm, line, sizeof line);
+        fprintf(stderr, "%s\n", line);
+    }
+
+    free(col.buf);
+    free(ids);
+    free(text);
+    mynah_slm_sampler_free(sam);
+    mynah_slm_state_free(&st);
+    mynah_slm_tokenizer_free(tok);
+    mynah_slm_free(m);
+    return n < 0 ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { usage(stderr); return 2; }
 
@@ -175,6 +300,42 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
         usage(stdout);
         return 0;
+    }
+    if (!strcmp(argv[1], "run")) {
+        run_opts o = { .max_new = 128, .stream = 1, .think = MYNAH_SLM_THINK_OFF };
+        mynah_slm_sampler_defaults(&o.sp);
+        for (int i = 2; i < argc; i++) {
+            const char *a = argv[i];
+            const char *v = (i + 1 < argc) ? argv[i + 1] : NULL;
+#define NEEDV() do { if (!v) { fprintf(stderr, "mynah-slm: %s needs a value\n", a); return 2; } i++; } while (0)
+            if      (!strcmp(a, "-m"))          { NEEDV(); o.model = v; }
+            else if (!strcmp(a, "-p"))          { NEEDV(); o.prompt = v; }
+            else if (!strcmp(a, "--system"))    { NEEDV(); o.system = v; }
+            else if (!strcmp(a, "-n"))          { NEEDV(); o.max_new = atoi(v); }
+            else if (!strcmp(a, "--ctx"))       { NEEDV(); o.ctx = atoi(v); }
+            else if (!strcmp(a, "--temp"))      { NEEDV(); o.sp.temp = (float)atof(v); }
+            else if (!strcmp(a, "--top-k"))     { NEEDV(); o.sp.top_k = (uint32_t)atoi(v); }
+            else if (!strcmp(a, "--top-p"))     { NEEDV(); o.sp.top_p = (float)atof(v); }
+            else if (!strcmp(a, "--min-p"))     { NEEDV(); o.sp.min_p = (float)atof(v); }
+            else if (!strcmp(a, "--seed"))      { NEEDV(); o.sp.seed = strtoull(v, NULL, 10); }
+            else if (!strcmp(a, "--repeat-penalty")) { NEEDV(); o.sp.repeat_penalty = (float)atof(v); }
+            else if (!strcmp(a, "--think")) {
+                NEEDV();
+                o.think = !strcmp(v, "on")  ? MYNAH_SLM_THINK_ON
+                        : !strcmp(v, "low") ? MYNAH_SLM_THINK_LOW
+                                            : MYNAH_SLM_THINK_OFF;
+            }
+            else if (!strcmp(a, "--raw"))       o.raw = 1;
+            else if (!strcmp(a, "--no-stream")) o.stream = 0;
+            else if (!strcmp(a, "--quiet"))     o.quiet = 1;
+            else { fprintf(stderr, "mynah-slm: unknown option '%s'\n", a); return 2; }
+#undef NEEDV
+        }
+        if (!o.model || !o.prompt) {
+            fprintf(stderr, "mynah-slm: run needs -m <model.gguf> and -p <prompt>\n");
+            return 2;
+        }
+        return cmd_run(&o);
     }
     if (!strcmp(argv[1], "tokenize")) {
         const char *model = NULL;
