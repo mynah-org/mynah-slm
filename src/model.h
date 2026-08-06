@@ -79,4 +79,8 @@ typedef struct mynah_slm_model mynah_slm_model_t;
 /* Zero-copy pointer to a tensor's stored bytes. */
 const void *mynah_slm_tensor_data(const mynah_slm_model_t *m, const ingot_tensor *t);
 
+/* The full config. Internal: the public header exposes accessors instead, so
+ * this struct can change without breaking an installed mynah_slm.h. */
+const mynah_slm_config *mynah_slm_model_config(const mynah_slm_model_t *m);
+
 #endif /* MYNAH_SLM_MODEL_H */

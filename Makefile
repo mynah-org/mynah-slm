@@ -65,7 +65,9 @@ help:
 	@echo "  all          mynah-slm CLI (default)"
 	@echo "  lib          libmynah_slm.a"
 	@echo "  shared       libmynah_slm.{dylib,so}"
-	@echo "  test         unit tests (exit 77 = skipped, model missing)"
+	@echo "  test         unit tests + parity (exit 77 = skipped, model missing)"
+	@echo "  test-parity  C forward pass vs the numpy oracle, stage by stage"
+	@echo "  golden-dump  regenerate the oracle's reference activations"
 	@echo "  debug        -O0 -g rebuild"
 	@echo "  ubsan        UBSan rebuild + test, then clean"
 	@echo "  asan         ASan+UBSan rebuild + test (LINUX CI ONLY, see below)"
@@ -93,7 +95,14 @@ $(OBJ): | $(INGOT_LIB)
 # three modules later.
 TESTS := tests/test_ingot tests/test_inspect tests/test_kernels tests/test_model
 
-tests/%: build/tests/%.o $(OBJ) $(INGOT_LIB)
+# The parity harness is built like the others but driven separately: it dumps
+# activations, and tools/eval/compare.py is what judges them.
+PARITY     := tests/test_parity
+GOLDEN_DIR := tests/golden/it_hello
+DUMP_DIR   := build/dump/it_hello
+PROMPT     ?= Ciao! Come stai?
+
+tests/%: build/tests/%.o build/tests/npy.o $(OBJ) $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
 test: $(TESTS) mynah-slm
@@ -105,6 +114,26 @@ test: $(TESTS) mynah-slm
 	@./mynah-slm --version >/dev/null || exit 1
 	@if [ -e "$(MODEL)" ]; then ./mynah-slm inspect "$(MODEL)" >/dev/null || exit 1; \
 	 else echo "SKIP inspect: $(MODEL) not found (weights live on the NAS, see CLAUDE.md)"; fi
+	@$(MAKE) --no-print-directory test-parity
+
+# C forward pass vs the numpy oracle, stage by stage. Skips (77) rather than
+# failing when the model or the golden dumps are absent: weights are not a
+# build dependency. Regenerate the golden side with `make golden-dump`.
+test-parity: $(PARITY)
+	@mkdir -p $(DUMP_DIR)
+	@$(PARITY) "$(MODEL)" $(GOLDEN_DIR) $(DUMP_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP parity: model or golden dumps missing (make golden-dump)"; exit 0; \
+	  elif [ $$rc -ne 0 ]; then exit $$rc; fi; \
+	  cd tools && uv run python -m eval.compare ../$(GOLDEN_DIR) ../$(DUMP_DIR); rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP parity: nothing to compare"; exit 0; else exit $$rc; fi
+
+# Regenerate the oracle's reference activations. Slow (no KV cache, on purpose)
+# and only needed when the prompt or the dumped stages change.
+golden-dump:
+	@test -e "$(MODEL)" || { echo "no model at $(MODEL) — scripts/use_model.sh"; exit 1; }
+	@mkdir -p $(GOLDEN_DIR)
+	cd tools && uv run python -m oracle.generate ../$(MODEL) \
+	  --prompt "$(PROMPT)" --dump-dir ../$(GOLDEN_DIR) -n 1
 
 # ── libraries ──────────────────────────────────────────────────────────────
 lib: libmynah_slm.a
@@ -152,7 +181,7 @@ leaks: mynah-slm $(TESTS)
 	 else echo "SKIP leaks/inspect: $(MODEL) not found"; fi
 
 clean:
-	rm -rf build mynah-slm libmynah_slm.a libmynah_slm$(SOEXT) $(TESTS) dist
+	rm -rf build mynah-slm libmynah_slm.a libmynah_slm$(SOEXT) $(TESTS) $(PARITY) dist
 	@# Without this, libingot.a survives a clean: update the subtree and the
 	@# next build silently links the previous library.
 	@test -d $(INGOT_DIR) && $(MAKE) -C $(INGOT_DIR) clean || true
@@ -171,4 +200,4 @@ install: mynah-slm libmynah_slm.a
 	install -m 644 libmynah_slm.a $(DESTDIR)$(PREFIX)/lib/
 	install -m 644 include/mynah_slm.h $(DESTDIR)$(PREFIX)/include/
 
-.PHONY: all help lib shared test debug ubsan asan leaks clean install update-ingot
+.PHONY: all help lib shared test test-parity golden-dump debug ubsan asan leaks clean install update-ingot

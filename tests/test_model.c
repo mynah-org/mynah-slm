@@ -16,7 +16,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-const mynah_slm_config *mynah_slm_model_config(const mynah_slm_model_t *m);
 
 static int failures;
 

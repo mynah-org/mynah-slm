@@ -90,6 +90,10 @@ def main() -> int:
              "model": os.path.basename(args.model)},
             open(os.path.join(args.dump_dir, "meta.json"), "w"), indent=2,
         )
+        # Plain one-id-per-line, so the C parity test can read the exact same
+        # token sequence without linking a JSON parser to do it.
+        with open(os.path.join(args.dump_dir, "tokens.txt"), "w") as f:
+            f.write("".join(f"{i}\n" for i in ids))
         print(f"# dumped {len(dump) - 1} arrays -> {args.dump_dir}", file=sys.stderr)
 
     t0 = time.time()
