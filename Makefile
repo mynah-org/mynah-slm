@@ -58,15 +58,16 @@ CFLAGS += -DMYNAH_SLM_BUILD='"$(MYNAH_SLM_BUILD)"'
 MODEL_NAME ?= Qwen3-0.6B-Q4_K_M.gguf
 MODEL      ?= $(firstword $(wildcard models-local/$(MODEL_NAME)) models/$(MODEL_NAME))
 
-all: mynah-slm
+all: mynah-slm mynah-slm-server
 
 help:
 	@echo "mynah-slm targets:"
-	@echo "  all          mynah-slm CLI (default)"
+	@echo "  all          mynah-slm CLI + mynah-slm-server (default)"
 	@echo "  lib          libmynah_slm.a"
 	@echo "  shared       libmynah_slm.{dylib,so}"
 	@echo "  test         unit tests + parity (exit 77 = skipped, model missing)"
 	@echo "  test-parity  C forward pass vs the numpy oracle, stage by stage"
+	@echo "  test-server  end-to-end HTTP checks (needs a minute of generation)"
 	@echo "  golden-dump  regenerate the oracle's reference activations"
 	@echo "  debug        -O0 -g rebuild"
 	@echo "  ubsan        UBSan rebuild + test, then clean"
@@ -77,6 +78,14 @@ help:
 
 mynah-slm: $(OBJ) build/cli/main.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+SERVER_OBJ := build/server/main.o build/server/http.o build/server/json.o
+mynah-slm-server: $(OBJ) $(SERVER_OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+build/server/%.o: server/%.c $(HDR) $(wildcard server/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -iquote server -c $< -o $@
 
 # objects in build/ (never next to the sources: the variant builds — ubsan,
 # asan — must not pollute the normal one)
@@ -126,6 +135,14 @@ test-parity: $(PARITY)
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi; \
 	  cd tools && uv run python -m eval.compare ../$(GOLDEN_DIR) ../$(DUMP_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP parity: nothing to compare"; exit 0; else exit $$rc; fi
+
+# End-to-end server checks: shape, determinism (sequential and concurrent),
+# SSE framing, and that reasoning never reaches content. Separate from `test`
+# because it spends a minute of real generation.
+test-server: mynah-slm-server
+	@sh tests/test_server.sh "$(MODEL)"; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP test-server: model missing"; exit 0; \
+	  else exit $$rc; fi
 
 # Regenerate the oracle's reference activations. Slow (no KV cache, on purpose)
 # and only needed when the prompt or the dumped stages change.
@@ -181,7 +198,7 @@ leaks: mynah-slm $(TESTS)
 	 else echo "SKIP leaks/inspect: $(MODEL) not found"; fi
 
 clean:
-	rm -rf build mynah-slm libmynah_slm.a libmynah_slm$(SOEXT) $(TESTS) $(PARITY) dist
+	rm -rf build mynah-slm mynah-slm-server libmynah_slm.a libmynah_slm$(SOEXT) $(TESTS) $(PARITY) dist
 	@# Without this, libingot.a survives a clean: update the subtree and the
 	@# next build silently links the previous library.
 	@test -d $(INGOT_DIR) && $(MAKE) -C $(INGOT_DIR) clean || true
@@ -194,10 +211,10 @@ update-ingot:
 	@$(MAKE) -C $(INGOT_DIR) clean
 
 PREFIX ?= /usr/local
-install: mynah-slm libmynah_slm.a
+install: mynah-slm mynah-slm-server libmynah_slm.a
 	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include
-	install -m 755 mynah-slm $(DESTDIR)$(PREFIX)/bin/
+	install -m 755 mynah-slm mynah-slm-server $(DESTDIR)$(PREFIX)/bin/
 	install -m 644 libmynah_slm.a $(DESTDIR)$(PREFIX)/lib/
 	install -m 644 include/mynah_slm.h $(DESTDIR)$(PREFIX)/include/
 
-.PHONY: all help lib shared test test-parity golden-dump debug ubsan asan leaks clean install update-ingot
+.PHONY: all help lib shared test test-parity test-server golden-dump debug ubsan asan leaks clean install update-ingot

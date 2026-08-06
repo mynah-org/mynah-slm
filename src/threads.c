@@ -12,8 +12,7 @@ typedef struct {
     void   *ctx;
     int     n;
     int     next;        /* next task index to claim */
-    int     active;      /* workers still inside the region */
-    unsigned generation; /* bumped per region, so a worker cannot re-run one */
+    int     left;        /* tasks not yet COMPLETED */
 } region;
 
 static pthread_t       *g_workers;
@@ -43,14 +42,24 @@ int mynah_slm_num_cpus(void) {
 
 /* Claim task indices until the region is exhausted. Work-stealing by counter
  * rather than a fixed per-thread range: chunks are not equal in cost (the last
- * row block of a matvec can be short) and an idle core is worse than a lock. */
+ * row block of a matvec can be short) and an idle core is worse than a lock.
+ *
+ * `left` is decremented AFTER the task returns, which is what lets the caller
+ * wait on work being finished rather than on workers being present. */
 static void run_tasks(void) {
     for (;;) {
         pthread_mutex_lock(&g_mu);
         const int i = (g_r.next < g_r.n) ? g_r.next++ : -1;
+        void (*fn)(void *, int) = g_r.fn;
+        void *ctx = g_r.ctx;
         pthread_mutex_unlock(&g_mu);
         if (i < 0) return;
-        g_r.fn(g_r.ctx, i);
+
+        fn(ctx, i);
+
+        pthread_mutex_lock(&g_mu);
+        if (--g_r.left == 0) pthread_cond_broadcast(&g_done);
+        pthread_mutex_unlock(&g_mu);
     }
 }
 
@@ -62,14 +71,9 @@ static void *worker(void *arg) {
         while (!g_stop && g_gen == seen) pthread_cond_wait(&g_work, &g_mu);
         if (g_stop) { pthread_mutex_unlock(&g_mu); return NULL; }
         seen = g_gen;
-        g_r.active++;
         pthread_mutex_unlock(&g_mu);
 
         run_tasks();
-
-        pthread_mutex_lock(&g_mu);
-        if (--g_r.active == 0) pthread_cond_signal(&g_done);
-        pthread_mutex_unlock(&g_mu);
     }
 }
 
@@ -117,19 +121,29 @@ void mynah_slm_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
     }
 
     pthread_mutex_lock(&g_mu);
-    g_r.fn     = fn;
-    g_r.ctx    = ctx;
-    g_r.n      = n;
-    g_r.next   = 0;
-    g_r.active = 1;            /* the caller counts as a participant */
+    g_r.fn   = fn;
+    g_r.ctx  = ctx;
+    g_r.n    = n;
+    g_r.next = 0;
+    g_r.left = n;
     g_gen++;
     pthread_cond_broadcast(&g_work);
     pthread_mutex_unlock(&g_mu);
 
     run_tasks();               /* the caller works too rather than idling */
 
+    /* Wait on TASKS FINISHED, never on workers being present.
+     *
+     * The first version counted participating workers instead, and it was
+     * wrong in a way that only showed up as wrong answers. A worker that had
+     * not yet woken would increment the counter AFTER the caller had already
+     * decremented it to zero and returned; the next region then reset the
+     * counter under that straggler, and its caller could see zero — or
+     * negative — and return BEFORE its own workers had written their output
+     * slices. The next layer read half-written buffers, so greedy decoding
+     * produced a different answer run to run. Caught by
+     * tests/test_server.sh, which asks the same question five times. */
     pthread_mutex_lock(&g_mu);
-    if (--g_r.active > 0)
-        while (g_r.active > 0) pthread_cond_wait(&g_done, &g_mu);
+    while (g_r.left > 0) pthread_cond_wait(&g_done, &g_mu);
     pthread_mutex_unlock(&g_mu);
 }
