@@ -13,6 +13,7 @@
 #include "ingot/dtype.h"
 #include "ingot/gguf.h"
 
+#include <stdio.h>   /* snprintf */
 #include <stdlib.h>
 #include <string.h>
 
@@ -42,6 +43,77 @@ static mynah_slm_type_use *row_for(mynah_slm_report *r, int type) {
     return row;
 }
 
+/* INGOT_KV_* is the metadata value enum, distinct from INGOT_TYPE_* (the ggml
+ * tensor types), so ingot_type_name() is the wrong function here. */
+static const char *kv_type_name(int t) {
+    switch (t) {
+        case INGOT_KV_UINT8:   return "u8";
+        case INGOT_KV_INT8:    return "i8";
+        case INGOT_KV_UINT16:  return "u16";
+        case INGOT_KV_INT16:   return "i16";
+        case INGOT_KV_UINT32:  return "u32";
+        case INGOT_KV_INT32:   return "i32";
+        case INGOT_KV_FLOAT32: return "f32";
+        case INGOT_KV_BOOL:    return "bool";
+        case INGOT_KV_STRING:  return "str";
+        case INGOT_KV_ARRAY:   return "array";
+        case INGOT_KV_UINT64:  return "u64";
+        case INGOT_KV_INT64:   return "i64";
+        case INGOT_KV_FLOAT64: return "f64";
+        default:               return "?";
+    }
+}
+
+/* Render one KV into `dst`. Arrays are summarized, never dumped: the tokenizer
+ * vocabulary is a 151936-entry array and printing it helps nobody. */
+static void render_kv(const ingot_kv *kv, mynah_slm_meta_kv *out) {
+    strncpy(out->name, ingot_kv_key(kv), sizeof out->name - 1);
+
+    if (ingot_kv_type(kv) == INGOT_KV_ARRAY) {
+        uint64_t len = 0;
+        ingot_kv_arr_len(kv, &len);
+        out->is_array = 1;
+        snprintf(out->value, sizeof out->value, "[%s x %llu]",
+                 kv_type_name(ingot_kv_arr_type(kv)),
+                 (unsigned long long)len);
+        return;
+    }
+
+    /* Switch on the DECLARED type, do not try accessors in turn. ingot's
+     * integer accessors happily convert a float, so a first-match chain that
+     * tries _u64 before _f64 renders rms_norm_eps = 1e-6 as "0" — which is a
+     * config value we depend on, and a plausible-looking lie. */
+    const char *s;
+    uint64_t u;
+    int64_t  i;
+    double   f;
+    int      b;
+    switch (ingot_kv_type(kv)) {
+        case INGOT_KV_STRING:
+            snprintf(out->value, sizeof out->value, "%s",
+                     ingot_kv_str(kv, &s) == 0 ? s : "(unreadable)");
+            break;
+        case INGOT_KV_BOOL:
+            snprintf(out->value, sizeof out->value, "%s",
+                     ingot_kv_bool(kv, &b) == 0 ? (b ? "true" : "false") : "(unreadable)");
+            break;
+        case INGOT_KV_FLOAT32:
+        case INGOT_KV_FLOAT64:
+            if (ingot_kv_f64(kv, &f) == 0) snprintf(out->value, sizeof out->value, "%g", f);
+            else                           snprintf(out->value, sizeof out->value, "(unreadable)");
+            break;
+        case INGOT_KV_INT8:  case INGOT_KV_INT16:
+        case INGOT_KV_INT32: case INGOT_KV_INT64:
+            if (ingot_kv_i64(kv, &i) == 0) snprintf(out->value, sizeof out->value, "%lld", (long long)i);
+            else                           snprintf(out->value, sizeof out->value, "(unreadable)");
+            break;
+        default:
+            if (ingot_kv_u64(kv, &u) == 0) snprintf(out->value, sizeof out->value, "%llu", (unsigned long long)u);
+            else                           snprintf(out->value, sizeof out->value, "(unreadable)");
+            break;
+    }
+}
+
 static int by_bytes_desc(const void *a, const void *b) {
     const mynah_slm_type_use *x = a, *y = b;
     if (x->bytes  != y->bytes)  return x->bytes  < y->bytes  ? 1 : -1;
@@ -67,10 +139,15 @@ int mynah_slm_inspect_gguf(mynah_slm_report *out, const char *path,
     out->runnable     = 1;
 
     out->tensors = calloc(out->n_tensors ? out->n_tensors : 1, sizeof *out->tensors);
-    if (!out->tensors) {
+    out->meta    = calloc(out->n_kv ? out->n_kv : 1, sizeof *out->meta);
+    if (!out->tensors || !out->meta) {
         ingot_gguf_close(g);
-        return fail(err, errsz, "out of memory listing tensors");
+        mynah_slm_report_free(out);
+        return fail(err, errsz, "out of memory listing the checkpoint");
     }
+
+    for (size_t i = 0; i < out->n_kv; i++)
+        render_kv(ingot_gguf_kv_at(g, i), &out->meta[out->n_meta++]);
 
     uint64_t total_elems = 0;
     for (size_t i = 0; i < out->n_tensors; i++) {
@@ -118,8 +195,11 @@ void mynah_slm_report_free(mynah_slm_report *r) {
     if (!r) return;
     free(r->types);
     free(r->tensors);
+    free(r->meta);
     r->types         = NULL;
     r->n_types       = 0;
     r->tensors       = NULL;
     r->n_tensor_info = 0;
+    r->meta          = NULL;
+    r->n_meta        = 0;
 }

@@ -18,6 +18,7 @@ static void usage(FILE *f) {
         "  mynah-slm inspect <model.gguf>            per-type census\n"
         "  mynah-slm inspect <model.gguf> --tensors  ... plus every tensor\n"
         "  mynah-slm inspect <model.gguf> --tensors Q6_K   ... only that type\n"
+        "  mynah-slm inspect <model.gguf> --meta     ... plus the metadata KV\n"
         "  mynah-slm --version\n"
         "\n"
         "Weights live on the NAS (models/ is a symlink); see CLAUDE.md.\n",
@@ -42,7 +43,8 @@ static void shape_str(const mynah_slm_tensor_info *t, char *buf, size_t n) {
     if (off < n) snprintf(buf + off, n - off, "]");
 }
 
-static int cmd_inspect(const char *path, int list_tensors, const char *only_type) {
+static int cmd_inspect(const char *path, int list_tensors, const char *only_type,
+                       int list_meta) {
     mynah_slm_report r;
     char err[256];
 
@@ -73,6 +75,13 @@ static int cmd_inspect(const char *path, int list_tensors, const char *only_type
                t->can_dequant ? "" : "<- ingot cannot decode this");
     }
     printf("\n");
+
+    if (list_meta) {
+        printf("  %-40s %s\n", "metadata key", "value");
+        for (size_t i = 0; i < r.n_meta; i++)
+            printf("  %-40s %s\n", r.meta[i].name, r.meta[i].value);
+        printf("\n");
+    }
 
     if (list_tensors) {
         uint64_t shown_bytes = 0;
@@ -114,19 +123,21 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[1], "inspect")) {
         if (argc < 3) { fprintf(stderr, "mynah-slm: inspect needs a path\n"); return 2; }
-        int list = 0;
+        int list = 0, meta = 0;
         const char *only = NULL;
         for (int i = 3; i < argc; i++) {
             if (!strcmp(argv[i], "--tensors")) {
                 list = 1;
                 /* an optional bare type name may follow */
                 if (i + 1 < argc && argv[i + 1][0] != '-') only = argv[++i];
+            } else if (!strcmp(argv[i], "--meta")) {
+                meta = 1;
             } else {
                 fprintf(stderr, "mynah-slm: unknown option '%s'\n", argv[i]);
                 return 2;
             }
         }
-        return cmd_inspect(argv[2], list, only);
+        return cmd_inspect(argv[2], list, only, meta);
     }
 
     fprintf(stderr, "mynah-slm: unknown command '%s'\n", argv[1]);

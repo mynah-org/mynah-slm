@@ -42,6 +42,11 @@ static int write_fixture(const char *path, char *err, size_t errsz) {
     ingot_gguf_kv_string(w, "general.architecture", "qwen3");
     ingot_gguf_kv_u32(w, "qwen3.block_count", 2);
     ingot_gguf_kv_u32(w, "qwen3.embedding_length", DIM);
+    /* A small float and a large one. Both are real config values, and both are
+     * silently destroyed by a renderer that tries integer accessors first —
+     * ingot converts happily, so 1e-6 comes back as "0". */
+    ingot_gguf_kv_f32(w, "qwen3.attention.layer_norm_rms_epsilon", 1e-6f);
+    ingot_gguf_kv_f32(w, "qwen3.rope.freq_base", 1e6f);
 
     float *attn = ramp(DIM * DIM);
     float *down = ramp(FF * DIM);
@@ -153,6 +158,21 @@ int main(void) {
             fail("ffn_down shape", "ne was not reversed into row-major order");
         if (down->nelem != 256 * 512) fail("ffn_down nelem", "wrong element count");
     }
+
+    /* ── metadata rendering ─────────────────────────────────────────────── */
+    printf("\n-- metadata --\n");
+    const char *eps = NULL, *theta = NULL;
+    for (size_t i = 0; i < r.n_meta; i++) {
+        if (!strcmp(r.meta[i].name, "qwen3.attention.layer_norm_rms_epsilon")) eps   = r.meta[i].value;
+        if (!strcmp(r.meta[i].name, "qwen3.rope.freq_base"))                   theta = r.meta[i].value;
+    }
+    printf("ok   rms_eps=%s rope_theta=%s\n", eps ? eps : "(absent)", theta ? theta : "(absent)");
+    /* The regression: a first-match accessor chain renders 1e-6 as "0", which
+     * looks like a value rather than like a bug. */
+    if (!eps || strcmp(eps, "0") == 0)
+        fail("rms_norm_eps", "rendered as 0 — float KV read through an integer accessor");
+    if (!theta || strcmp(theta, "0") == 0)
+        fail("rope.freq_base", "rendered as 0 — float KV read through an integer accessor");
 
     mynah_slm_report_free(&r);
     unlink(path);

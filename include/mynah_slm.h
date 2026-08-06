@@ -49,6 +49,15 @@ typedef struct {
     uint64_t    nbytes;
 } mynah_slm_tensor_info;
 
+/* One metadata key, rendered. Scalars become their text; arrays are summarized
+ * as "[int32 x 151936]" rather than dumped, because a vocabulary is 151936
+ * entries and nobody wants it in a report. */
+typedef struct {
+    char name[128];
+    char value[256];
+    int  is_array;
+} mynah_slm_meta_kv;
+
 /* One row of the per-type census: how much of a checkpoint is stored in a
  * given ggml block type, and whether this build can actually use it. */
 typedef struct {
@@ -82,6 +91,11 @@ typedef struct {
      * from, so making it optional would only add a flag nobody passes. */
     mynah_slm_tensor_info *tensors;
     size_t                 n_tensor_info;
+    /* Every metadata key, in file order. This is where the architecture config
+     * comes from — layers, head counts, RoPE theta, the tokenizer — so it is
+     * not optional either. */
+    mynah_slm_meta_kv     *meta;
+    size_t                 n_meta;
 } mynah_slm_report;
 
 /* Open a GGUF (single file or `-00001-of-000NN` split) and fill `out`.
