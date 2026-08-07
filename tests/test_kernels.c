@@ -11,6 +11,7 @@
  * SPDX-License-Identifier: MIT */
 #include "kernels.h"
 
+#include "kvcache.h"
 #include "qmat.h"
 
 #include "ingot/dtype.h"
@@ -349,12 +350,88 @@ done:
     free(w); free(x); free(a); free(b); free(packed);
 }
 
+/* The KV round trip is what the format costs numerically, and it is worth a
+ * gate because the perplexity sweep in docs/perf.md rests on it: q4 keys came
+ * out ruinous, and the first question about a result like that is whether the
+ * quantizer is broken. These bounds say it is not — each format lands where
+ * its bit budget says it should.
+ *
+ * Ranges rather than points: the exact figure depends on the data, and a test
+ * pinned to four digits would fail on a rounding change that harmed nobody. */
+static void test_kv_roundtrip(void) {
+    enum { N = 1 << 15 };
+    static float ref[N], x[N];
+
+    /* Sum of six uniforms: roughly the bell shape a post-RoPE key has, and not
+     * the flat distribution that would flatter a block-scaled format. */
+    unsigned seed = 7u;
+    for (int i = 0; i < N; i++) {
+        double a = 0.0;
+        for (int k = 0; k < 6; k++) {
+            seed = seed * 1103515245u + 12345u;
+            a += (double)((seed >> 16) & 0x7fff) / 32768.0 - 0.5;
+        }
+        ref[i] = (float)(a * 2.0);
+    }
+
+    const struct { mynah_slm_kv_type t; double lo, hi; } cases[] = {
+        { MYNAH_SLM_KV_BF16, 5e-4, 5e-3 },   /* 8 mantissa bits */
+        { MYNAH_SLM_KV_FP8,  8e-3, 6e-2 },   /* 3 mantissa bits, no scale */
+        { MYNAH_SLM_KV_Q8,   1e-3, 1e-2 },   /* 127 levels per 32 values */
+        { MYNAH_SLM_KV_Q4,   3e-2, 2e-1 },   /* 7 levels per 32 values */
+    };
+
+    for (size_t c = 0; c < sizeof cases / sizeof *cases; c++) {
+        memcpy(x, ref, sizeof ref);
+        mynah_slm_kv_roundtrip(cases[c].t, x, N);
+
+        double num = 0.0, den = 0.0;
+        for (int i = 0; i < N; i++) {
+            const double d = (double)x[i] - (double)ref[i];
+            num += d * d;
+            den += (double)ref[i] * (double)ref[i];
+        }
+        const double rms = sqrt(num / den);
+
+        char what[96], detail[96];
+        snprintf(what, sizeof what, "%s round trip lands in its bit budget",
+                 mynah_slm_kv_type_name(cases[c].t));
+        snprintf(detail, sizeof detail, "rms rel %.3e, expected %.0e..%.0e",
+                 rms, cases[c].lo, cases[c].hi);
+        check(what, rms >= cases[c].lo && rms <= cases[c].hi, detail);
+    }
+
+    /* f32 must be exactly a no-op, or the default path is not the reference. */
+    memcpy(x, ref, sizeof ref);
+    mynah_slm_kv_roundtrip(MYNAH_SLM_KV_F32, x, N);
+    check("f32 is bit-identical, not merely close",
+          memcmp(x, ref, sizeof ref) == 0, "the default path altered the values");
+
+    /* A per-block scale beats a floating exponent at the same width — the
+     * reason q8 is the 8-bit format here and fp8 is not. */
+    double err[2];
+    for (int k = 0; k < 2; k++) {
+        memcpy(x, ref, sizeof ref);
+        mynah_slm_kv_roundtrip(k == 0 ? MYNAH_SLM_KV_Q8 : MYNAH_SLM_KV_FP8, x, N);
+        double num = 0.0, den = 0.0;
+        for (int i = 0; i < N; i++) {
+            const double d = (double)x[i] - (double)ref[i];
+            num += d * d; den += (double)ref[i] * (double)ref[i];
+        }
+        err[k] = sqrt(num / den);
+    }
+    char detail[96];
+    snprintf(detail, sizeof detail, "q8 %.2e vs fp8 %.2e", err[0], err[1]);
+    check("q8 is more accurate than fp8 at the same 8 bits", err[0] < err[1], detail);
+}
+
 int main(void) {
     printf("-- norms --\n");        test_rms_norm(); test_rms_norm_per_head();
     printf("\n-- rope --\n");       test_rope();
     printf("\n-- activations --\n");test_activations();
     printf("\n-- attention --\n");  test_attention();
     printf("\n-- quantized matvec --\n"); test_q4_k_matvec();
+    printf("\n-- kv cache precision --\n"); test_kv_roundtrip();
 
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASS",
            failures, failures == 1 ? "" : "s");

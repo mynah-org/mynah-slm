@@ -13,9 +13,11 @@
 #include "template.h"
 #include "threads.h"
 #include "timing.h"
+#include "kvcache.h"
 #include "tokenizer.h"
 #include "tools.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,11 +32,13 @@ static void usage(FILE *f) {
         "  mynah-slm inspect <model.gguf> --tensors Q6_K   ... only that type\n"
         "  mynah-slm inspect <model.gguf> --meta     ... plus the metadata KV\n"
         "  mynah-slm tokenize -m <model.gguf> [--special] < text\n"
+        "  mynah-slm ppl -m <model.gguf> -f text.txt [--kv q8] [-n N]\n"
+        "                                            perplexity, the quality gate\n"
         "\n"
         "  mynah-slm run -m <model.gguf> -p \"prompt\" [-n 128] [--think off|low|on]\n"
         "                [--temp T] [--top-k K] [--top-p P] [--min-p M] [--seed S]\n"
         "                [--raw] [--no-stream] [--quiet] [--ctx N] [--show-think]\n"
-        "                [--tools tools.json]\n"
+        "                [--tools tools.json] [--kv f32|bf16|fp8|q8|q4]\n"
         "                [-t N | --threads N]   (default: performance cores)\n"
         "\n"
         "  Reasoning NEVER reaches stdout: it is discarded, or written to stderr\n"
@@ -244,9 +248,85 @@ static int collect_cb(void *ctx, uint32_t id, const char *text, size_t len) {
     return 0;
 }
 
+/* Mean negative log-likelihood of a text under the model, teacher-forced.
+ *
+ * The quality question a quantization claim has to answer, and the one thing
+ * "the story reads fine" cannot: greedy text diverging tells you the sampler
+ * hit a different argmax somewhere, which happens for a 1e-6 difference as
+ * readily as for a ruinous one. NLL measures the distribution, token by token,
+ * against the same text every time.
+ *
+ * Reported as perplexity too, because that is the number everyone else quotes.
+ * Same text, same model, same threads: only the thing under test changes. */
+static int cmd_ppl(const char *model_path, const char *path, int threads,
+                   mynah_slm_kv_type kv_k, mynah_slm_kv_type kv_v, int max_tok) {
+    char err[256];
+    mynah_slm_threads_init(threads);
+
+    mynah_slm_model_t *m = mynah_slm_load(model_path, err, sizeof err);
+    if (!m) { fprintf(stderr, "mynah-slm: %s\n", err); return 1; }
+
+    mynah_slm_tokenizer *tok = mynah_slm_tokenizer_load(m->gguf, err, sizeof err);
+    if (!tok) { fprintf(stderr, "mynah-slm: %s\n", err); return 1; }
+
+    char *text = path ? slurp_file(path, NULL) : slurp();
+    if (!text) { fprintf(stderr, "mynah-slm: cannot read the text\n"); return 1; }
+
+    long n_tok = mynah_slm_tokenize(tok, text, 0, NULL, 0);
+    if (n_tok < 2) { fprintf(stderr, "mynah-slm: need at least two tokens\n"); return 1; }
+    uint32_t *ids = malloc((size_t)n_tok * sizeof *ids);
+    if (!ids) return 1;
+    mynah_slm_tokenize(tok, text, 0, ids, (size_t)n_tok);
+    if (max_tok > 0 && n_tok > max_tok) n_tok = max_tok;
+
+    mynah_slm_state st;
+    if (mynah_slm_state_init(&st, m, (uint32_t)n_tok + 8, err, sizeof err) != 0) {
+        fprintf(stderr, "mynah-slm: %s\n", err);
+        return 1;
+    }
+    st.kv_k = kv_k;
+    st.kv_v = kv_v;
+
+    const uint32_t vocab = mynah_slm_vocab_size(m);
+    float *logits = malloc(vocab * sizeof *logits);
+    if (!logits) return 1;
+
+    /* One token at a time: every position's logits are needed, so there is
+     * nothing for the batched path to skip. */
+    double nll = 0.0;
+    long scored = 0;
+    for (long i = 0; i + 1 < n_tok; i++) {
+        if (mynah_slm_forward(&st, ids[i], logits) != 0) break;
+
+        double max = logits[0];
+        for (uint32_t v = 1; v < vocab; v++) if (logits[v] > max) max = logits[v];
+        double sum = 0.0;
+        for (uint32_t v = 0; v < vocab; v++) sum += exp((double)logits[v] - max);
+
+        /* log p(next) = logit - max - log(sum exp(logit - max)). Stable form:
+         * the naive log of a sum of exps overflows on a 151936-wide vector. */
+        nll -= ((double)logits[ids[i + 1]] - max - log(sum));
+        scored++;
+    }
+
+    if (scored == 0) { fprintf(stderr, "mynah-slm: nothing scored\n"); return 1; }
+    const double mean = nll / (double)scored;
+    printf("k=%-4s v=%-4s  tokens %ld  nll %.5f  ppl %.3f\n",
+           mynah_slm_kv_type_name(kv_k), mynah_slm_kv_type_name(kv_v),
+           scored, mean, exp(mean));
+
+    free(logits); free(ids); free(text);
+    mynah_slm_state_free(&st);
+    mynah_slm_tokenizer_free(tok);
+    mynah_slm_free(m);
+    mynah_slm_threads_shutdown();
+    return 0;
+}
+
 typedef struct {
     const char *model, *prompt, *system, *tools_path;
     int   max_new, raw, stream, quiet, think, ctx, show_think, threads;
+    mynah_slm_kv_type kv_k, kv_v;
     mynah_slm_sampler_params sp;
 } run_opts;
 
@@ -314,6 +394,8 @@ static int cmd_run(run_opts *o) {
         fprintf(stderr, "mynah-slm: %s\n", err);
         return 1;
     }
+    st.kv_k = o->kv_k;
+    st.kv_v = o->kv_v;
     mynah_slm_timing_end_load(&tm);
 
     mynah_slm_sampler *sam = mynah_slm_sampler_new(&o->sp, mynah_slm_vocab_size(m));
@@ -423,6 +505,17 @@ int main(int argc, char **argv) {
             else if (!strcmp(a, "-p"))          { NEEDV(); o.prompt = v; }
             else if (!strcmp(a, "--system"))    { NEEDV(); o.system = v; }
             else if (!strcmp(a, "--tools"))     { NEEDV(); o.tools_path = v; }
+            else if (!strcmp(a, "--kv") || !strcmp(a, "--kv-k") || !strcmp(a, "--kv-v")) {
+                const char *flag = a;
+                NEEDV();
+                mynah_slm_kv_type t;
+                if (mynah_slm_kv_type_parse(v, &t) != 0) {
+                    fprintf(stderr, "mynah-slm: %s takes f32|bf16|fp8|q8|q4\n", flag);
+                    return 2;
+                }
+                if (strcmp(flag, "--kv-v") != 0) o.kv_k = t;
+                if (strcmp(flag, "--kv-k") != 0) o.kv_v = t;
+            }
             else if (!strcmp(a, "-n"))          { NEEDV(); o.max_new = atoi(v); }
             else if (!strcmp(a, "--ctx"))       { NEEDV(); o.ctx = atoi(v); }
             else if (!strcmp(a, "-t") || !strcmp(a, "--threads")) { NEEDV(); o.threads = atoi(v); }
@@ -450,6 +543,33 @@ int main(int argc, char **argv) {
             return 2;
         }
         return cmd_run(&o);
+    }
+    if (!strcmp(argv[1], "ppl")) {
+        const char *model = NULL, *file = NULL;
+        int threads = 0, max_tok = 0;
+        mynah_slm_kv_type kv_k = MYNAH_SLM_KV_F32, kv_v = MYNAH_SLM_KV_F32;
+        for (int i = 2; i < argc; i++) {
+            const char *a = argv[i];
+            const char *v = (i + 1 < argc) ? argv[i + 1] : NULL;
+            if      (!strcmp(a, "-m") && v)   { model = v; i++; }
+            else if (!strcmp(a, "-f") && v)   { file = v; i++; }
+            else if (!strcmp(a, "-n") && v)   { max_tok = atoi(v); i++; }
+            else if ((!strcmp(a, "-t") || !strcmp(a, "--threads")) && v) { threads = atoi(v); i++; }
+            else if ((!strcmp(a, "--kv") || !strcmp(a, "--kv-k") ||
+                      !strcmp(a, "--kv-v")) && v) {
+                mynah_slm_kv_type t;
+                if (mynah_slm_kv_type_parse(v, &t) != 0) {
+                    fprintf(stderr, "mynah-slm: %s takes f32|bf16|fp8|q8|q4\n", a);
+                    return 2;
+                }
+                if (strcmp(a, "--kv-v") != 0) kv_k = t;
+                if (strcmp(a, "--kv-k") != 0) kv_v = t;
+                i++;
+            }
+            else { fprintf(stderr, "mynah-slm: unknown option '%s'\n", a); return 2; }
+        }
+        if (!model) { fprintf(stderr, "mynah-slm: ppl needs -m <model.gguf>\n"); return 2; }
+        return cmd_ppl(model, file, threads, kv_k, kv_v, max_tok);
     }
     if (!strcmp(argv[1], "tokenize")) {
         const char *model = NULL;

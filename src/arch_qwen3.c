@@ -169,6 +169,17 @@ int mynah_slm_state_init(mynah_slm_state *s, const mynah_slm_model_t *m,
      * the knee, and the scratch it needs is a few MB. MYNAH_SLM_BATCH exists
      * so the next machine gets measured instead of assumed. Never wider than
      * the context. */
+    /* KV precision. An env var as well as the API field, so a sweep — and
+     * tests/test_parity, which takes no flags — can select it without a
+     * rebuild. */
+    const char *kv_env = getenv("MYNAH_SLM_KV");
+    if (kv_env) {
+        mynah_slm_kv_type_parse(kv_env, &s->kv_k);
+        s->kv_v = s->kv_k;
+    }
+    if ((kv_env = getenv("MYNAH_SLM_KV_K")) != NULL) mynah_slm_kv_type_parse(kv_env, &s->kv_k);
+    if ((kv_env = getenv("MYNAH_SLM_KV_V")) != NULL) mynah_slm_kv_type_parse(kv_env, &s->kv_v);
+
     uint32_t batch = 256;
     const char *env = getenv("MYNAH_SLM_BATCH");
     if (env) {
@@ -322,6 +333,10 @@ int mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
 
             mynah_slm_rope_apply(&s->rope, q_row, c->n_heads,    pos0 + t);
             mynah_slm_rope_apply(&s->rope, k_row, c->n_kv_heads, pos0 + t);
+
+            mynah_slm_kv_roundtrip(s->kv_k, k_row, c->kv_dim);
+            mynah_slm_kv_roundtrip(s->kv_v, v_slot + (size_t)t * c->kv_dim,
+                                   c->kv_dim);
         }
 
         /* One pass over the history for the whole batch instead of one per
@@ -421,6 +436,12 @@ int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
         /* V is never rotated — only Q and K carry position. */
         mynah_slm_rope_apply(&s->rope, s->q,    c->n_heads,    pos);
         mynah_slm_rope_apply(&s->rope, k_slot,  c->n_kv_heads, pos);
+
+        /* K is rounded to the cache's precision AFTER RoPE, because RoPE is
+         * what will have been applied to the stored value. Rounding first
+         * would measure a format nobody would ship. */
+        mynah_slm_kv_roundtrip(s->kv_k, k_slot, c->kv_dim);
+        mynah_slm_kv_roundtrip(s->kv_v, v_slot, c->kv_dim);
 
         mynah_slm_attention_mt(s->attn, s->q, k_layer, v_layer, n_kv,
                                c->n_heads, c->n_kv_heads, c->head_dim, s->scores_mt);

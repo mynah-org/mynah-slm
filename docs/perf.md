@@ -199,19 +199,81 @@ machine rather than the kernel — which is exactly what two *separate* runs did
 disagreeing by 80% on those same untouched tensors. Interleaved, in one
 process, best-of-N.
 
-End to end, interleaved, 60 generated tokens:
+End to end, interleaved, 60 generated tokens, four runs across two sessions:
 
 | | decode |
 |---|---|
-| ours | **36.5 / 36.5 tok/s** |
-| ingot | 28.0 / 27.8 tok/s |
+| ours | 36.5 / 36.5 / 35.2 / 34.9 tok/s |
+| ingot | 28.0 / 27.8 / 26.6 / 26.3 tok/s |
 
-**+30%, and the greedy output is byte-identical.** Correctness is gated in two
+**+30 to +32%, and the greedy output is byte-identical.** The ratio is what is
+stable; the absolute number drifts about 5% with the thermal state of the
+machine, which is exactly why the comparison is interleaved and why a single
+run of each would be worth nothing. (The lower pair was measured after killing
+two idle server processes left over from a test run — they were using no CPU,
+but they held ~800 MB of mapped weights on a 16 GB machine. Check what else is
+running before quoting an absolute.) Correctness is gated in two
 places rather than assumed: `tests/test_kernels.c` checks our kernel against
 ingot's on synthetic Q4_K weights with no checkpoint (`rel=3.5e-07`, and ingot
 is the right oracle there because it is cross-checked against llama.cpp), and
 the parity gate still holds at `1.50e-06` on layer 0 with 19/19 argmax
 agreement.
+
+## KV cache precision: 4-bit keys are ruinous, 4-bit values are nearly free
+
+At a 2275-token context the KV caches are **~520 MB — larger than the model**,
+and attention re-reads them on every generated token. So their precision is the
+biggest single memory item and a real share of decode time.
+
+The memory saving is arithmetic and known in advance. The QUALITY is not, and
+that is the only part worth measuring, so `mynah-slm ppl` exists: mean negative
+log-likelihood of a fixed text, teacher-forced, same text and same threads with
+only the format changing. Greedy output cannot answer this — text diverges as
+readily from a 1e-6 difference as from a ruinous one, because all it takes is
+one argmax flipping early.
+
+917 tokens across it/en/de/fr/es/ja/zh, `Qwen3-0.6B-Q4_K_M`:
+
+| K | V | ppl | vs f32 | bits/value |
+|---|---|---|---|---|
+| f32 | f32 | 2.802 | — | 32 / 32 |
+| bf16 | bf16 | 2.801 | -0.0% | 16 / 16 |
+| **q8** | **q8** | **2.803** | **+0.0%** | 8.5 / 8.5 |
+| q8 | f32 | 2.799 | -0.1% | 8.5 / 32 |
+| fp8 | fp8 | 2.817 | +0.5% | 8 / 8 |
+| bf16 | q4 | 2.817 | +0.5% | 16 / 4.5 |
+| f32 | q4 | 2.835 | +1.2% | 32 / 4.5 |
+| **q8** | **q4** | **2.871** | **+2.5%** | 8.5 / 4.5 |
+| q4 | q8 | **26.776** | **+855%** | 4.5 / 8.5 |
+| q4 | q4 | 27.583 | +884% | 4.5 / 4.5 |
+
+**K and V are not equally sensitive, and the gap is enormous.** A key goes
+through the softmax exponent, where its error is amplified before anything
+normalizes it; a value is averaged with weights that sum to one, where errors
+partly cancel. Four-bit keys destroy the model — 10x the perplexity, and the
+generated text switches language mid-sentence. Four-bit VALUES, with the same
+9.4% quantization noise, cost 0.5-1.2%.
+
+That asymmetry is the practical result: **quantize V harder than K.**
+
+**q8 beats fp8 at the same 8 bits** (2.799 vs 2.817). One scale per 32 values
+adapts to the block; e4m3 spends 4 of its 8 bits on an exponent that a
+well-scaled block does not need. Worth knowing before reaching for fp8 because
+the hardware has a name for it.
+
+The quantizer itself is gated rather than trusted — `tests/test_kernels.c`
+checks each format's round-trip error against its bit budget (bf16 1.6e-3,
+q8 5.2e-3, fp8 2.6e-2, q4 9.4e-2 RMS relative), because the first question
+about a 10x perplexity is whether the tool is broken. It is not: q4 really is
+9.4% noise, and keys do not survive it.
+
+What this buys, at a 2275-token context, once the packed storage is written:
+
+| | KV size | vs f32 |
+|---|---|---|
+| f32 / f32 | 521 MB | — |
+| q8 / q8 | 138 MB | **3.8x** |
+| q8 / q4 | 106 MB | **4.9x** |
 
 ## Batched prefill: 26 -> 370 tok/s, and TTFT 7.6 s -> 0.58 s
 
@@ -305,11 +367,10 @@ not fine for a path that has to agree with decode.
   equivalent treatment — its scales are int8 per 16 weights rather than a
   packed 6-bit pair, so the same distribute-the-sum trick does not transfer
   unchanged, but the per-element scale multiply is there to remove.
-- **A bf16 KV cache.** At a 2275-token context the caches are ~520 MB, more
-  than the model itself, and attention re-reads them every token. Halving that
-  is the one change that makes the engine both lighter and faster; it needs its
-  own quality measurement, because it moves the numbers the parity gate
-  watches.
+- **Packed KV storage.** The precision question below is answered; what is not
+  yet written is the storage that turns the answer into bytes saved. Today the
+  formats are measured by ROUND TRIP — quantized and dequantized straight back
+  into the f32 cache — which costs the quality without paying the saving.
 - **SIMD in our own kernels: measured, and mostly not worth it.** See below.
 - **Q4_0 has a kernel now** (NEON + AVX2, 7-10x over the generic path), which
   changes nothing for Qwen3 — it is Q4_K/Q6_K — and everything for Gemma 4,

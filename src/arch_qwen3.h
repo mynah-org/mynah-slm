@@ -10,6 +10,7 @@
 #define MYNAH_SLM_ARCH_QWEN3_H
 
 #include "kernels.h"
+#include "kvcache.h"
 #include "model.h"
 
 /* Optional per-layer taps, used by the parity harness to dump the residual
@@ -23,6 +24,16 @@ typedef struct {
 
     uint32_t n_ctx;     /* allocated positions */
     uint32_t n_past;    /* positions already in the cache */
+
+    /* The precision K and V are KEPT at, SEPARATELY — they are not equally
+     * sensitive. A key goes through the softmax exponent, where an error is
+     * amplified before it is normalized; a value is averaged with weights that
+     * sum to one, where errors partly cancel. Measured, that difference is
+     * worth several bits (docs/perf.md).
+     *
+     * f32 is the reference the parity gate was set on; anything else trades
+     * quality for bytes and has to be measured, never assumed. */
+    mynah_slm_kv_type kv_k, kv_v;
 
     /* [n_layers][n_ctx][kv_dim] — a position is contiguous, which is the order
      * the attention kernel walks. */
