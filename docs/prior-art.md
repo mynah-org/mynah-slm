@@ -6,9 +6,38 @@ not link against sibling projects (PLAN.md: "No dependency on mynah-asr or
 mynah-tts").
 
 Rule of thumb: **port, don't invent.** If a kernel already exists in a sibling
-and is validated, porting it costs an afternoon and inherits its bug fixes. If
-it's generic enough for a weight-container consumer, it belongs **upstream in
-`ingot`**, not copied a fourth time.
+and is validated, porting it costs an afternoon and inherits its bug fixes.
+
+**Porting means copying it here, not hoisting it into a shared library.** The
+line we hold (CLAUDE.md rule 4) is *what has one right answer gets shared, what
+is a performance trade-off does not*:
+
+- **Containers are shared.** "Decode a Q4_K block" has exactly one correct
+  output, checkable bit-for-bit against llama.cpp, and it does not vary by
+  engine. That is `ingot`, and every sibling should keep using it.
+- **Compute is not.** A product's shape depends on the batch width, the KV
+  layout, the threading and the precision policy — none of which are the same
+  across an ASR encoder, a TTS codec head and a text decoder. There is no
+  single right answer to share.
+
+The failure mode we are deliberately avoiding is the one every general tensor
+library reaches: a wide contract means every change has to be re-benchmarked
+across every architecture and every consumer before it can be accepted, so the
+safe merge is always the generic one, and the generic one is nobody's fastest.
+It is not a competence problem, it is what a wide contract costs.
+
+A concrete case from this repo: `ingot_matmat` quantizes activations to int8
+from two tokens up — a good default for a general library, and 20x the
+tolerance our parity gate holds. A shared library has to pick one default. An
+engine gets to pick its own.
+
+**When to reconsider**, so this stays a decision and not a habit: hoist a
+kernel into a shared library only once the *same* kernel, at the *same*
+shapes and the *same* precision policy, has been independently measured to win
+in two or more engines. If the precision policy differs, it was never the same
+kernel. Until then the thing worth sharing between siblings is the METHOD —
+interleaved A/B, differences not absolutes, a parity gate at per-stage
+tolerance — which copies for free and cannot rot.
 
 ---
 
