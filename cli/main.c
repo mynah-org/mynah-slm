@@ -280,12 +280,11 @@ static int cmd_ppl(const char *model_path, const char *path, int threads,
     if (max_tok > 0 && n_tok > max_tok) n_tok = max_tok;
 
     mynah_slm_state st;
-    if (mynah_slm_state_init(&st, m, (uint32_t)n_tok + 8, err, sizeof err) != 0) {
+    if (mynah_slm_state_init_kv(&st, m, (uint32_t)n_tok + 8, kv_k, kv_v,
+                                err, sizeof err) != 0) {
         fprintf(stderr, "mynah-slm: %s\n", err);
         return 1;
     }
-    st.kv_k = kv_k;
-    st.kv_v = kv_v;
 
     const uint32_t vocab = mynah_slm_vocab_size(m);
     float *logits = malloc(vocab * sizeof *logits);
@@ -311,9 +310,10 @@ static int cmd_ppl(const char *model_path, const char *path, int threads,
 
     if (scored == 0) { fprintf(stderr, "mynah-slm: nothing scored\n"); return 1; }
     const double mean = nll / (double)scored;
-    printf("k=%-4s v=%-4s  tokens %ld  nll %.5f  ppl %.3f\n",
+    printf("k=%-4s v=%-4s  tokens %ld  nll %.5f  ppl %.3f  kv %.1f MB\n",
            mynah_slm_kv_type_name(kv_k), mynah_slm_kv_type_name(kv_v),
-           scored, mean, exp(mean));
+           scored, mean, exp(mean),
+           (double)mynah_slm_kv_bytes(&st.kv) / (1024.0 * 1024.0));
 
     free(logits); free(ids); free(text);
     mynah_slm_state_free(&st);
@@ -390,12 +390,11 @@ static int cmd_run(run_opts *o) {
     mynah_slm_state st;
     const uint32_t want_ctx = o->ctx > 0 ? (uint32_t)o->ctx
                                          : (uint32_t)(n_prompt + o->max_new + 8);
-    if (mynah_slm_state_init(&st, m, want_ctx, err, sizeof err) != 0) {
+    if (mynah_slm_state_init_kv(&st, m, want_ctx, o->kv_k, o->kv_v,
+                                err, sizeof err) != 0) {
         fprintf(stderr, "mynah-slm: %s\n", err);
         return 1;
     }
-    st.kv_k = o->kv_k;
-    st.kv_v = o->kv_v;
     mynah_slm_timing_end_load(&tm);
 
     mynah_slm_sampler *sam = mynah_slm_sampler_new(&o->sp, mynah_slm_vocab_size(m));
@@ -495,7 +494,11 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(argv[1], "run")) {
-        run_opts o = { .max_new = 128, .stream = 1, .think = MYNAH_SLM_THINK_OFF };
+        /* bf16 by default, measured: half the KV memory, +26% decode at a
+         * 2275-token context, and perplexity identical to f32 to three
+         * decimals (docs/perf.md). `--kv f32` gets the reference back. */
+        run_opts o = { .max_new = 128, .stream = 1, .think = MYNAH_SLM_THINK_OFF,
+                       .kv_k = MYNAH_SLM_KV_BF16, .kv_v = MYNAH_SLM_KV_BF16 };
         mynah_slm_sampler_defaults(&o.sp);
         for (int i = 2; i < argc; i++) {
             const char *a = argv[i];

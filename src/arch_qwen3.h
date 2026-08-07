@@ -33,11 +33,11 @@ typedef struct {
      *
      * f32 is the reference the parity gate was set on; anything else trades
      * quality for bytes and has to be measured, never assumed. */
-    mynah_slm_kv_type kv_k, kv_v;
+    mynah_slm_kv_type kv_k, kv_v;   /* requested; the cache is built from these */
 
-    /* [n_layers][n_ctx][kv_dim] — a position is contiguous, which is the order
-     * the attention kernel walks. */
-    float *k_cache, *v_cache;
+    /* [n_layers][n_ctx][kv_dim], K and V possibly at different precisions.
+     * A position is contiguous, which is the order attention walks. */
+    mynah_slm_kv kv;
 
     /* scratch, all allocated once */
     float *x;          /* residual stream          [d_model]  */
@@ -62,6 +62,11 @@ typedef struct {
     float *bx, *bh, *bq, *battn, *bproj, *bgate, *bup;
     float *strip;                     /* [STRIP_ROWS * max_cols] */
     float *bscores;                   /* [batch_max * n_ctx] attention scores */
+    /* K and V are computed in f32 and then ENCODED into the cache, so they
+     * need a landing place first. At f32 the encode is a memcpy; paying it
+     * keeps one code path instead of two. */
+    float *bk, *bv;                   /* [batch_max * kv_dim] */
+    float *kgather, *vgather;         /* [n_ctx * head_dim], batched attention */
 
     mynah_slm_final_cb on_embed;   /* the residual stream before layer 0 */
     mynah_slm_layer_cb on_layer;
@@ -76,6 +81,16 @@ typedef struct {
 int  mynah_slm_project(const mynah_slm_model_t *m, const ingot_tensor *w,
                        const float *in, float *out);
 
+/* The KV precision has to be chosen HERE, not assigned to the state
+ * afterwards: the cache is allocated and its layout fixed during init, and a
+ * field set later would be read by nothing. (It was, once, and every format
+ * silently measured as f32.) */
+int  mynah_slm_state_init_kv(mynah_slm_state *s, const mynah_slm_model_t *m,
+                             uint32_t n_ctx, mynah_slm_kv_type kv_k,
+                             mynah_slm_kv_type kv_v, char *err, size_t errsz);
+
+/* f32 unless MYNAH_SLM_KV / _K / _V say otherwise — the form for callers that
+ * have no opinion, and the one a sweep can drive without a rebuild. */
 int  mynah_slm_state_init(mynah_slm_state *s, const mynah_slm_model_t *m,
                           uint32_t n_ctx, char *err, size_t errsz);
 void mynah_slm_state_free(mynah_slm_state *s);

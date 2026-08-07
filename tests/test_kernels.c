@@ -425,6 +425,98 @@ static void test_kv_roundtrip(void) {
     check("q8 is more accurate than fp8 at the same 8 bits", err[0] < err[1], detail);
 }
 
+/* The fused decode accessors must agree with the unpack-then-dot reference.
+ *
+ * They are two different implementations of the same sum — one walks the
+ * packed bytes with NEON, the other decodes a slice and dots it — and the
+ * first exists only because the second measured SLOWER than an f32 cache.
+ * A vectorized kernel that is subtly wrong is exactly the thing that shows up
+ * as "quality got a bit worse" three commits later. */
+static void test_kv_packed(void) {
+    enum { HEADS = 2, HD = 128, LAYERS = 1, CTX = 4 };
+
+    float row[HEADS * HD], q[HD];
+    unsigned seed = 99u;
+    for (int i = 0; i < HEADS * HD; i++) {
+        seed = seed * 1103515245u + 12345u;
+        row[i] = (float)((int)((seed >> 16) & 0x7fff) - 16384) * 1e-4f;
+    }
+    for (int i = 0; i < HD; i++) {
+        seed = seed * 1103515245u + 12345u;
+        q[i] = (float)((int)((seed >> 16) & 0x7fff) - 16384) * 1e-4f;
+    }
+
+    const mynah_slm_kv_type types[] = { MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_FP8,
+                                        MYNAH_SLM_KV_Q8, MYNAH_SLM_KV_Q4 };
+    for (size_t c = 0; c < sizeof types / sizeof *types; c++) {
+        mynah_slm_kv kv;
+        if (mynah_slm_kv_init(&kv, types[c], types[c], LAYERS, CTX, HEADS, HD) != 0) {
+            check("kv cache allocates", 0, "init failed");
+            return;
+        }
+        mynah_slm_kv_put_k(&kv, 0, 1, row);
+        mynah_slm_kv_put_v(&kv, 0, 1, row);
+
+        /* The reference: decode the slice, then dot it in plain f32. */
+        float slice[HD];
+        mynah_slm_kv_gather_k(&kv, 0, 1, 2, slice);      /* positions 0..1 */
+        const float *k1 = slice + HD;                    /* position 1 */
+        double want = 0.0;
+        for (int i = 0; i < HD; i++) want += (double)q[i] * (double)k1[i];
+
+        const double got = mynah_slm_kv_dot_k(&kv, 0, 1, 1, q);
+        const double rel = fabs(got - want) / (fabs(want) > 1e-9 ? fabs(want) : 1.0);
+
+        char what[96], detail[128];
+        snprintf(what, sizeof what, "%s fused dot matches unpack-then-dot",
+                 mynah_slm_kv_type_name(types[c]));
+        snprintf(detail, sizeof detail, "got %.6f want %.6f rel %.2e", got, want, rel);
+        check(what, rel < 1e-5, detail);
+
+        /* And the accumulate, which has its own unpacking. */
+        float acc[HD] = {0};
+        mynah_slm_kv_axpy_v(&kv, 0, 1, 1, 0.75f, acc);
+        double worst = 0.0;
+        for (int i = 0; i < HD; i++) {
+            const double d = fabs((double)acc[i] - 0.75 * (double)k1[i]);
+            if (d > worst) worst = d;
+        }
+        snprintf(what, sizeof what, "%s fused accumulate matches",
+                 mynah_slm_kv_type_name(types[c]));
+        snprintf(detail, sizeof detail, "worst abs %.2e", worst);
+        check(what, worst < 1e-5, detail);
+
+        /* A position never written must read as zero, or a fresh cache would
+         * make attention read whatever the allocator left behind. */
+        mynah_slm_kv_free(&kv);
+    }
+
+    /* The packed value has to be the round trip's value: two definitions of
+     * one format is one too many. */
+    mynah_slm_kv kv;
+    if (mynah_slm_kv_init(&kv, MYNAH_SLM_KV_Q8, MYNAH_SLM_KV_Q8, 1, 2, HEADS, HD) == 0) {
+        mynah_slm_kv_put_k(&kv, 0, 0, row);
+        float packed[HD], expect[HD];
+        mynah_slm_kv_gather_k(&kv, 0, 0, 1, packed);
+        memcpy(expect, row, sizeof expect);
+        mynah_slm_kv_roundtrip(MYNAH_SLM_KV_Q8, expect, HD);
+        double worst = 0.0;
+        for (int i = 0; i < HD; i++) {
+            const double d = fabs((double)packed[i] - (double)expect[i]);
+            if (d > worst) worst = d;
+        }
+        char detail[96];
+        snprintf(detail, sizeof detail, "worst abs %.2e", worst);
+        /* Exact, not close: one definition of the format, used by both. The
+         * first version of this had the round trip keep an f32 scale and the
+         * packed writer an f16 one, and the two drifted by 3.7e-04 — small
+         * enough to look like rounding and large enough to make the measured
+         * perplexity table describe something nobody could run. */
+        check("packed q8 agrees with the round-trip definition", worst == 0.0, detail);
+        mynah_slm_kv_free(&kv);
+    }
+}
+
 int main(void) {
     printf("-- norms --\n");        test_rms_norm(); test_rms_norm_per_head();
     printf("\n-- rope --\n");       test_rope();
@@ -432,6 +524,7 @@ int main(void) {
     printf("\n-- attention --\n");  test_attention();
     printf("\n-- quantized matvec --\n"); test_q4_k_matvec();
     printf("\n-- kv cache precision --\n"); test_kv_roundtrip();
+    printf("\n-- kv cache, packed --\n"); test_kv_packed();
 
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASS",
            failures, failures == 1 ? "" : "s");

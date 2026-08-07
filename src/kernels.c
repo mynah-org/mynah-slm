@@ -8,6 +8,8 @@
  * SPDX-License-Identifier: MIT */
 #include "kernels.h"
 
+#include "kvcache.h"
+
 #include "threads.h"
 
 #include <math.h>
@@ -343,6 +345,87 @@ void mynah_slm_attention_batch(float *out, const float *q,
                     (int)n_q, (int)head_dim, (int)n_kv, 1.0f,
                     scores, (int)n_kv,
                     v + (size_t)kvh * head_dim, (int)kv_dim,
+                    0.0f, out + (size_t)h * head_dim, (int)q_stride);
+    }
+}
+
+/* ── attention over a packed KV cache ──────────────────────────────────────*/
+
+typedef struct {
+    float *out, *scratch;
+    const float *q;
+    const mynah_slm_kv *cache;
+    uint32_t layer, n_kv, n_heads, n_kv_heads, head_dim;
+} attn_kv_job;
+
+static void attn_kv_task(void *ctx, int i) {
+    attn_kv_job *j = ctx;
+    const uint32_t h = (uint32_t)i;
+    const uint32_t group = j->n_heads / j->n_kv_heads;
+    const uint32_t kvh = h / group;
+    const float scale = 1.0f / sqrtf((float)j->head_dim);
+
+    const float *qh = j->q + (size_t)h * j->head_dim;
+    float *scores = j->scratch + (size_t)h * j->n_kv;
+
+    for (uint32_t t = 0; t < j->n_kv; t++)
+        scores[t] = mynah_slm_kv_dot_k(j->cache, j->layer, t, kvh, qh) * scale;
+    mynah_slm_softmax(scores, j->n_kv);
+
+    float *oh = j->out + (size_t)h * j->head_dim;
+    memset(oh, 0, j->head_dim * sizeof *oh);
+    for (uint32_t t = 0; t < j->n_kv; t++)
+        mynah_slm_kv_axpy_v(j->cache, j->layer, t, kvh, scores[t], oh);
+}
+
+void mynah_slm_attention_kv_mt(float *out, const float *q,
+                               const struct mynah_slm_kv *cache, uint32_t layer,
+                               uint32_t n_kv, uint32_t n_heads,
+                               uint32_t n_kv_heads, uint32_t head_dim,
+                               float *scratch) {
+    attn_kv_job j = { out, scratch, q, (const mynah_slm_kv *)cache, layer,
+                      n_kv, n_heads, n_kv_heads, head_dim };
+    mynah_slm_parallel_for((int)n_heads, attn_kv_task, &j);
+}
+
+void mynah_slm_attention_kv_batch(float *out, const float *q,
+                                  const struct mynah_slm_kv *cache, uint32_t layer,
+                                  uint32_t pos0, uint32_t n_q, uint32_t n_heads,
+                                  uint32_t n_kv_heads, uint32_t head_dim,
+                                  uint32_t q_stride, float *scores,
+                                  float *kscratch, float *vscratch) {
+    const mynah_slm_kv *c = (const mynah_slm_kv *)cache;
+    const uint32_t group = n_heads / n_kv_heads;
+    const uint32_t n_kv  = pos0 + n_q;
+    const float    scale = 1.0f / sqrtf((float)head_dim);
+
+    uint32_t gathered = (uint32_t)-1;
+    for (uint32_t h = 0; h < n_heads; h++) {
+        const uint32_t kvh = h / group;
+        /* GQA: several query heads share one KV head, and they are adjacent,
+         * so the gather is paid once per KV head rather than once per head. */
+        if (kvh != gathered) {
+            mynah_slm_kv_gather_k(c, layer, kvh, n_kv, kscratch);
+            mynah_slm_kv_gather_v(c, layer, kvh, n_kv, vscratch);
+            gathered = kvh;
+        }
+
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    (int)n_q, (int)n_kv, (int)head_dim, scale,
+                    q + (size_t)h * head_dim, (int)q_stride,
+                    kscratch, (int)head_dim,
+                    0.0f, scores, (int)n_kv);
+
+        for (uint32_t t = 0; t < n_q; t++) {
+            float *row = scores + (size_t)t * n_kv;
+            const uint32_t len = pos0 + t + 1;
+            mynah_slm_softmax(row, len);
+            memset(row + len, 0, (size_t)(n_kv - len) * sizeof *row);
+        }
+
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    (int)n_q, (int)head_dim, (int)n_kv, 1.0f,
+                    scores, (int)n_kv, vscratch, (int)head_dim,
                     0.0f, out + (size_t)h * head_dim, (int)q_stride);
     }
 }

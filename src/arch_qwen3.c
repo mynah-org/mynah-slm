@@ -131,7 +131,20 @@ static float *alloc_f32(size_t n) {
 
 int mynah_slm_state_init(mynah_slm_state *s, const mynah_slm_model_t *m,
                          uint32_t n_ctx, char *err, size_t errsz) {
+    mynah_slm_kv_type k = MYNAH_SLM_KV_F32, v = MYNAH_SLM_KV_F32;
+    const char *e = getenv("MYNAH_SLM_KV");
+    if (e) { mynah_slm_kv_type_parse(e, &k); v = k; }
+    if ((e = getenv("MYNAH_SLM_KV_K")) != NULL) mynah_slm_kv_type_parse(e, &k);
+    if ((e = getenv("MYNAH_SLM_KV_V")) != NULL) mynah_slm_kv_type_parse(e, &v);
+    return mynah_slm_state_init_kv(s, m, n_ctx, k, v, err, errsz);
+}
+
+int mynah_slm_state_init_kv(mynah_slm_state *s, const mynah_slm_model_t *m,
+                            uint32_t n_ctx, mynah_slm_kv_type kv_k,
+                            mynah_slm_kv_type kv_v, char *err, size_t errsz) {
     memset(s, 0, sizeof *s);
+    s->kv_k = kv_k;
+    s->kv_v = kv_v;
     const mynah_slm_config *c = &m->cfg;
 
     if (n_ctx == 0 || n_ctx > c->n_ctx) n_ctx = c->n_ctx;
@@ -147,9 +160,6 @@ int mynah_slm_state_init(mynah_slm_state *s, const mynah_slm_model_t *m,
      * [pos][n_kv_heads * head_dim] so a position is contiguous — that is the
      * order the attention kernel walks. Allocated once, never grown inside the
      * token loop. */
-    const size_t per_layer = (size_t)n_ctx * c->kv_dim;
-    s->k_cache = alloc_f32(per_layer * c->n_layers);
-    s->v_cache = alloc_f32(per_layer * c->n_layers);
 
     s->x       = alloc_f32(c->d_model);
     s->h       = alloc_f32(c->d_model);
@@ -169,17 +179,6 @@ int mynah_slm_state_init(mynah_slm_state *s, const mynah_slm_model_t *m,
      * the knee, and the scratch it needs is a few MB. MYNAH_SLM_BATCH exists
      * so the next machine gets measured instead of assumed. Never wider than
      * the context. */
-    /* KV precision. An env var as well as the API field, so a sweep — and
-     * tests/test_parity, which takes no flags — can select it without a
-     * rebuild. */
-    const char *kv_env = getenv("MYNAH_SLM_KV");
-    if (kv_env) {
-        mynah_slm_kv_type_parse(kv_env, &s->kv_k);
-        s->kv_v = s->kv_k;
-    }
-    if ((kv_env = getenv("MYNAH_SLM_KV_K")) != NULL) mynah_slm_kv_type_parse(kv_env, &s->kv_k);
-    if ((kv_env = getenv("MYNAH_SLM_KV_V")) != NULL) mynah_slm_kv_type_parse(kv_env, &s->kv_v);
-
     uint32_t batch = 256;
     const char *env = getenv("MYNAH_SLM_BATCH");
     if (env) {
@@ -205,12 +204,18 @@ int mynah_slm_state_init(mynah_slm_state *s, const mynah_slm_model_t *m,
      * be worth stating — 1.2 MB at a 2000-token context — and still an order
      * of magnitude under the KV cache it reads. */
     s->bscores = alloc_f32((size_t)batch * n_ctx);
+    s->bk      = alloc_f32((size_t)batch * c->kv_dim);
+    s->bv      = alloc_f32((size_t)batch * c->kv_dim);
+    s->kgather = alloc_f32((size_t)n_ctx * c->head_dim);
+    s->vgather = alloc_f32((size_t)n_ctx * c->head_dim);
 
-    if (!s->k_cache || !s->v_cache || !s->x || !s->h || !s->q || !s->attn ||
+    if (!s->x || !s->h || !s->q || !s->attn ||
         !s->proj || !s->gate || !s->up || !s->scores || !s->scores_mt ||
         !s->logits || !s->embed_row || !s->bx || !s->bh || !s->bq ||
         !s->battn || !s->bproj || !s->bgate || !s->bup || !s->strip ||
-        !s->bscores) {
+        !s->bscores || !s->bk || !s->bv || !s->kgather || !s->vgather ||
+        mynah_slm_kv_init(&s->kv, s->kv_k, s->kv_v, c->n_layers, n_ctx,
+                          c->n_kv_heads, c->head_dim) != 0) {
         snprintf(err, errsz, "out of memory for a %u-position context", n_ctx);
         mynah_slm_state_free(s);
         return -1;
@@ -223,8 +228,7 @@ uint32_t mynah_slm_batch_max(const mynah_slm_state *s) { return s->batch_max; }
 void mynah_slm_state_free(mynah_slm_state *s) {
     if (!s) return;
     mynah_slm_rope_free(&s->rope);
-    mynah_slm_aligned_free(s->k_cache);
-    mynah_slm_aligned_free(s->v_cache);
+    mynah_slm_kv_free(&s->kv);
     mynah_slm_aligned_free(s->x);
     mynah_slm_aligned_free(s->h);
     mynah_slm_aligned_free(s->q);
@@ -245,6 +249,10 @@ void mynah_slm_state_free(mynah_slm_state *s) {
     mynah_slm_aligned_free(s->bup);
     mynah_slm_aligned_free(s->strip);
     mynah_slm_aligned_free(s->bscores);
+    mynah_slm_aligned_free(s->bk);
+    mynah_slm_aligned_free(s->bv);
+    mynah_slm_aligned_free(s->kgather);
+    mynah_slm_aligned_free(s->vgather);
     memset(s, 0, sizeof *s);
 }
 
@@ -292,18 +300,17 @@ int mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
                                      c->d_model);
     }
 
+    const int kv_is_f32 = (s->kv.type_k == MYNAH_SLM_KV_F32 &&
+                           s->kv.type_v == MYNAH_SLM_KV_F32);
     const size_t per_layer = (size_t)s->n_ctx * c->kv_dim;
 
     for (uint32_t l = 0; l < c->n_layers; l++) {
         const mynah_slm_layer *w = &m->layers[l];
 
-        float *k_layer = s->k_cache + (size_t)l * per_layer;
-        float *v_layer = s->v_cache + (size_t)l * per_layer;
-        /* The batch occupies n CONSECUTIVE positions, and the cache is laid out
-         * position-major — so the projection writes straight into the cache
-         * here exactly as it does for one token, no gather and no copy. */
-        float *k_slot = k_layer + (size_t)pos0 * c->kv_dim;
-        float *v_slot = v_layer + (size_t)pos0 * c->kv_dim;
+        /* The batch's K and V land here first and are encoded into the cache
+         * once RoPE has been applied. */
+        float *k_slot = s->bk;
+        float *v_slot = s->bv;
 
         for (uint32_t t = 0; t < n; t++)
             mynah_slm_rms_norm(s->bh + (size_t)t * c->d_model,
@@ -334,16 +341,23 @@ int mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
             mynah_slm_rope_apply(&s->rope, q_row, c->n_heads,    pos0 + t);
             mynah_slm_rope_apply(&s->rope, k_row, c->n_kv_heads, pos0 + t);
 
-            mynah_slm_kv_roundtrip(s->kv_k, k_row, c->kv_dim);
-            mynah_slm_kv_roundtrip(s->kv_v, v_slot + (size_t)t * c->kv_dim,
-                                   c->kv_dim);
+            mynah_slm_kv_put_k(&s->kv, l, pos0 + t, k_row);
+            mynah_slm_kv_put_v(&s->kv, l, pos0 + t, v_slot + (size_t)t * c->kv_dim);
         }
 
         /* One pass over the history for the whole batch instead of one per
          * query. The triangle is handled by masking inside the kernel. */
-        mynah_slm_attention_batch(s->battn, s->bq, k_layer, v_layer,
-                                  pos0, n, c->n_heads, c->n_kv_heads,
-                                  c->head_dim, c->q_dim, s->bscores);
+        if (kv_is_f32)
+            mynah_slm_attention_batch(s->battn, s->bq,
+                                      (const float *)s->kv.k + (size_t)l * per_layer,
+                                      (const float *)s->kv.v + (size_t)l * per_layer,
+                                      pos0, n, c->n_heads, c->n_kv_heads,
+                                      c->head_dim, c->q_dim, s->bscores);
+        else
+            mynah_slm_attention_kv_batch(s->battn, s->bq, &s->kv, l, pos0, n,
+                                         c->n_heads, c->n_kv_heads, c->head_dim,
+                                         c->q_dim, s->bscores,
+                                         s->kgather, s->vgather);
 
         if (project_batch(m, w->wo, s, s->battn, s->bproj, n) != 0) return -1;
         for (uint32_t t = 0; t < n; t++)
@@ -406,17 +420,18 @@ int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
     if (embed_row(m, token, s->x) != 0) return -1; /* no sqrt(d_model) scaling */
     if (s->on_embed) s->on_embed(s->on_layer_ctx, s->x, c->d_model);
 
+    const int kv_is_f32 = (s->kv.type_k == MYNAH_SLM_KV_F32 &&
+                           s->kv.type_v == MYNAH_SLM_KV_F32);
     const size_t per_layer = (size_t)s->n_ctx * c->kv_dim;
 
     for (uint32_t l = 0; l < c->n_layers; l++) {
         const mynah_slm_layer *w = &m->layers[l];
 
-        /* Write K and V for this position straight into the cache: the
-         * projection output IS the cache slot, so there is no copy. */
-        float *k_layer = s->k_cache + (size_t)l * per_layer;
-        float *v_layer = s->v_cache + (size_t)l * per_layer;
-        float *k_slot  = k_layer + (size_t)pos * c->kv_dim;
-        float *v_slot  = v_layer + (size_t)pos * c->kv_dim;
+        /* K and V are computed here and encoded into the cache below. At f32
+         * the encode is a memcpy — the price of one code path rather than a
+         * zero-copy special case that would only work for one format. */
+        float *k_slot = s->bk;
+        float *v_slot = s->bv;
 
         mynah_slm_rms_norm(s->h, s->x, (const float *)ingot_gguf_data(m->gguf, w->attn_norm),
                            c->d_model, c->rms_eps);
@@ -437,14 +452,21 @@ int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
         mynah_slm_rope_apply(&s->rope, s->q,    c->n_heads,    pos);
         mynah_slm_rope_apply(&s->rope, k_slot,  c->n_kv_heads, pos);
 
-        /* K is rounded to the cache's precision AFTER RoPE, because RoPE is
-         * what will have been applied to the stored value. Rounding first
-         * would measure a format nobody would ship. */
-        mynah_slm_kv_roundtrip(s->kv_k, k_slot, c->kv_dim);
-        mynah_slm_kv_roundtrip(s->kv_v, v_slot, c->kv_dim);
+        /* Stored AFTER RoPE, because RoPE is what will have been applied to
+         * the cached value. Encoding first would store a different tensor. */
+        mynah_slm_kv_put_k(&s->kv, l, pos, k_slot);
+        mynah_slm_kv_put_v(&s->kv, l, pos, v_slot);
 
-        mynah_slm_attention_mt(s->attn, s->q, k_layer, v_layer, n_kv,
-                               c->n_heads, c->n_kv_heads, c->head_dim, s->scores_mt);
+        if (kv_is_f32)
+            mynah_slm_attention_mt(s->attn, s->q,
+                                   (const float *)s->kv.k + (size_t)l * per_layer,
+                                   (const float *)s->kv.v + (size_t)l * per_layer,
+                                   n_kv, c->n_heads, c->n_kv_heads, c->head_dim,
+                                   s->scores_mt);
+        else
+            mynah_slm_attention_kv_mt(s->attn, s->q, &s->kv, l, n_kv,
+                                      c->n_heads, c->n_kv_heads, c->head_dim,
+                                      s->scores_mt);
 
         if (mynah_slm_project(m, w->wo, s->attn, s->proj) != 0) return -1;
         mynah_slm_add(s->x, s->proj, c->d_model);

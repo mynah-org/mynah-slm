@@ -107,7 +107,8 @@ int main(int argc, char **argv) {
 
     const mynah_slm_config *c = mynah_slm_model_config(m);
     mynah_slm_state st;
-    if (mynah_slm_state_init(&st, m, seq + 1, err, sizeof err) != 0) {
+    if (mynah_slm_state_init_kv(&st, m, seq + 1, MYNAH_SLM_KV_F32, MYNAH_SLM_KV_F32,
+                                err, sizeof err) != 0) {
         printf("FAIL state: %s\n", err);
         mynah_slm_free(m);
         free(tokens);

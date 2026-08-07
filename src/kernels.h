@@ -129,4 +129,32 @@ void mynah_slm_attention_batch(float *out, const float *q,
                                uint32_t n_kv_heads, uint32_t head_dim,
                                uint32_t q_stride, float *scores);
 
+/* ── attention over a PACKED KV cache ──────────────────────────────────────
+ * The same two shapes as above, reading K and V through kvcache.h instead of
+ * from f32 arrays. Separate entry points rather than a flag: the f32 path is
+ * the reference and must keep its exact kernels, so it never goes through
+ * here at all.
+ *
+ * The decode form is FUSED — it dots and accumulates straight off the packed
+ * bytes. Decoding the history into scratch first would move more memory than
+ * the compression saves, which would make a smaller cache a slower one.
+ *
+ * The batch form gathers each head into `kscratch`/`vscratch` ([n_kv][head_dim]
+ * each) and hands those to sgemm: there the gather is paid once per head and
+ * amortized over every query in the batch. */
+struct mynah_slm_kv;
+
+void mynah_slm_attention_kv_mt(float *out, const float *q,
+                               const struct mynah_slm_kv *cache, uint32_t layer,
+                               uint32_t n_kv, uint32_t n_heads,
+                               uint32_t n_kv_heads, uint32_t head_dim,
+                               float *scratch);
+
+void mynah_slm_attention_kv_batch(float *out, const float *q,
+                                  const struct mynah_slm_kv *cache, uint32_t layer,
+                                  uint32_t pos0, uint32_t n_q, uint32_t n_heads,
+                                  uint32_t n_kv_heads, uint32_t head_dim,
+                                  uint32_t q_stride, float *scores,
+                                  float *kscratch, float *vscratch);
+
 #endif /* MYNAH_SLM_KERNELS_H */

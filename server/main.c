@@ -24,6 +24,7 @@
 #include "sampler.h"
 #include "template.h"
 #include "threads.h"
+#include "kvcache.h"
 #include "timing.h"
 #include "tokenizer.h"
 #include "tools.h"
@@ -344,8 +345,12 @@ static void handle_chat(server_ctx *c, http_conn *conn,
     mynah_slm_state st;
     char err[256];
     const uint32_t want = (uint32_t)n_prompt + (uint32_t)max_new + 8;
-    if (mynah_slm_state_init(&st, c->model, want < c->n_ctx ? want : c->n_ctx,
-                             err, sizeof err) != 0) {
+    /* bf16 KV: half the memory of f32 and faster with it, at a perplexity
+     * difference of nothing (docs/perf.md). A server holds a cache per request
+     * and is where the footprint matters most. */
+    if (mynah_slm_state_init_kv(&st, c->model, want < c->n_ctx ? want : c->n_ctx,
+                                MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_BF16,
+                                err, sizeof err) != 0) {
         pthread_mutex_unlock(&c->infer_mu);
         http_error(conn, 500, err);
         free(ids); free(text);

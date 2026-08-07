@@ -85,7 +85,11 @@ int main(int argc, char **argv) {
     if (!ref || !got) return 1;
 
     mynah_slm_state st;
-    if (mynah_slm_state_init(&st, m, (uint32_t)n_tok + 64, err, sizeof err) != 0) {
+    /* f32 explicitly: this test asks whether batching equals the one-token
+     * path, and a quantized cache would add a second variable to a comparison
+     * that exists to isolate one. */
+    if (mynah_slm_state_init_kv(&st, m, (uint32_t)n_tok + 64, MYNAH_SLM_KV_F32,
+                                MYNAH_SLM_KV_F32, err, sizeof err) != 0) {
         printf("FAIL state: %s\n", err);
         return 1;
     }

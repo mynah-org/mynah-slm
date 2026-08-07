@@ -267,13 +267,50 @@ q8 5.2e-3, fp8 2.6e-2, q4 9.4e-2 RMS relative), because the first question
 about a 10x perplexity is whether the tool is broken. It is not: q4 really is
 9.4% noise, and keys do not survive it.
 
-What this buys, at a 2275-token context, once the packed storage is written:
+### The packed cache: bf16 is 2x smaller AND 26% faster, and is now the default
 
-| | KV size | vs f32 |
-|---|---|---|
-| f32 / f32 | 521 MB | — |
-| q8 / q8 | 138 MB | **3.8x** |
-| q8 / q4 | 106 MB | **4.9x** |
+The formats above were first measured by ROUND TRIP — quantized and dequantized
+straight back into an f32 cache — which isolates the quality question from the
+plumbing. `src/kvcache.c` now stores them packed for real. Measured at a
+2400-position context, 28 layers, decode with 2275 tokens of history, mean of
+four runs:
+
+| K / V | KV cache | vs f32 | decode | ppl |
+|---|---|---|---|---|
+| f32 / f32 | 550 MB | — | 18.8 tok/s | 2.802 |
+| **bf16 / bf16** (default) | **275 MB** | **2.0x** | **23.7 tok/s (+26%)** | **2.802** |
+| q8 / q8 | 146 MB | 3.8x | 19.7 tok/s | 2.797 |
+| q8 / q4 | 112 MB | 4.9x | 18.9 tok/s | 2.834 |
+
+**bf16 wins on every axis at once** — half the memory, a quarter more decode,
+and a perplexity identical to f32 to three decimals — so it is what the CLI and
+the server now use. `--kv f32` gets the reference back; `--kv-k q8 --kv-v q4`
+is for when memory is the binding constraint and 4.9x is worth 1.1% of
+perplexity.
+
+That ordering is not what the byte counts predict, and getting to it took two
+corrections worth keeping:
+
+**The first packed version was SLOWER than f32** — 11.5 tok/s against 14.5 —
+while reading a quarter of the bytes. Its dot and accumulate were scalar loops,
+competing against an f32 path that dots with 16-wide NEON. Compression only
+becomes speed once the decode is vectorized too.
+
+**Then bf16 measured at 10.3 tok/s, half of f32.** It had no fused path at all:
+it decoded a slice into scratch and dotted that, per position, per head. That
+number was measuring the missing kernel, not the format — and publishing it
+would have buried the best option in the table. With a fused widen-and-FMA it
+went from 10.3 to 23.7.
+
+Which also explains why q8 gains so little despite reading four times less: an
+int8 lane must be widened twice and converted to float before it can enter an
+FMA, so a memory-bound loop turns into a compute-bound one. bf16 needs a single
+shift, and keeps the saving.
+
+Timing note: single runs disagreed by 25% (16.1 and 20.7 tok/s for the same
+configuration). Every figure here is the mean of four, taken after killing two
+idle server processes that were holding ~800 MB of mapped weights; at that
+point best and mean agree to 1%.
 
 ## Batched prefill: 26 -> 370 tok/s, and TTFT 7.6 s -> 0.58 s
 
