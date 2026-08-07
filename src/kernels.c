@@ -1853,47 +1853,73 @@ int ingot_q5_k_matvec_scalar(const void *weights, size_t rows, size_t cols,
 }
 
 #if defined(INGOT_HAVE_Q4_K_NEON)
+/* Distribute the sum instead of materializing every weight.
+ *
+ *     SUM_j w_j x_j  =  d*scale * SUM_j (q_j x_j)  -  dmin*min * SUM_j x_j
+ *
+ * The previous kernel built each weight before using it: multiply by d*scale,
+ * subtract dmin*min, THEN the multiply-add that actually matters — two vector
+ * ops per four values spent on arithmetic the sub-block could have shared. Here
+ * the quants accumulate against the input and the inputs accumulate on their
+ * own, and the scale and min are each applied once per 32-weight sub-block.
+ *
+ * Folded into a running vector with vmlaq_n_f32 (the min term as a negative
+ * multiplier, since NEON has no vmlsq_n_f32) so a block still costs exactly one
+ * horizontal reduction.
+ *
+ * Fewer roundings than before, not more: the min is now one subtraction per
+ * sub-block rather than one per weight. Held to 1e-5 against dequant-then-dot
+ * by test_quant's every-format gate. */
 static float q5_k_dot_block_neon(const unsigned char *block, const float *input) {
     float d, dmin;
     const unsigned char *scales, *qh, *qs;
     q5_scale_pointers(block, &d, &dmin, &scales, &qh, &qs);
-    float32x4_t accumulator = vdupq_n_f32(0.0f);
-    uint8x8_t sixteen = vdup_n_u8(16);
+    float32x4_t total = vdupq_n_f32(0.0f);
+    const uint8x8_t sixteen = vdup_n_u8(16);
+    const uint8x8_t nib = vdup_n_u8(0x0f);
     unsigned char u1 = 1, u2 = 2;
+
     for (int base = 0, scale_index = 0; base < INGOT_QK_K; base += 64, scale_index += 2) {
         unsigned char scale0, scale1, min0, min1;
         scale_min(scales, scale_index, &scale0, &min0);
         scale_min(scales, scale_index + 1, &scale1, &min1);
-        float d0 = d * scale0, d1 = d * scale1;
-        float m0 = dmin * min0, m1 = dmin * min1;
-        uint8x8_t u1v = vdup_n_u8(u1), u2v = vdup_n_u8(u2);
+        const uint8x8_t u1v = vdup_n_u8(u1), u2v = vdup_n_u8(u2);
+
+        float32x4_t q0 = vdupq_n_f32(0.0f), q1 = vdupq_n_f32(0.0f);
+        float32x4_t x0 = vdupq_n_f32(0.0f), x1 = vdupq_n_f32(0.0f);
+
         for (int i = 0; i < 32; i += 8) {
-            uint8x8_t packed = vld1_u8(qs + i);
-            uint8x8_t qhbits = vld1_u8(qh + i);
+            const uint8x8_t packed = vld1_u8(qs + i);
+            const uint8x8_t qhbits = vld1_u8(qh + i);
             /* 5th bit: add 16 to the nibble when the selected qh bit is set. */
-            uint8x8_t lo = vadd_u8(vand_u8(packed, vdup_n_u8(0x0f)),
-                                   vand_u8(vtst_u8(qhbits, u1v), sixteen));
-            uint8x8_t hi = vadd_u8(vshr_n_u8(packed, 4),
-                                   vand_u8(vtst_u8(qhbits, u2v), sixteen));
-            float32x4_t low = q4_k_u8x8_to_f32(lo, 0);
-            float32x4_t low_high = q4_k_u8x8_to_f32(lo, 1);
-            float32x4_t upper = q4_k_u8x8_to_f32(hi, 0);
-            float32x4_t upper_high = q4_k_u8x8_to_f32(hi, 1);
-            low = vsubq_f32(vmulq_n_f32(low, d0), vdupq_n_f32(m0));
-            low_high = vsubq_f32(vmulq_n_f32(low_high, d0), vdupq_n_f32(m0));
-            upper = vsubq_f32(vmulq_n_f32(upper, d1), vdupq_n_f32(m1));
-            upper_high = vsubq_f32(vmulq_n_f32(upper_high, d1), vdupq_n_f32(m1));
-            accumulator = vmlaq_f32(accumulator, low, vld1q_f32(input + base + i));
-            accumulator = vmlaq_f32(accumulator, low_high, vld1q_f32(input + base + i + 4));
-            accumulator = vmlaq_f32(accumulator, upper, vld1q_f32(input + base + i + 32));
-            accumulator = vmlaq_f32(accumulator, upper_high,
-                                    vld1q_f32(input + base + i + 36));
+            const uint8x8_t lo = vadd_u8(vand_u8(packed, nib),
+                                         vand_u8(vtst_u8(qhbits, u1v), sixteen));
+            const uint8x8_t hi = vadd_u8(vshr_n_u8(packed, 4),
+                                         vand_u8(vtst_u8(qhbits, u2v), sixteen));
+
+            const float32x4_t xa = vld1q_f32(input + base + i);
+            const float32x4_t xb = vld1q_f32(input + base + i + 4);
+            const float32x4_t xc = vld1q_f32(input + base + i + 32);
+            const float32x4_t xd = vld1q_f32(input + base + i + 36);
+
+            q0 = vmlaq_f32(q0, q4_k_u8x8_to_f32(lo, 0), xa);
+            q0 = vmlaq_f32(q0, q4_k_u8x8_to_f32(lo, 1), xb);
+            q1 = vmlaq_f32(q1, q4_k_u8x8_to_f32(hi, 0), xc);
+            q1 = vmlaq_f32(q1, q4_k_u8x8_to_f32(hi, 1), xd);
+            x0 = vaddq_f32(x0, vaddq_f32(xa, xb));
+            x1 = vaddq_f32(x1, vaddq_f32(xc, xd));
         }
+
+        total = vmlaq_n_f32(total, q0, d * scale0);
+        total = vmlaq_n_f32(total, q1, d * scale1);
+        total = vmlaq_n_f32(total, x0, -(dmin * min0));
+        total = vmlaq_n_f32(total, x1, -(dmin * min1));
+
         qs += 32;
         u1 <<= 2;
         u2 <<= 2;
     }
-    return vaddvq_f32(accumulator);
+    return vaddvq_f32(total);
 }
 
 static int ingot_q5_k_matvec_neon(const void *weights, size_t rows, size_t cols,
@@ -1917,6 +1943,91 @@ static int ingot_q5_k_matvec_neon(const void *weights, size_t rows, size_t cols,
 }
 #endif
 
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+/* The AVX2 twin of the kernel above, same distribute-the-sum identity. x86 had
+ * no Q5_K kernel at all before this and went through decode-then-dot.
+ *
+ * NEON's vtst_u8 has no single-instruction x86 equivalent, so the 5th bit is
+ * built as: AND the selector, compare-equal against zero (0xFF where the bit is
+ * CLEAR), then andnot against 16 — three ops where NEON needs two. */
+static float q5_k_dot_block_avx2(const unsigned char *block, const float *input) {
+    float d, dmin;
+    const unsigned char *scales, *qh, *qs;
+    q5_scale_pointers(block, &d, &dmin, &scales, &qh, &qs);
+    __m256 total = _mm256_setzero_ps();
+    const __m128i nib = _mm_set1_epi8(0x0f);
+    const __m128i sixteen = _mm_set1_epi8(16);
+    const __m128i zero = _mm_setzero_si128();
+    unsigned char u1 = 1, u2 = 2;
+
+    for (int base = 0, scale_index = 0; base < INGOT_QK_K; base += 64, scale_index += 2) {
+        unsigned char scale0, scale1, min0, min1;
+        scale_min(scales, scale_index, &scale0, &min0);
+        scale_min(scales, scale_index + 1, &scale1, &min1);
+        const __m128i u1v = _mm_set1_epi8((char)u1), u2v = _mm_set1_epi8((char)u2);
+
+        __m256 q0 = _mm256_setzero_ps(), q1 = _mm256_setzero_ps();
+        __m256 x0 = _mm256_setzero_ps(), x1 = _mm256_setzero_ps();
+
+        for (int i = 0; i < 32; i += 8) {
+            const __m128i packed = _mm_loadl_epi64((const __m128i *)(const void *)(qs + i));
+            const __m128i qhbits = _mm_loadl_epi64((const __m128i *)(const void *)(qh + i));
+
+            const __m128i b1 = _mm_andnot_si128(
+                _mm_cmpeq_epi8(_mm_and_si128(qhbits, u1v), zero), sixteen);
+            const __m128i b2 = _mm_andnot_si128(
+                _mm_cmpeq_epi8(_mm_and_si128(qhbits, u2v), zero), sixteen);
+
+            const __m128i lo = _mm_add_epi8(_mm_and_si128(packed, nib), b1);
+            const __m128i hi = _mm_add_epi8(
+                _mm_and_si128(_mm_srli_epi16(packed, 4), nib), b2);
+
+            const __m256 xa = _mm256_loadu_ps(input + base + i);
+            const __m256 xc = _mm256_loadu_ps(input + base + i + 32);
+
+            q0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo)), xa, q0);
+            q1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi)), xc, q1);
+            x0 = _mm256_add_ps(x0, xa);
+            x1 = _mm256_add_ps(x1, xc);
+        }
+
+        total = _mm256_fmadd_ps(q0, _mm256_set1_ps(d * scale0), total);
+        total = _mm256_fmadd_ps(q1, _mm256_set1_ps(d * scale1), total);
+        total = _mm256_fmadd_ps(x0, _mm256_set1_ps(-(dmin * min0)), total);
+        total = _mm256_fmadd_ps(x1, _mm256_set1_ps(-(dmin * min1)), total);
+
+        qs += 32;
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+    {
+        __m128 h = _mm_add_ps(_mm256_castps256_ps128(total),
+                              _mm256_extractf128_ps(total, 1));
+        h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+        h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
+        return _mm_cvtss_f32(h);
+    }
+}
+
+static int ingot_q5_k_matvec_avx2(const void *weights, size_t rows, size_t cols,
+                                  const float *input, float *output) {
+    const size_t blocks_per_row = cols / INGOT_QK_K;
+    if (blocks_per_row > SIZE_MAX / INGOT_Q5_K_BYTES) return -1;
+    const size_t row_bytes = blocks_per_row * INGOT_Q5_K_BYTES;
+    if (rows > SIZE_MAX / row_bytes) return -1;
+    const unsigned char *source = (const unsigned char *)weights;
+    for (size_t row = 0; row < rows; row++) {
+        const unsigned char *row_data = source + row * row_bytes;
+        float sum = 0.0f;
+        for (size_t block = 0; block < blocks_per_row; block++)
+            sum += q5_k_dot_block_avx2(row_data + block * INGOT_Q5_K_BYTES,
+                                       input + block * INGOT_QK_K);
+        output[row] = sum;
+    }
+    return 0;
+}
+#endif
+
 static int kquant_apply(const void *weights, size_t rows, size_t cols,
                         const float *input, float *output, size_t block_bytes,
                         void (*dequant)(const unsigned char *, float *), int matvec);
@@ -1929,11 +2040,8 @@ int ingot_q5_k_matvec(const void *weights, size_t rows, size_t cols,
         return ingot_q5_k_matvec_neon(weights, rows, cols, input, output);
 #endif
 #if defined(INGOT_HAVE_Q4_K_AVX2)
-    /* No dedicated AVX2 kernel (yet): decode-then-dot through kquant_apply
-     * still beats the scalar walk, since both halves of it are vectorized. */
     if (ingot_cpu().avx2)
-        return kquant_apply(weights, rows, cols, input, output,
-                            INGOT_Q5_K_BYTES, q5_dequant_block, 1);
+        return ingot_q5_k_matvec_avx2(weights, rows, cols, input, output);
 #endif
     return ingot_q5_k_matvec_scalar(weights, rows, cols, input, output);
 }
