@@ -151,7 +151,8 @@ int mynah_slm_state_init_kv(mynah_slm_state *s, const mynah_slm_model_t *m,
     s->model = m;
     s->n_ctx = n_ctx;
 
-    if (mynah_slm_rope_init(&s->rope, c->head_dim, n_ctx, c->rope_theta) != 0) {
+    if (mynah_slm_rope_init(&s->rope, c->head_dim, n_ctx, c->rope_theta,
+                            c->rope_interleaved) != 0) {
         snprintf(err, errsz, "cannot build the RoPE table for %u positions", n_ctx);
         return -1;
     }

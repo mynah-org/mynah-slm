@@ -149,7 +149,7 @@ void mynah_slm_rms_norm_per_head(float *x, const float *weight,
 /* ── RoPE ─────────────────────────────────────────────────────────────────── */
 
 int mynah_slm_rope_init(mynah_slm_rope *r, uint32_t head_dim, uint32_t max_pos,
-                        float theta) {
+                        float theta, int interleaved) {
     memset(r, 0, sizeof *r);
     if (head_dim == 0 || head_dim % 2 != 0 || max_pos == 0) return -1;
 
@@ -158,8 +158,9 @@ int mynah_slm_rope_init(mynah_slm_rope *r, uint32_t head_dim, uint32_t max_pos,
     r->sin = mynah_slm_aligned_alloc((size_t)max_pos * half * sizeof(float));
     if (!r->cos || !r->sin) { mynah_slm_rope_free(r); return -1; }
 
-    r->head_dim = head_dim;
-    r->max_pos  = max_pos;
+    r->head_dim    = head_dim;
+    r->max_pos     = max_pos;
+    r->interleaved = interleaved;
 
     for (uint32_t i = 0; i < half; i++) {
         /* exponent 2i/head_dim, matching the oracle exactly */
@@ -188,12 +189,23 @@ void mynah_slm_rope_apply(const mynah_slm_rope *r, float *x,
 
     for (uint32_t h = 0; h < n_heads; h++) {
         float *xh = x + (size_t)h * r->head_dim;
-        for (uint32_t i = 0; i < half; i++) {
-            /* Split-half: i pairs with i + half. */
-            const float a = xh[i], b = xh[i + half];
-            const float c = cos_p[i], s = sin_p[i];
-            xh[i]        = a * c - b * s;
-            xh[i + half] = b * c + a * s;
+        if (r->interleaved) {
+            /* 2i pairs with 2i+1. The frequency index is the same i, so the
+             * table is shared between the two forms — only the pairing moves. */
+            for (uint32_t i = 0; i < half; i++) {
+                const float a = xh[2 * i], b = xh[2 * i + 1];
+                const float c = cos_p[i], s = sin_p[i];
+                xh[2 * i]     = a * c - b * s;
+                xh[2 * i + 1] = b * c + a * s;
+            }
+        } else {
+            for (uint32_t i = 0; i < half; i++) {
+                /* Split-half: i pairs with i + half. */
+                const float a = xh[i], b = xh[i + half];
+                const float c = cos_p[i], s = sin_p[i];
+                xh[i]        = a * c - b * s;
+                xh[i + half] = b * c + a * s;
+            }
         }
     }
 }

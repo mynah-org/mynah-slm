@@ -146,6 +146,14 @@ static int load_config(mynah_slm_config *c, const ingot_gguf *g,
                     "no head dimension: neither %s.attention.key_length nor "
                     "%s.rope.dimension_count is present", arch, arch);
 
+    /* Which RoPE pairing the stored weights expect. There is no metadata key
+     * for it — llama.cpp carries the same knowledge as a per-architecture
+     * table, because it is a property of how the converter wrote the file.
+     * Ours is explicit and small, and the default is NeoX. */
+    static const char *const INTERLEAVED[] = { "granite", "llama", NULL };
+    for (size_t i = 0; INTERLEAVED[i]; i++)
+        if (strcmp(arch, INTERLEAVED[i]) == 0) c->rope_interleaved = 1;
+
     /* muP scalars. Absent means "this family does not use them", so the
      * defaults are the neutral values and one forward pass serves both. */
     kv_f32_opt(g, arch, "attention.scale",  &c->attn_scale,     0.0f);

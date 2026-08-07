@@ -104,7 +104,7 @@ static void test_rope(void) {
     enum { HD = 8, MAXPOS = 32 };
     const uint32_t half = HD / 2;
     mynah_slm_rope r;
-    if (mynah_slm_rope_init(&r, HD, MAXPOS, 10000.0f) != 0) {
+    if (mynah_slm_rope_init(&r, HD, MAXPOS, 10000.0f, 0) != 0) {
         check("rope_init", 0, "allocation failed");
         return;
     }

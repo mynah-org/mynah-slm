@@ -51,18 +51,25 @@ typedef struct {
     float   *sin;
     uint32_t head_dim;
     uint32_t max_pos;
+    /* Which elements pair up. See mynah_slm_config.rope_interleaved: it is a
+     * property of how the checkpoint was written, not of the architecture. */
+    int      interleaved;
 } mynah_slm_rope;
 
 int  mynah_slm_rope_init(mynah_slm_rope *r, uint32_t head_dim, uint32_t max_pos,
-                         float theta);
+                         float theta, int interleaved);
 void mynah_slm_rope_free(mynah_slm_rope *r);
 
 /* Rotate x[n_heads * head_dim] in place, at absolute position `pos`.
  *
- * SPLIT-HALF (NeoX): element i pairs with element i + head_dim/2. NOT the
- * interleaved form that pairs 2i with 2i+1. Both variants run and produce
- * fluent output; only one is Qwen3's, and the parity gate rejects the other at
- * layer 0 while its greedy argmax still agrees on half the positions. */
+ * SPLIT-HALF (NeoX) when `interleaved` is 0: element i pairs with element
+ * i + head_dim/2. Interleaved when it is 1: 2i pairs with 2i+1.
+ *
+ * BOTH VARIANTS RUN AND PRODUCE FLUENT OUTPUT, which is what makes this the
+ * most expensive trap in the file. Qwen3 needs the first; Granite needs the
+ * second, because llama.cpp's converter permuted its q and k on the way into
+ * the GGUF. Measured on the same text: 65 perplexity with the right one, 412
+ * with the wrong one, and coherent English either way. */
 void mynah_slm_rope_apply(const mynah_slm_rope *r, float *x,
                           uint32_t n_heads, uint32_t pos);
 

@@ -51,6 +51,19 @@ typedef struct {
     float    residual_scale;  /* each residual branch is multiplied by this */
     float    logit_scale;     /* logits are DIVIDED by this */
 
+    /* Which RoPE pairing the STORED weights expect.
+     *
+     * 0 = NeoX split-half: element i pairs with i + head_dim/2 (Qwen3, Gemma).
+     * 1 = interleaved: 2i pairs with 2i+1 (Granite, Llama).
+     *
+     * This is not a property of the architecture, it is a property of the
+     * FILE. llama.cpp's converter permutes q and k for Llama-family models so
+     * that the interleaved form applies, and Granite inherits that path. Get
+     * it wrong and the model still produces fluent English — perplexity 412
+     * against 65 on the same text, which is the whole difference between
+     * "a weak 350M" and "our bug". */
+    int      rope_interleaved;
+
     /* A GGUF carries one terminator; generation_config.json can carry more.
      * Plural from the start so the second one is not an afterthought. */
     uint32_t eos[MYNAH_SLM_MAX_EOS];
