@@ -562,7 +562,113 @@ static inline void axpy_q4_block(float *o, const uint8_t *q, float w) {
     }
 }
 
-#else   /* the scalar twins, and the definition of what the above compute */
+#elif defined(__AVX2__)
+#include <immintrin.h>
+
+static inline float hsum_avx(__m256 v) {
+    __m128 a = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    a = _mm_add_ps(a, _mm_movehl_ps(a, a));
+    a = _mm_add_ss(a, _mm_shuffle_ps(a, a, 0x55));
+    return _mm_cvtss_f32(a);
+}
+
+/* bf16 widens by moving its 16 bits into the high half of an f32 — one shift,
+ * which is why it stays the fastest format here. */
+static inline __m256 bf16_widen8(const uint16_t *b) {
+    return _mm256_castsi256_ps(
+        _mm256_slli_epi32(_mm256_cvtepu16_epi32(
+            _mm_loadu_si128((const __m128i *)(const void *)b)), 16));
+}
+
+static inline float dot_bf16(const uint8_t *p, const float *x, uint32_t n) {
+    const uint16_t *b = (const uint16_t *)(const void *)p;
+    __m256 acc = _mm256_setzero_ps();
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8)
+        acc = _mm256_fmadd_ps(bf16_widen8(b + i), _mm256_loadu_ps(x + i), acc);
+    float sum = hsum_avx(acc);
+    for (; i < n; i++) {
+        const uint32_t bits = (uint32_t)b[i] << 16;
+        float f; memcpy(&f, &bits, sizeof f);
+        sum += f * x[i];
+    }
+    return sum;
+}
+
+static inline void axpy_bf16(float *o, const uint8_t *p, float w, uint32_t n) {
+    const uint16_t *b = (const uint16_t *)(const void *)p;
+    const __m256 vw = _mm256_set1_ps(w);
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(o + i, _mm256_fmadd_ps(bf16_widen8(b + i), vw,
+                                                _mm256_loadu_ps(o + i)));
+    for (; i < n; i++) {
+        const uint32_t bits = (uint32_t)b[i] << 16;
+        float f; memcpy(&f, &bits, sizeof f);
+        o[i] += w * f;
+    }
+}
+
+static inline float dot_q8_block(const int8_t *q, const float *x) {
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < KV_BLOCK; i += 8) {
+        const __m256i v = _mm256_cvtepi8_epi32(
+            _mm_loadl_epi64((const __m128i *)(const void *)(q + i)));
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(v), _mm256_loadu_ps(x + i), acc);
+    }
+    return hsum_avx(acc);
+}
+
+static inline void axpy_q8_block(float *o, const int8_t *q, float w) {
+    const __m256 vw = _mm256_set1_ps(w);
+    for (int i = 0; i < KV_BLOCK; i += 8) {
+        const __m256i v = _mm256_cvtepi8_epi32(
+            _mm_loadl_epi64((const __m128i *)(const void *)(q + i)));
+        _mm256_storeu_ps(o + i, _mm256_fmadd_ps(_mm256_cvtepi32_ps(v), vw,
+                                                _mm256_loadu_ps(o + i)));
+    }
+}
+
+/* The low nibbles are elements 0..15 and the high ones 16..31, biased by 8 —
+ * llama.cpp's q4_0 layout. */
+static inline void q4_expand(const uint8_t *q, float *out) {
+    const __m128i packed = _mm_loadu_si128((const __m128i *)(const void *)q);
+    const __m128i lo = _mm_and_si128(packed, _mm_set1_epi8(0x0f));
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), _mm_set1_epi8(0x0f));
+    const __m256i bias = _mm256_set1_epi32(8);
+
+    /* Unrolled rather than looped: the byte shift is an immediate, so the
+     * shift amount has to be a compile-time constant. */
+#define KV_Q4_EXPAND(dst, src, sh)                                            \
+    _mm256_storeu_ps((dst), _mm256_cvtepi32_ps(_mm256_sub_epi32(              \
+        _mm256_cvtepu8_epi32(_mm_srli_si128((src), (sh))), bias)))
+
+    KV_Q4_EXPAND(out + 0,  lo, 0);
+    KV_Q4_EXPAND(out + 8,  lo, 8);
+    KV_Q4_EXPAND(out + 16, hi, 0);
+    KV_Q4_EXPAND(out + 24, hi, 8);
+#undef KV_Q4_EXPAND
+}
+
+static inline float dot_q4_block(const uint8_t *q, const float *x) {
+    float v[KV_BLOCK];
+    q4_expand(q, v);
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < KV_BLOCK; i += 8)
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(v + i), _mm256_loadu_ps(x + i), acc);
+    return hsum_avx(acc);
+}
+
+static inline void axpy_q4_block(float *o, const uint8_t *q, float w) {
+    float v[KV_BLOCK];
+    q4_expand(q, v);
+    const __m256 vw = _mm256_set1_ps(w);
+    for (int i = 0; i < KV_BLOCK; i += 8)
+        _mm256_storeu_ps(o + i, _mm256_fmadd_ps(_mm256_loadu_ps(v + i), vw,
+                                                _mm256_loadu_ps(o + i)));
+}
+
+#else   /* the scalar twins, and the definition of what the other two compute */
 
 static inline float dot_bf16(const uint8_t *p, const float *x, uint32_t n) {
     float sum = 0.0f;

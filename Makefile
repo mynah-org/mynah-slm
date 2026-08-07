@@ -5,7 +5,11 @@ CC      ?= cc
 # inf is UB, and gcc on x86 vectorizes expf through libmvec and turns it into a
 # NaN. That exact bug hit mynah-asr's Linux CI on 2026-07-18 while clang/ARM
 # survived by luck. Not worth the few percent here.
-CFLAGS  ?= -std=c11 -O3 -march=native -Wall -Wextra -iquote src -D_DEFAULT_SOURCE
+# Split out so a cross build can replace it without overriding CFLAGS entirely
+# — which would drop every computed flag below, including the quoted
+# -DMYNAH_SLM_BUILD. See test-x86-rosetta.
+ARCH_FLAGS ?= -march=native
+CFLAGS  ?= -std=c11 -O3 $(ARCH_FLAGS) -Wall -Wextra -iquote src -D_DEFAULT_SOURCE
 LDFLAGS ?=
 
 CFLAGS += -fPIC
@@ -69,6 +73,8 @@ help:
 	@echo "  test-parity  C forward pass vs the numpy oracle, stage by stage"
 	@echo "  test-server  end-to-end HTTP checks (needs a minute of generation)"
 	@echo "  bench        per-tensor matvec throughput"
+	@echo "  check-x86    cross-compile the AVX2 paths"
+	@echo "  test-x86-rosetta  build x86_64 and RUN the suite under Rosetta"
 	@echo "  golden-dump  regenerate the oracle's reference activations"
 	@echo "  debug        -O0 -g rebuild"
 	@echo "  ubsan        UBSan rebuild + test, then clean"
@@ -100,7 +106,7 @@ build/%.o: %.c $(HDR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(INGOT_LIB):
-	$(MAKE) -C $(INGOT_DIR) lib
+	$(MAKE) -C $(INGOT_DIR) lib CC="$(CC)" CFLAGS="-O2 $(ARCH_FLAGS)"
 
 $(OBJ): | $(INGOT_LIB)
 
@@ -165,6 +171,34 @@ golden-dump:
 	@mkdir -p $(GOLDEN_DIR)
 	cd tools && uv run python -m oracle.generate ../$(MODEL) \
 	  --prompt "$(PROMPT)" --dump-dir ../$(GOLDEN_DIR) -n 1
+
+# ── x86, from an arm64 laptop ──────────────────────────────────────────────
+# The AVX2 paths in src/qmat.c, src/kvcache.c and src/kernels.c would otherwise
+# only ever meet a compiler on someone else's machine. Two targets, because
+# they answer different questions:
+#
+#   check-x86         does it COMPILE at AVX2+F16C and at AVX-512? Catches
+#                     #ifdef rot and intrinsic misuse, nothing else.
+#   test-x86-rosetta  does it RUN? Builds the whole suite as x86_64 and runs it
+#                     under Rosetta, which translates AVX2. This is the one
+#                     that would catch a wrong shuffle. AVX-512 is not
+#                     translated and stays compile-only.
+X86_TARGET ?= x86_64-apple-macos13.3
+X86_SRC := $(SRC) $(wildcard tests/*.c)
+
+check-x86:
+	@mkdir -p build/x86
+	@for f in $(X86_SRC); do \
+	  $(CC) -target $(X86_TARGET) -std=c11 -O2 -Wall -Wextra -iquote src -Iinclude \
+	    -I$(INGOT_DIR)/include -DMYNAH_SLM_BUILD='"x86check"' -D$(BLAS_DEF) -DACCELERATE_NEW_LAPACK \
+	    -mavx2 -mfma -mf16c -c $$f -o build/x86/$$(basename $$f .c).avx2.o || exit 1; \
+	done
+	@echo "x86-64 cross-compile OK (avx2 + fma + f16c)"
+
+test-x86-rosetta:
+	$(MAKE) clean
+	$(MAKE) CC="$(CC) -arch x86_64" ARCH_FLAGS="-mavx2 -mfma -mf16c" test
+	$(MAKE) clean
 
 # ── libraries ──────────────────────────────────────────────────────────────
 lib: libmynah_slm.a
@@ -235,4 +269,4 @@ install: mynah-slm mynah-slm-server libmynah_slm.a
 	install -m 644 libmynah_slm.a $(DESTDIR)$(PREFIX)/lib/
 	install -m 644 include/mynah_slm.h $(DESTDIR)$(PREFIX)/include/
 
-.PHONY: all help lib shared test test-parity test-server bench golden-dump debug ubsan asan leaks clean install update-ingot
+.PHONY: all help lib shared test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks clean install update-ingot

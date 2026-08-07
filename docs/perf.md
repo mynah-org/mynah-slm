@@ -450,9 +450,20 @@ not fine for a path that has to agree with decode.
   changes nothing for Qwen3 — it is Q4_K/Q6_K — and everything for Gemma 4,
   whose QAT checkpoints ship as Q4_0. Untested end to end until that model is
   downloaded.
-- **x86 is compile-verified only.** `make check-x86` in ingot passes at
-  AVX2+F16C and AVX-512, but this machine is aarch64: the AVX2 paths have never
-  executed. That is a limitation, not a claim.
+- **x86 is now EXECUTED, not just compiled.** Every kernel written here has
+  three forms — NEON, AVX2, and a scalar reference the other two must agree
+  with — and two targets check the x86 one:
+
+  | | what it answers |
+  |---|---|
+  | `make check-x86` | does it compile at AVX2+FMA+F16C? Catches `#ifdef` rot and intrinsic misuse |
+  | `make test-x86-rosetta` | does it RUN? Builds the whole suite as x86_64 and runs it under Rosetta, which translates AVX2 |
+
+  The second is the one that matters, and it passes: the AVX2 Q4_K matvec
+  agrees with ingot at `6.10e-07`, batched prefill at `1.4-1.8e-06`, the parity
+  gate at `1.59e-06` on layer 0, and the KV cache's bf16/q8/q4 accessors match
+  their unpack-then-dot references. AVX-512 stays compile-only — Rosetta does
+  not translate it — and that limit is stated rather than papered over.
 
 ## The scalar kernels: one of them mattered, four did not
 
@@ -506,6 +517,17 @@ interleaved, with a sample big enough to survive the thermal state — a single
 number here would have led to reverting a real improvement.
 
 ## Method notes
+
+- **Absolute numbers on this laptop drift by up to 40% with thermal state; the
+  ratios do not.** The same `lm_head` matvec measured 5.36 ms on a cold machine
+  and 7.43 ms after several hours of benchmarking — no code between the two.
+  Everything published here as a CLAIM is a ratio measured interleaved in one
+  process (1.55x, +26%, +25%); the absolute tok/s figures are the state of one
+  machine on one afternoon and should be re-measured, not quoted.
+- That was checked rather than assumed: the suspicion was that passing
+  `-march=native` down to ingot had changed its kernels. Built both ways, back
+  to back, ingot lands at 7.44 and 7.43 ms — the flag does nothing here and the
+  drift is the machine.
 
 - Weights are staged on the local disk for every measurement
   (`scripts/use_model.sh`). Read over a network share the same full weight read

@@ -93,8 +93,18 @@ static int use_own_kernels(void) {
 
 void mynah_slm_matvec_set_enabled(int on) { g_own = on ? 1 : 0; }
 
+/* Every kernel below exists in three forms: NEON, AVX2, and a scalar
+ * reference. The scalar one is not a fallback nobody runs — it is the
+ * definition the other two have to agree with, and it is what a machine
+ * without either instruction set actually gets.
+ *
+ * x86 cannot be executed natively here (this is an M1), so it is verified two
+ * ways: `make check-x86` cross-compiles it, and `make test-x86-rosetta` builds
+ * the suite as x86_64 and RUNS it under Rosetta, which translates AVX2. */
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 #define MYNAH_SLM_HAVE_SDOT 1
+#elif defined(__AVX2__)
+#define MYNAH_SLM_HAVE_SDOT 1     /* maddubs + madd, no VNNI required */
 #endif
 
 static int g_int8 = -1;
@@ -167,7 +177,9 @@ static void q4_k_scale_min(const unsigned char *scales, int index,
 }
 
 #if defined(MYNAH_SLM_HAVE_SDOT)
+#if defined(__ARM_NEON)
 #include <arm_neon.h>
+#endif
 
 /* ── the int8 path ─────────────────────────────────────────────────────────
  * SDOT does four int8 multiply-accumulates per lane in one instruction, where
@@ -183,6 +195,21 @@ static void q4_k_scale_min(const unsigned char *scales, int index,
  * so the min term keeps full precision and only the product term is
  * approximated. Whether that is acceptable is a question for `mynah-slm ppl`,
  * which is why this is off by default. */
+#if defined(__AVX2__)
+#include <immintrin.h>
+
+/* No VNNI required: maddubs multiplies u8 by i8 into i16 pairs and madd folds
+ * those into i32. The nibbles are 0..15 and the activations fit int8, so the
+ * largest partial is 15*127*2 = 3810 — far inside i16, and maddubs saturates
+ * rather than wraps, which would otherwise be the trap here. */
+static inline int hsum256i(__m256i v) {
+    __m128i a = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+    a = _mm_add_epi32(a, _mm_shuffle_epi32(a, 0x4e));
+    a = _mm_add_epi32(a, _mm_shuffle_epi32(a, 0xb1));
+    return _mm_cvtsi128_si32(a);
+}
+#endif
+
 static float q4_k_row_int8(const unsigned char *row, size_t blocks,
                            const int8_t *xq, const float *xscale,
                            const float *xsum) {
@@ -203,6 +230,8 @@ static float q4_k_row_int8(const unsigned char *row, size_t blocks,
 
             const int8_t *xlo = xq + b * 256 + base;
             const int8_t *xhi = xlo + 32;
+            int sum_lo, sum_hi;
+#if defined(__ARM_NEON)
             int32x4_t alo = vdupq_n_s32(0), ahi = vdupq_n_s32(0);
             for (int i = 0; i < 32; i += 16) {
                 const uint8x16_t p = vld1q_u8(q + i);
@@ -211,10 +240,23 @@ static float q4_k_row_int8(const unsigned char *row, size_t blocks,
                 ahi = vdotq_s32(ahi, vreinterpretq_s8_u8(vshrq_n_u8(p, 4)),
                                 vld1q_s8(xhi + i));
             }
+            sum_lo = vaddvq_s32(alo);
+            sum_hi = vaddvq_s32(ahi);
+#else
+            const __m256i ones = _mm256_set1_epi16(1);
+            const __m256i p = _mm256_loadu_si256((const __m256i *)(const void *)q);
+            const __m256i nl = _mm256_and_si256(p, _mm256_set1_epi8(0x0f));
+            const __m256i nh = _mm256_and_si256(_mm256_srli_epi16(p, 4),
+                                                _mm256_set1_epi8(0x0f));
+            const __m256i vl = _mm256_loadu_si256((const __m256i *)(const void *)xlo);
+            const __m256i vh = _mm256_loadu_si256((const __m256i *)(const void *)xhi);
+            sum_lo = hsum256i(_mm256_madd_epi16(_mm256_maddubs_epi16(nl, vl), ones));
+            sum_hi = hsum256i(_mm256_madd_epi16(_mm256_maddubs_epi16(nh, vh), ones));
+#endif
 
             const size_t s0 = sub0 + (size_t)base / 32;
-            total += d * (float)sc0 * xscale[s0]     * (float)vaddvq_s32(alo);
-            total += d * (float)sc1 * xscale[s0 + 1] * (float)vaddvq_s32(ahi);
+            total += d * (float)sc0 * xscale[s0]     * (float)sum_lo;
+            total += d * (float)sc1 * xscale[s0 + 1] * (float)sum_hi;
             mins  += dmin * ((float)mn0 * xsum[s0] + (float)mn1 * xsum[s0 + 1]);
             q += 32;
         }
@@ -270,7 +312,57 @@ static float q4_k_row(const unsigned char *row, size_t blocks,
     return vaddvq_f32(total) - mins;
 }
 
-#else   /* the scalar twin, and the reference for what the NEON one means */
+#elif defined(__AVX2__)
+#include <immintrin.h>
+
+static inline float hsum256(__m256 v) {
+    __m128 a = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    a = _mm_add_ps(a, _mm_movehl_ps(a, a));
+    a = _mm_add_ss(a, _mm_shuffle_ps(a, a, 0x55));
+    return _mm_cvtss_f32(a);
+}
+
+static float q4_k_row(const unsigned char *row, size_t blocks,
+                      const float *x, const float *xsum) {
+    __m256 total = _mm256_setzero_ps();
+    float  mins  = 0.0f;
+
+    for (size_t b = 0; b < blocks; b++) {
+        const unsigned char *block = row + b * 144;
+        const float d    = mynah_slm_f16_to_f32(block);
+        const float dmin = mynah_slm_f16_to_f32(block + 2);
+        const unsigned char *scales = block + 4;
+        const unsigned char *q      = block + 16;
+        const float         *bx     = x    + b * 256;
+        const float         *bs     = xsum + b * 8;
+
+        for (int base = 0, si = 0; base < 256; base += 64, si += 2) {
+            unsigned char sc0, mn0, sc1, mn1;
+            q4_k_scale_min(scales, si,     &sc0, &mn0);
+            q4_k_scale_min(scales, si + 1, &sc1, &mn1);
+
+            __m256 lo = _mm256_setzero_ps(), hi = _mm256_setzero_ps();
+            for (int i = 0; i < 32; i += 8) {
+                const __m128i packed = _mm_loadl_epi64((const __m128i *)(const void *)(q + i));
+                const __m128i nl = _mm_and_si128(packed, _mm_set1_epi8(0x0f));
+                const __m128i nh = _mm_and_si128(_mm_srli_epi16(packed, 4),
+                                                 _mm_set1_epi8(0x0f));
+                lo = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(nl)),
+                                     _mm256_loadu_ps(bx + base + i), lo);
+                hi = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(nh)),
+                                     _mm256_loadu_ps(bx + base + i + 32), hi);
+            }
+            total = _mm256_fmadd_ps(lo, _mm256_set1_ps(d * (float)sc0), total);
+            total = _mm256_fmadd_ps(hi, _mm256_set1_ps(d * (float)sc1), total);
+            mins += dmin * ((float)mn0 * bs[base / 32] +
+                            (float)mn1 * bs[base / 32 + 1]);
+            q += 32;
+        }
+    }
+    return hsum256(total) - mins;
+}
+
+#else   /* the scalar twin, and the reference for what the other two mean */
 
 static float q4_k_row(const unsigned char *row, size_t blocks,
                       const float *x, const float *xsum) {
