@@ -1,7 +1,7 @@
 # Models
 
 Every number here is measured with `mynah-slm inspect`, not copied from a model
-card. Weights live on the NAS (`models/` is a symlink); see CLAUDE.md.
+card.
 
 ```sh
 scripts/download_model.sh --list
@@ -116,8 +116,8 @@ Two things about that repo, both verified against the HF API:
   We deliberately do not download it: mynah-slm is the **text tower only**, and
   ASR is `mynah-asr`'s job.
 
-**Not yet inspected** — not downloaded. Architecture traps are in CLAUDE.md and
-will be verified against a real checkpoint in M7.1.
+**Not yet inspected** — not downloaded. Its architecture traps will be written
+up in `docs/gemma4-arch.md` and verified against a real checkpoint in M7.1.
 
 The QAT checkpoint is plain **`Q4_0`**, which ingot decodes but only through its
 *generic* kernel. See TASKS.md 0.4: the fast NEON kernel already exists in

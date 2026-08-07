@@ -1,8 +1,8 @@
 /* arch_qwen3.c — the Qwen3 decoder.
  *
  * One token at a time against a KV cache. There is no separate prefill path:
- * prefill is this function in a loop. That is the qwen-asr lesson recorded in
- * CLAUDE.md — divergent prefill and decode paths breed bugs that only appear
+ * prefill is this function in a loop. That is the qwen-asr lesson: divergent
+ * prefill and decode paths breed bugs that only appear
  * on one of them, and the batched prefill is a speed optimization that has to
  * prove itself equal to this, not a second definition of what the model is.
  *

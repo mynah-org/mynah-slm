@@ -1,8 +1,8 @@
 # Build & Test — WITHOUT weights, deliberately.
 #
-# Every checkpoint this engine runs is hundreds of MB and lives on the NAS, so
-# CI never downloads one: the tests that need a model exit 77 and `make test`
-# prints SKIP for them. What remains is still real work — the ingot container
+# Every checkpoint this engine runs is hundreds of MB, so CI never downloads
+# one: the tests that need a model exit 77 and `make test` prints SKIP for
+# them. What remains is still real work — the ingot container
 # contract, the decoder kernels including their scalar twins, the GGUF metadata
 # census, the tokenizer's special-token wiring — and it is the portability half
 # that an M1 alone can never give: glibc, gcc, OpenBLAS, x86_64.

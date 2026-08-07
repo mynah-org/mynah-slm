@@ -217,9 +217,10 @@ number here would have led to reverting a real improvement.
 
 ## Method notes
 
-- Weights are staged locally for every measurement. Off the NAS the same full
-  weight read takes 17.0 s against 7.5 s, and page-cache pressure re-faults over
-  SMB mid-run — see CLAUDE.md.
+- Weights are staged on the local disk for every measurement
+  (`scripts/use_model.sh`). Read over a network share the same full weight read
+  takes 17.0 s against 7.5 s, and page-cache pressure re-faults over SMB
+  mid-run, which makes a number unreproducible rather than merely slow.
 - TTFT is stamped at the first token, never reconstructed from a total.
 - Prefill tok/s and decode tok/s are different numbers and are never quoted for
   one another.

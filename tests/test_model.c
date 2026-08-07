@@ -5,8 +5,8 @@
  * with itself; it checks that it agrees with the documented architecture, and
  * it fails if either drifts.
  *
- * Exit 77 (skip) when no checkpoint is staged: weights live on the NAS and are
- * not a build dependency.
+ * Exit 77 (skip) when no checkpoint is staged: weights are not a build
+ * dependency, and CI has none.
  *
  * SPDX-License-Identifier: MIT */
 #include "model.h"

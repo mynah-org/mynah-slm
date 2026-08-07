@@ -72,14 +72,14 @@ class Qwen3Config:
 class Qwen3Weights:
     def __init__(self, path: str):
         if not os.path.exists(path):
-            # models/ is a symlink to the NAS, which drops its SMB session more
-            # often than is comfortable. Say which of the two it is instead of
-            # letting np.memmap raise a bare FileNotFoundError.
+            # models/ is often a symlink to external storage, and a dropped
+            # mount looks exactly like a missing file. Say which of the two it
+            # is instead of letting np.memmap raise a bare FileNotFoundError.
             hint = ""
             root = os.path.dirname(os.path.abspath(path))
             if os.path.islink(root) or "models" in path:
-                hint = ("\nmodels/ is a symlink to /Volumes/shared (the NAS). "
-                        "If it is not mounted, remount it — see CLAUDE.md.")
+                hint = ("\nIf models/ is a symlink to external storage, "
+                        "check that its target is still mounted.")
             raise SystemExit(f"oracle: checkpoint not found: {path}{hint}")
 
         reader = GGUFReader(path)

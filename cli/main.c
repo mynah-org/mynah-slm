@@ -41,7 +41,7 @@ static void usage(FILE *f) {
         "  Timings go to stderr, so stdout stays pipeable into mynah-tts.\n"
         "  mynah-slm --version\n"
         "\n"
-        "Weights live on the NAS (models/ is a symlink); see CLAUDE.md.\n",
+        "No checkpoint yet? scripts/download_model.sh --list\n",
         mynah_slm_version());
 }
 

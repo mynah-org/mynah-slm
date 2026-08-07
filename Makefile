@@ -50,11 +50,11 @@ CFLAGS += -Iinclude
 MYNAH_SLM_BUILD := $(shell git describe --always --dirty 2>/dev/null || echo dev)
 CFLAGS += -DMYNAH_SLM_BUILD='"$(MYNAH_SLM_BUILD)"'
 
-# Weights live on the NAS (see CLAUDE.md): models/ is a symlink to
-# /Volumes/shared/mynah-slm/models. For anything that MEASURES, stage a copy
-# locally first with scripts/use_model.sh — reading weights over SMB is ~20x
-# slower on the I/O and, worse, unreproducible once page-cache pressure starts
-# re-faulting them mid-run. models-local/ wins automatically when populated.
+# Checkpoints live in models/, which is often not local storage — a network
+# share, an external drive. For anything that MEASURES, stage a copy on the
+# local disk first with scripts/use_model.sh: remote weights are ~20x slower on
+# the I/O and, worse, unreproducible once page-cache pressure starts re-faulting
+# them mid-run. models-local/ wins automatically when populated.
 MODEL_NAME ?= Qwen3-0.6B-Q4_K_M.gguf
 MODEL      ?= $(firstword $(wildcard models-local/$(MODEL_NAME)) models/$(MODEL_NAME))
 
@@ -127,7 +127,7 @@ test: $(TESTS) mynah-slm
 	done
 	@./mynah-slm --version >/dev/null || exit 1
 	@if [ -e "$(MODEL)" ]; then ./mynah-slm inspect "$(MODEL)" >/dev/null || exit 1; \
-	 else echo "SKIP inspect: $(MODEL) not found (weights live on the NAS, see CLAUDE.md)"; fi
+	 else echo "SKIP inspect: $(MODEL) not found (scripts/download_model.sh --list)"; fi
 	@$(MAKE) --no-print-directory test-parity
 
 # C forward pass vs the numpy oracle, stage by stage. Skips (77) rather than

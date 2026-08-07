@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Download a supported checkpoint into models/ — which is a SYMLINK TO THE NAS
-# (/Volumes/shared/mynah-slm/models). The laptop's internal disk has ~17 GB
-# free and is not allowed to hold weights; see CLAUDE.md.
+# Download a supported checkpoint from HuggingFace into models/.
+#
+# Public links only: no account, no token, nothing to log into. The download
+# resumes if it is interrupted, so re-running it after a dropped connection
+# picks up where it stopped.
 #
 # Non-interactive by design: no prompts, no menu, safe from CI and from an agent.
 #
@@ -55,9 +57,19 @@ for m in "${MODELS[@]}"; do
   IFS='|' read -r key repo file size desc <<<"$m"
   [ "$key" = "$CHOICE" ] || continue
 
-  # A dangling symlink here means the NAS is not mounted. Say so plainly
-  # instead of letting curl create a 400 MB file on the internal disk.
-  [ -d "$DEST" ] || die "$DEST is not a directory — is the NAS mounted? (see CLAUDE.md)"
+  # Two different failures wear the same "not a directory" face here, and only
+  # one of them is a problem:
+  #   - the destination is a SYMLINK that does not resolve. Somebody points
+  #     models/ at external storage — a network share, another drive — and it
+  #     is not mounted right now. Say so, instead of quietly writing hundreds
+  #     of MB to wherever the link used to go.
+  #   - it simply does not exist, which is just a fresh clone. Create it.
+  if [ ! -d "$DEST" ]; then
+    if [ -L "$DEST" ]; then
+      die "$DEST is a symlink that does not resolve — is its target mounted?"
+    fi
+    mkdir -p "$DEST" || die "cannot create $DEST"
+  fi
 
   out="$DEST/$file"
   if [ -f "$out" ]; then
