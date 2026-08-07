@@ -219,6 +219,43 @@ is the right oracle there because it is cross-checked against llama.cpp), and
 the parity gate still holds at `1.50e-06` on layer 0 with 19/19 argmax
 agreement.
 
+## `--fast`: int8 activations, +25% decode for +1.4% perplexity
+
+The Q4_K kernel above keeps activations in f32 and spends three vector
+instructions per four weights on widening and converting. SDOT does four int8
+multiply-accumulates per lane in one instruction — but only if the activations
+are int8 too.
+
+The identity survives the change cleanly, and only half of it is approximated:
+
+```
+SUM_j w_j x_j = d*scale * xs * SUM_j (q_j * xq_j)  -  dmin*min * SUM_j x_j
+                                ^^^^^^^^^^^^^^^^^        ^^^^^^^^^^^^^^^^
+                                integer, one SDOT        still exact f32
+```
+
+The activations are quantized once per matvec — the same hoist as `SUM x_j` —
+so 2048 rows share one quantization.
+
+| | decode | perplexity | tool calls | JSON valid |
+|---|---|---|---|---|
+| exact (default) | 34.9 tok/s | 2.802 | 25/30 | 30/30 |
+| `--fast` | **43.7 tok/s (+25%)** | 2.842 (+1.4%) | 23/30 | **29/30** |
+
+**It is off by default, and that is the point.** Every other speed change in
+this document is free — a reorder, a better kernel, a smaller cache with the
+same numbers. This one spends quality: 1.4% of perplexity, two cases of the
+tool-call suite, and the first malformed tool call in ninety measured turns.
+A JSON object that does not parse is a functional failure, not a quality
+nuance, and that is the line between an opt-in and a default.
+
+**The control matters here more than the result.** The first reading compared
+`--fast` against 26/30 — a number measured that morning, before three separate
+numerical changes landed. Re-run on the SAME binary, the exact path scores
+25/30, so int8 costs two cases and not three. (The 26 vs 25 is the suite's own
+sensitivity: greedy scoring flips on any perturbation, which is why perplexity
+is the primary gate and this is the corroborating one.)
+
 ## KV cache precision: 4-bit keys are ruinous, 4-bit values are nearly free
 
 At a 2275-token context the KV caches are **~520 MB — larger than the model**,

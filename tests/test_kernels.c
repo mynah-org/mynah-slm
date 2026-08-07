@@ -290,7 +290,7 @@ static void test_q4_k_matvec(void) {
     float *x = malloc(COLS * sizeof *x);
     float *a = malloc(ROWS * sizeof *a);
     float *b = malloc(ROWS * sizeof *b);
-    float  xsum[COLS / 32];
+    mynah_slm_matvec_in prep;
     unsigned char *packed = malloc((size_t)ROWS * (COLS / 256) * 144);
     if (!w || !x || !a || !b || !packed) { check("q4_k allocations", 0, "out of memory"); return; }
 
@@ -315,9 +315,10 @@ static void test_q4_k_matvec(void) {
             goto done;
         }
 
-    mynah_slm_matvec_prepare(x, COLS, xsum);
     mynah_slm_matvec_set_enabled(1);
-    if (mynah_slm_matvec(INGOT_TYPE_Q4_K, packed, ROWS, COLS, x, xsum, a) != 0) {
+    mynah_slm_matvec_set_int8(0);
+    mynah_slm_matvec_prepare(x, COLS, &prep);
+    if (mynah_slm_matvec(INGOT_TYPE_Q4_K, packed, ROWS, COLS, x, &prep, a) != 0) {
         check("our Q4_K matvec runs", 0, "it declined the call");
         goto done;
     }
@@ -341,9 +342,39 @@ static void test_q4_k_matvec(void) {
     check("our Q4_K matvec agrees with ingot's", rel < 1e-4, detail);
     printf("     %s\n", detail);
 
+    /* The int8-activation path is a different bargain and gets a different
+     * bound: it quantizes the ACTIVATIONS, so it is not a reorder and must not
+     * be held to a reorder's tolerance. The bound is loose on purpose: this
+     * fixture is uniform noise, where a block's max is far from its typical
+     * value and int8 therefore does worse than on real activations. Its job is
+     * to catch a broken unpack — which lands at 0.5 relative, not 0.007 — not
+     * to pin the quantization noise. What the noise actually costs is measured
+     * where it matters, on perplexity: +1.4% (docs/perf.md). */
+    if (mynah_slm_matvec_int8_enabled() || 1) {
+        mynah_slm_matvec_set_int8(1);
+        mynah_slm_matvec_prepare(x, COLS, &prep);
+        if (prep.have_int8 &&
+            mynah_slm_matvec(INGOT_TYPE_Q4_K, packed, ROWS, COLS, x, &prep, a) == 0) {
+            double worst = 0.0, scale = 0.0;
+            for (int r = 0; r < ROWS; r++) {
+                const double d = fabs((double)a[r] - (double)b[r]);
+                if (d > worst) worst = d;
+                if (fabs((double)b[r]) > scale) scale = fabs((double)b[r]);
+            }
+            const double rel = scale > 0.0 ? worst / scale : worst;
+            char d2[128];
+            snprintf(d2, sizeof d2, "rel=%.2e (int8 activations, not a reorder)", rel);
+            check("the int8 matvec stays within its quantization budget",
+                  rel > 1e-7 && rel < 3e-2, d2);
+            printf("     %s\n", d2);
+        }
+        mynah_slm_matvec_set_int8(0);
+        mynah_slm_matvec_prepare(x, COLS, &prep);
+    }
+
     /* And the fallback must be honest about what it does not have. */
     check("we decline types we have no kernel for",
-          mynah_slm_matvec(INGOT_TYPE_Q6_K, packed, ROWS, COLS, x, xsum, a) != 0,
+          mynah_slm_matvec(INGOT_TYPE_Q6_K, packed, ROWS, COLS, x, &prep, a) != 0,
           "claimed a Q6_K kernel we did not write");
 
 done:

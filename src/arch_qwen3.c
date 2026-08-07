@@ -33,7 +33,7 @@ typedef struct {
     const uint8_t *base;
     float         *out;
     const float   *in;
-    const float   *xsum;         /* NULL when ingot's kernel is doing the work */
+    const mynah_slm_matvec_in *prep;  /* NULL when ingot's kernel does the work */
     size_t         cols, row_bytes, rows_per_chunk, rows;
     int            type, rc;
 } matvec_job;
@@ -46,8 +46,8 @@ static void matvec_chunk(void *ctx, int i) {
     if (first + n > j->rows) n = j->rows - first;
 
     const uint8_t *rows = j->base + first * j->row_bytes;
-    if (j->xsum &&
-        mynah_slm_matvec(j->type, rows, n, j->cols, j->in, j->xsum,
+    if (j->prep &&
+        mynah_slm_matvec(j->type, rows, n, j->cols, j->in, j->prep,
                          j->out + first) == 0)
         return;
 
@@ -69,21 +69,21 @@ int mynah_slm_project(const mynah_slm_model_t *m, const ingot_tensor *w,
      * On the stack because it is cols/32 floats — 96 for the widest tensor in
      * this model — and a heap buffer for 384 bytes inside the token loop would
      * be the expensive part. */
-    float xsum_buf[MYNAH_SLM_XSUM_MAX];
-    const float *xsum = NULL;
+    mynah_slm_matvec_in prep;
+    const mynah_slm_matvec_in *prepared = NULL;
     if (mynah_slm_matvec_have(w->type) && cols % 256 == 0 &&
         cols / 32 <= MYNAH_SLM_XSUM_MAX) {
-        mynah_slm_matvec_prepare(in, cols, xsum_buf);
-        xsum = xsum_buf;
+        mynah_slm_matvec_prepare(in, cols, &prep);
+        prepared = &prep;
     }
 
     uint64_t block_elems = 0, block_bytes = 0;
     if (nth <= 1 || rows < 64 ||
         ingot_type_geometry(w->type, &block_elems, &block_bytes) != 0 ||
         block_elems == 0 || cols % block_elems != 0) {
-        if (xsum) {
+        if (prepared) {
             const uint8_t *b = ingot_gguf_data(m->gguf, w);
-            if (b && mynah_slm_matvec(w->type, b, rows, cols, in, xsum, out) == 0)
+            if (b && mynah_slm_matvec(w->type, b, rows, cols, in, prepared, out) == 0)
                 return 0;
         }
         return ingot_gguf_matvec(m->gguf, w, in, out);
@@ -99,7 +99,7 @@ int mynah_slm_project(const mynah_slm_model_t *m, const ingot_tensor *w,
     if ((size_t)chunks > rows) chunks = (int)rows;
 
     matvec_job j = {
-        .base = base, .out = out, .in = in, .xsum = xsum,
+        .base = base, .out = out, .in = in, .prep = prepared,
         .cols = cols, .row_bytes = (cols / block_elems) * block_bytes,
         .rows_per_chunk = (rows + (size_t)chunks - 1) / (size_t)chunks,
         .rows = rows, .type = w->type, .rc = 0,

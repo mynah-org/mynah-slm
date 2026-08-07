@@ -59,6 +59,7 @@ Qwen3-0.6B is implemented and validated; Gemma 4 is not started.
 | Multi-threading | ✅ 3.56x on 8 threads, bit-identical to the serial path |
 | Our own Q4_K matvec (`src/qmat.c`) | ✅ **1.55x** over ingot's per tensor, decode 28 → **36.5 tok/s** |
 | KV cache precision (`--kv f32\|bf16\|fp8\|q8\|q4`) | ✅ **bf16 by default**: half the memory, +26% decode at 2K context, same perplexity |
+| `--fast` — int8 activations (SDOT) | ✅ opt-in: **+25% decode** for +1.4% perplexity. Off by default, because it is the one change that is not free |
 | Batched prefill (projections **and** attention) | ✅ **14x** — 26 → 370 tok/s on a 198-token prompt, TTFT 7.6 s → 0.58 s |
 | HTTP server: `/health`, `/v1/models`, `/v1/chat/completions` (+SSE), `/v1/tokenize` | ✅ |
 | Tool calling: schemas in, calls out, second turn, SSE | ✅ prompt byte-identical to HF; **26/30** with `--think on`, 21/30 without ([docs/tools.md](docs/tools.md)) |

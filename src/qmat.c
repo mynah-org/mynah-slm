@@ -93,17 +93,60 @@ static int use_own_kernels(void) {
 
 void mynah_slm_matvec_set_enabled(int on) { g_own = on ? 1 : 0; }
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#define MYNAH_SLM_HAVE_SDOT 1
+#endif
+
+static int g_int8 = -1;
+
+int mynah_slm_matvec_int8_enabled(void) {
+#if defined(MYNAH_SLM_HAVE_SDOT)
+    if (g_int8 < 0) {
+        /* Off unless asked for. It trades accuracy for speed, and a default
+         * that quietly does that is how a quantization claim stops meaning
+         * anything. `mynah-slm ppl` is what decides, not this. */
+        const char *e = getenv("MYNAH_SLM_INT8");
+        g_int8 = (e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return g_int8;
+#else
+    return 0;
+#endif
+}
+
+void mynah_slm_matvec_set_int8(int on) { g_int8 = on ? 1 : 0; }
+
 int mynah_slm_matvec_have(int type) {
     return type == INGOT_TYPE_Q4_K && use_own_kernels();
 }
 
-void mynah_slm_matvec_prepare(const float *input, size_t cols, float *xsum) {
-    if (!input || !xsum) return;
+void mynah_slm_matvec_prepare(const float *input, size_t cols,
+                              mynah_slm_matvec_in *prep) {
+    if (!input || !prep) return;
+    prep->have_int8 = mynah_slm_matvec_int8_enabled() && cols <= MYNAH_SLM_XQ_MAX;
+
     for (size_t s = 0; s < cols / 32; s++) {
         const float *x = input + s * 32;
-        float acc = 0.0f;
-        for (int i = 0; i < 32; i++) acc += x[i];
-        xsum[s] = acc;
+        float acc = 0.0f, amax = 0.0f;
+        for (int i = 0; i < 32; i++) {
+            acc += x[i];
+            const float a = fabsf(x[i]);
+            if (a > amax) amax = a;
+        }
+        prep->xsum[s] = acc;
+
+        if (prep->have_int8) {
+            const float scale = amax / 127.0f;
+            prep->xscale[s] = scale;
+            const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+            int8_t *q = prep->xq + s * 32;
+            for (int i = 0; i < 32; i++) {
+                float v = nearbyintf(x[i] * inv);
+                if (v >  127.0f) v =  127.0f;
+                if (v < -128.0f) v = -128.0f;
+                q[i] = (int8_t)v;
+            }
+        }
     }
 }
 
@@ -123,9 +166,65 @@ static void q4_k_scale_min(const unsigned char *scales, int index,
     }
 }
 
-#if defined(__ARM_NEON)
+#if defined(MYNAH_SLM_HAVE_SDOT)
 #include <arm_neon.h>
 
+/* ── the int8 path ─────────────────────────────────────────────────────────
+ * SDOT does four int8 multiply-accumulates per lane in one instruction, where
+ * the f32 form needs a widen, a convert and an FMA per four values. The price
+ * is that the ACTIVATIONS are quantized to int8 per 32 values.
+ *
+ * Both halves of the identity survive it cleanly:
+ *
+ *     SUM_j w_j x_j = d*scale * xs * SUM_j (q_j * xq_j)  -  dmin*min * SUM_j x_j
+ *                                    ^^^^^^^^^^^^^^^^^        ^^^^^^^^^^^^^^^^
+ *                                    integer, one SDOT        still exact f32
+ *
+ * so the min term keeps full precision and only the product term is
+ * approximated. Whether that is acceptable is a question for `mynah-slm ppl`,
+ * which is why this is off by default. */
+static float q4_k_row_int8(const unsigned char *row, size_t blocks,
+                           const int8_t *xq, const float *xscale,
+                           const float *xsum) {
+    float total = 0.0f, mins = 0.0f;
+
+    for (size_t b = 0; b < blocks; b++) {
+        const unsigned char *block = row + b * 144;
+        const float d    = mynah_slm_f16_to_f32(block);
+        const float dmin = mynah_slm_f16_to_f32(block + 2);
+        const unsigned char *scales = block + 4;
+        const unsigned char *q      = block + 16;
+        const size_t sub0 = b * 8;
+
+        for (int base = 0, si = 0; base < 256; base += 64, si += 2) {
+            unsigned char sc0, mn0, sc1, mn1;
+            q4_k_scale_min(scales, si,     &sc0, &mn0);
+            q4_k_scale_min(scales, si + 1, &sc1, &mn1);
+
+            const int8_t *xlo = xq + b * 256 + base;
+            const int8_t *xhi = xlo + 32;
+            int32x4_t alo = vdupq_n_s32(0), ahi = vdupq_n_s32(0);
+            for (int i = 0; i < 32; i += 16) {
+                const uint8x16_t p = vld1q_u8(q + i);
+                alo = vdotq_s32(alo, vreinterpretq_s8_u8(vandq_u8(p, vdupq_n_u8(0x0f))),
+                                vld1q_s8(xlo + i));
+                ahi = vdotq_s32(ahi, vreinterpretq_s8_u8(vshrq_n_u8(p, 4)),
+                                vld1q_s8(xhi + i));
+            }
+
+            const size_t s0 = sub0 + (size_t)base / 32;
+            total += d * (float)sc0 * xscale[s0]     * (float)vaddvq_s32(alo);
+            total += d * (float)sc1 * xscale[s0 + 1] * (float)vaddvq_s32(ahi);
+            mins  += dmin * ((float)mn0 * xsum[s0] + (float)mn1 * xsum[s0 + 1]);
+            q += 32;
+        }
+    }
+    return total - mins;
+}
+#endif
+
+
+#if defined(__ARM_NEON)
 static inline float32x4_t nib_to_f32(uint8x8_t v, int high) {
     const uint16x8_t w = vmovl_u8(v);
     return vcvtq_f32_u32(vmovl_u16(high ? vget_high_u16(w) : vget_low_u16(w)));
@@ -208,14 +307,24 @@ static float q4_k_row(const unsigned char *row, size_t blocks,
 #endif
 
 int mynah_slm_matvec(int type, const void *weights, size_t rows, size_t cols,
-                     const float *input, const float *xsum, float *output) {
-    if (!xsum || type != INGOT_TYPE_Q4_K || !use_own_kernels()) return -1;
+                     const float *input, const mynah_slm_matvec_in *prep,
+                     float *output) {
+    if (!prep || type != INGOT_TYPE_Q4_K || !use_own_kernels()) return -1;
     if (cols % 256 != 0) return -1;         /* Q4_K super-blocks, by definition */
 
     const size_t blocks = cols / 256;
     const unsigned char *base = (const unsigned char *)weights;
+
+#if defined(MYNAH_SLM_HAVE_SDOT)
+    if (prep->have_int8) {
+        for (size_t r = 0; r < rows; r++)
+            output[r] = q4_k_row_int8(base + r * blocks * 144, blocks,
+                                      prep->xq, prep->xscale, prep->xsum);
+        return 0;
+    }
+#endif
     for (size_t r = 0; r < rows; r++)
-        output[r] = q4_k_row(base + r * blocks * 144, blocks, input, xsum);
+        output[r] = q4_k_row(base + r * blocks * 144, blocks, input, prep->xsum);
     return 0;
 }
 

@@ -14,6 +14,7 @@
 #include "threads.h"
 #include "timing.h"
 #include "kvcache.h"
+#include "qmat.h"
 #include "tokenizer.h"
 #include "tools.h"
 
@@ -38,7 +39,7 @@ static void usage(FILE *f) {
         "  mynah-slm run -m <model.gguf> -p \"prompt\" [-n 128] [--think off|low|on]\n"
         "                [--temp T] [--top-k K] [--top-p P] [--min-p M] [--seed S]\n"
         "                [--raw] [--no-stream] [--quiet] [--ctx N] [--show-think]\n"
-        "                [--tools tools.json] [--kv f32|bf16|fp8|q8|q4]\n"
+        "                [--tools tools.json] [--kv f32|bf16|fp8|q8|q4] [--fast]\n"
         "                [-t N | --threads N]   (default: performance cores)\n"
         "\n"
         "  Reasoning NEVER reaches stdout: it is discarded, or written to stderr\n"
@@ -47,6 +48,9 @@ static void usage(FILE *f) {
         "  --tools takes an OpenAI-shaped array of function schemas. A call the\n"
         "  model makes is printed to stdout as one JSON line — {\"tool_calls\":[..]}\n"
         "  — and never mixed into the answer text, so `| jq` works.\n"
+        "\n"
+        "  --fast: int8 activations in the matvec. ~25%% more decode tok/s for\n"
+        "  ~1.4%% perplexity — measured, not free. Off by default.\n"
         "\n"
         "  Timings go to stderr, so stdout stays pipeable into mynah-tts.\n"
         "  mynah-slm --version\n"
@@ -325,13 +329,18 @@ static int cmd_ppl(const char *model_path, const char *path, int threads,
 
 typedef struct {
     const char *model, *prompt, *system, *tools_path;
-    int   max_new, raw, stream, quiet, think, ctx, show_think, threads;
+    int   max_new, raw, stream, quiet, think, ctx, show_think, threads, fast;
     mynah_slm_kv_type kv_k, kv_v;
     mynah_slm_sampler_params sp;
 } run_opts;
 
 static int cmd_run(run_opts *o) {
     char err[256];
+
+    /* Opt-in, never default: int8 activations buy ~25% decode and cost ~1.4%
+     * perplexity. A speed default that quietly spends quality is how a
+     * quantization claim stops meaning anything. */
+    if (o->fast) mynah_slm_matvec_set_int8(1);
 
     /* Tool schemas first: a bad file must fail before a 400 MB checkpoint is
      * mapped, not after. */
@@ -534,6 +543,7 @@ int main(int argc, char **argv) {
                         : !strcmp(v, "low") ? MYNAH_SLM_THINK_LOW
                                             : MYNAH_SLM_THINK_OFF;
             }
+            else if (!strcmp(a, "--fast"))      o.fast = 1;
             else if (!strcmp(a, "--show-think")) o.show_think = 1;
             else if (!strcmp(a, "--raw"))       o.raw = 1;
             else if (!strcmp(a, "--no-stream")) o.stream = 0;
