@@ -219,6 +219,87 @@ is the right oracle there because it is cross-checked against llama.cpp), and
 the parity gate still holds at `1.50e-06` on layer 0 with 19/19 argmax
 agreement.
 
+## Our own Q6_K matvec: a tie on ARM, 4.65x on x86
+
+The Q4_K win above left an obvious target. `make bench` on Granite says **46% of
+a Q4_K_M decode step's matvec time runs on Q6_K tensors** — `attn_v`,
+`ffn_down`, and the tied `lm_head` — all on ingot's kernel. Half the step, on
+code we had never tried to beat.
+
+We tried. On ARM it is a **tie**, and the way it failed is worth more than the
+kernel would have been.
+
+### First: is there room at all?
+
+Before optimizing, ask what the roof is. A 20-line probe (8 threads, 84 MB,
+streaming reads) says this M1 does **57–60 GB/s** — and, unlike x86, it reaches
+almost all of that from a single core. The `lm_head` matvec moves 84.3 MB in
+3.46 ms = **24.4 GB/s**, or 42% of the roof. So Q6_K was *not* memory-bound and
+there was, in principle, 2.3x of headroom.
+
+### Two attempts, both ties
+
+**Restructured f32.** ingot reduces each group of 16 weights to a scalar with
+`vaddvq_f32` and applies the scale in scalar float: 16 horizontal reductions
+plus 16 scalar multiply-adds per super-block, and a horizontal reduce is the one
+NEON operation with no throughput to give. Ours folds the group accumulator into
+a running vector with `vmlaq_n_f32` and reduces **once per row**.
+
+**int8 SDOT.** A group of 16 weights shares a scale and maps to 16 contiguous
+inputs, so one group is exactly one `vdotq_s32`; `q - 32` lands in [-32, 31],
+which is already an int8, so SDOT takes it with no fix-up. The widen, convert
+and two FMAs per 8 weights collapse to a quarter of an instruction per weight.
+Four group sums fold with two `vpaddq_s32` instead of four `vaddvq`.
+
+| `lm_head` `[100352 x 1024]` | ours | ingot | |
+|---|---|---|---|
+| restructured f32 | 3.460 ms | 3.429 ms | **0.99x** |
+| int8 SDOT | 3.534 ms | 3.619 ms | **1.02x** |
+
+**Cutting the instruction count by ~1.5x moved nothing.** That is the finding:
+this kernel is not issue-bound, and it is not bandwidth-bound either, so it sits
+on a plateau that neither scheduling nor op count reaches — most likely memory
+latency the prefetcher cannot hide across three interleaved byte streams.
+Recorded because "46% of a decode step" reads like an opportunity, and on ARM it
+is not one. **The int8 Q6_K kernel was deleted rather than shipped**: a quality
+trade-off that buys nothing is not a trade.
+
+### Then x86, where the same kernel is worth 4.65x
+
+ingot's Q6_K has a fused NEON path and **no AVX2 path at all** — read
+`ingot_q6_k_matvec`: on x86 it falls through to `kquant_apply`, the
+dequantize-into-a-256-float-scratch-then-dot loop that §2 above measured at 2.8x
+slower per element. So the identical kernel is standing next to something else
+entirely, and the A/B says so (x86_64, AVX2, under Rosetta):
+
+| tensor | ours | ingot | |
+|---|---|---|---|
+| `lm_head` `[100352 x 1024]` | 14.16 ms | 65.80 ms | **4.65x** |
+| `ffn_down` `[1024 x 2048]` | 0.316 | 1.295 | **4.09x** |
+| `ffn_gate` `[2048 x 1024]` | 0.320 | 1.308 | **4.09x** |
+| `attn_q` `[1024 x 1024]` | 0.179 | 0.722 | **4.03x** |
+
+Caveat stated rather than buried: these run under **Rosetta**, which translates
+AVX2, so the absolutes are not native x86 speeds and the ratio is probably
+amplified — our Q4_K wins 1.3–1.7x natively on ARM and 2.5–3.1x translated on
+the same comparison. What does not depend on the measurement is the structural
+reason, which is readable in ingot's source: there is no AVX2 Q6_K kernel. This
+is a vector kernel where there was none, not a better one.
+
+### So the default is split, and the split is the measurement
+
+`src/qmat.c` hands Q6_K to **ingot on ARM and to ours on x86**. Not a
+preference — a tie does not get to replace a validated kernel (CLAUDE.md rule
+4), and a 4x win does. `MYNAH_SLM_Q6K=own|ingot` forces either side so the A/B
+stays runnable on a machine whose default is the other one, which is how the
+ARM tie was measured at all.
+
+Correctness is gated on both: `tests/test_kernels.c` checks our Q6_K against
+ingot's on synthetic weights (`rel=2.2e-07` on ARM, `3.2e-07` on x86), and
+`make test-x86-rosetta` runs the whole suite as x86_64 — including the 7-stage
+parity gate, which exercises the AVX2 kernel in a real forward pass, since
+Qwen3's `attn_v`, `ffn_down` and `lm_head` are all Q6_K.
+
 ## `--fast`: int8 activations, +25% decode for +1.4% perplexity
 
 The Q4_K kernel above keeps activations in f32 and spends three vector

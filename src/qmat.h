@@ -110,4 +110,11 @@ int mynah_slm_matvec_have(int type);
  * and a real win gets called a regression. */
 void mynah_slm_matvec_set_enabled(int on);
 
+/* Q6_K is ours on x86 and ingot's on ARM by default, because that is what the
+ * A/B measured on each (see qmat.c). This forces the choice either way, which
+ * is what lets the gate in tests/test_kernels.c exercise OUR kernel on a Mac
+ * and `make bench` re-run the comparison there. MYNAH_SLM_Q6K=own|ingot does
+ * the same from the environment. */
+void mynah_slm_matvec_set_q6k(int own);
+
 #endif /* MYNAH_SLM_QMAT_H */

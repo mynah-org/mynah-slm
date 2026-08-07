@@ -46,6 +46,11 @@ static void bench_pair(const mynah_slm_model_t *m, const ingot_tensor *w,
                        double *own, double *ingot) {
     *own = *ingot = 1e30;
 
+    /* Q6_K defaults to ingot's on ARM, so without this the Q6_K rows would
+     * compare ingot against ingot and print a meaningless 1.00x. The A/B has to
+     * stay runnable on the machine whose default is the other side — that is
+     * how the tie was measured in the first place. */
+    mynah_slm_matvec_set_q6k(1);
     mynah_slm_matvec_set_enabled(1);
     mynah_slm_project(m, w, in, out);            /* warm the mapping */
 

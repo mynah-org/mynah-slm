@@ -257,12 +257,14 @@ That locates where the remaining time sits, with a number on it: in a Q4_K_M
 decode step, **46% of the matvec time is spent on Q6_K tensors** (`attn_v`,
 `ffn_down`, and the tied `lm_head`) running ingot's kernel rather than ours.
 
-Whether writing our own would win there is **not** established, and docs/perf.md
-argues for caution: ingot's Q6_K matvec was rewritten upstream and is already
-efficient per element — 24.2 G elem/s on this model's head, above every Q4_K
-tensor here. The honest statement is that 46% of the step is on code we have
-not tried to beat, which makes it the place to measure next, not a speedup
-already banked.
+**That has since been measured, and the answer was no — on this machine.** We
+wrote the Q6_K matvec twice (restructured f32, then int8 SDOT) and both tie
+ingot's NEON kernel to within 2%; cutting the instruction count by ~1.5x moved
+nothing, which says the kernel sits on a plateau that is neither bandwidth nor
+issue width. The same kernel is worth **4.65x on x86**, where ingot has no AVX2
+Q6_K at all — so it ships, defaulting to ingot on ARM and to ours on x86. The
+whole experiment, including the roof measurement that made the negative result
+interpretable, is in docs/perf.md.
 
 ### The verdict, and it is a split one
 

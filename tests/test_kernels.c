@@ -377,10 +377,93 @@ static void test_q4_k_matvec(void) {
         mynah_slm_matvec_prepare(x, COLS, &prep);
     }
 
-    /* And the fallback must be honest about what it does not have. */
+    /* And the fallback must be honest about what it does not have. Q5_K is the
+     * standing example: ingot's kernel is the only one, and we measured that
+     * ours would have nothing to add (docs/models.md). */
     check("we decline types we have no kernel for",
-          mynah_slm_matvec(INGOT_TYPE_Q6_K, packed, ROWS, COLS, x, &prep, a) != 0,
-          "claimed a Q6_K kernel we did not write");
+          mynah_slm_matvec(INGOT_TYPE_Q5_K, packed, ROWS, COLS, x, &prep, a) != 0,
+          "claimed a Q5_K kernel we did not write");
+
+done:
+    free(w); free(x); free(a); free(b); free(packed);
+}
+
+/* Our Q6_K matvec against ingot's. Same shape of test as Q4_K above, and it
+ * has to be: this kernel exists to be faster, so the ONLY thing standing
+ * between it and a wrong answer is that it still agrees.
+ *
+ * Q6_K's layout is the trap-rich one — quants split across two halves, four
+ * quarters read at four bit offsets of the same qh byte, scales indexed
+ * is/is+2/is+4/is+6, and `d` at the END of the block. Get any of it wrong and
+ * rows come out wildly wrong rather than slightly wrong, which is what a 1e-4
+ * bound on a normalized error is there to catch. */
+static void test_q6_k_matvec(void) {
+    enum { ROWS = 96, COLS = 512 };            /* COLS a multiple of 256 */
+
+    float *w = malloc((size_t)ROWS * COLS * sizeof *w);
+    float *x = malloc(COLS * sizeof *x);
+    float *a = malloc(ROWS * sizeof *a);
+    float *b = malloc(ROWS * sizeof *b);
+    mynah_slm_matvec_in prep;
+    unsigned char *packed = malloc((size_t)ROWS * (COLS / 256) * 210);
+    if (!w || !x || !a || !b || !packed) { check("q6_k allocations", 0, "out of memory"); return; }
+
+    if (!ingot_can_quantize(INGOT_TYPE_Q6_K)) {
+        check("ingot can encode Q6_K for the fixture", 0, "no encoder");
+        goto done;
+    }
+
+    /* Per-row magnitude spread so `d` and the int8 scales differ block to
+     * block; a fixture where every block shares one scale would pass with the
+     * scale indexing broken. */
+    unsigned seed = 999331u;
+    for (size_t i = 0; i < (size_t)ROWS * COLS; i++) {
+        seed = seed * 1103515245u + 12345u;
+        w[i] = (float)((int)((seed >> 16) & 0x7fffu) - 16384) * 1e-4f *
+               (1.0f + (float)(i / COLS % 5));
+    }
+    for (int i = 0; i < COLS; i++) {
+        seed = seed * 1103515245u + 12345u;
+        x[i] = (float)((int)((seed >> 16) & 0x7fffu) - 16384) * 1e-4f;
+    }
+
+    for (int r = 0; r < ROWS; r++)
+        if (ingot_quantize(INGOT_TYPE_Q6_K, w + (size_t)r * COLS, COLS,
+                           packed + (size_t)r * (COLS / 256) * 210) != 0) {
+            check("q6_k quantize the fixture", 0, "ingot_quantize failed");
+            goto done;
+        }
+
+    mynah_slm_matvec_set_enabled(1);
+    mynah_slm_matvec_set_int8(0);
+    /* Forced on: the default hands Q6_K back to ingot on ARM, where ours was
+     * measured a tie. The kernel still has to be RIGHT on both, or the x86
+     * build ships something nothing ever checked. */
+    mynah_slm_matvec_set_q6k(1);
+    mynah_slm_matvec_prepare(x, COLS, &prep);
+    if (mynah_slm_matvec(INGOT_TYPE_Q6_K, packed, ROWS, COLS, x, &prep, a) != 0) {
+        check("our Q6_K matvec runs", 0, "it declined the call");
+        goto done;
+    }
+    if (ingot_matvec(INGOT_TYPE_Q6_K, packed, ROWS, COLS, x, b) != 0) {
+        check("ingot's Q6_K matvec runs", 0, "ingot_matvec failed");
+        goto done;
+    }
+
+    double worst = 0.0, scale = 0.0;
+    int at = 0;
+    for (int r = 0; r < ROWS; r++) {
+        const double d = fabs((double)a[r] - (double)b[r]);
+        if (d > worst) { worst = d; at = r; }
+        if (fabs((double)b[r]) > scale) scale = fabs((double)b[r]);
+    }
+    const double rel = scale > 0.0 ? worst / scale : worst;
+
+    char detail[160];
+    snprintf(detail, sizeof detail, "rel=%.2e at row %d (ours %.6f, ingot %.6f)",
+             rel, at, a[at], b[at]);
+    check("our Q6_K matvec agrees with ingot's", rel < 1e-4, detail);
+    printf("     %s\n", detail);
 
 done:
     free(w); free(x); free(a); free(b); free(packed);
@@ -558,7 +641,7 @@ int main(void) {
     printf("\n-- rope --\n");       test_rope();
     printf("\n-- activations --\n");test_activations();
     printf("\n-- attention --\n");  test_attention();
-    printf("\n-- quantized matvec --\n"); test_q4_k_matvec();
+    printf("\n-- quantized matvec --\n"); test_q4_k_matvec(); test_q6_k_matvec();
     printf("\n-- kv cache precision --\n"); test_kv_roundtrip();
     printf("\n-- kv cache, packed --\n"); test_kv_packed();
 
