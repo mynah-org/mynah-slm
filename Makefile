@@ -195,9 +195,15 @@ check-x86:
 	done
 	@echo "x86-64 cross-compile OK (avx2 + fma + f16c)"
 
+# INGOT_CAPS_ASSUME is not optional here, it is what makes this target mean
+# something. Rosetta EXECUTES AVX2 but does not advertise it in CPUID, and
+# ingot dispatches on CPUID at runtime — so without it every ingot kernel under
+# this target quietly runs its scalar path and the gate tests nothing x86 about
+# ingot. (Our own kernels are gated at compile time and did run, which is how
+# the gap stayed hidden.) Added upstream for exactly this reason.
 test-x86-rosetta:
 	$(MAKE) clean
-	$(MAKE) CC="$(CC) -arch x86_64" ARCH_FLAGS="-mavx2 -mfma -mf16c" test
+	INGOT_CAPS_ASSUME=avx2 $(MAKE) CC="$(CC) -arch x86_64" ARCH_FLAGS="-mavx2 -mfma -mf16c" test
 	$(MAKE) clean
 
 # ── libraries ──────────────────────────────────────────────────────────────

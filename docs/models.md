@@ -257,14 +257,14 @@ That locates where the remaining time sits, with a number on it: in a Q4_K_M
 decode step, **46% of the matvec time is spent on Q6_K tensors** (`attn_v`,
 `ffn_down`, and the tied `lm_head`) running ingot's kernel rather than ours.
 
-**That has since been measured, and the answer was no — on this machine.** We
-wrote the Q6_K matvec twice (restructured f32, then int8 SDOT) and both tie
-ingot's NEON kernel to within 2%; cutting the instruction count by ~1.5x moved
-nothing, which says the kernel sits on a plateau that is neither bandwidth nor
-issue width. The same kernel is worth **4.65x on x86**, where ingot has no AVX2
-Q6_K at all — so it ships, defaulting to ingot on ARM and to ours on x86. The
-whole experiment, including the roof measurement that made the negative result
-interpretable, is in docs/perf.md.
+**That has since been measured, and it ended somewhere unexpected.** We wrote
+the Q6_K matvec twice (restructured f32, then int8 SDOT); both tie ingot's NEON
+kernel to within 2%, and cutting the instruction count by ~1.5x moved nothing.
+On x86 the same kernel was worth **4.65x**, because ingot had no AVX2 Q6_K at
+all — so it went **upstream into ingot**, which is where a kernel with no
+per-call specialization belongs. ingot's version then measured *faster* than
+ours, and our copy was deleted. One implementation, validated against
+llama.cpp by ingot's own suite. Full arc in docs/perf.md.
 
 ### The verdict, and it is a split one
 
