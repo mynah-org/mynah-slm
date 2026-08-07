@@ -14,6 +14,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Attention over a batch is two GEMMs per head against the KV cache — both
+ * operands f32, so this is BLAS's job and not a hand-written loop's. */
+#if defined(MYNAH_SLM_BLAS_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
+
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #define MYNAH_SLM_NEON 1
@@ -290,4 +298,51 @@ void mynah_slm_attention_mt(float *out, const float *q, const float *k, const fl
                             uint32_t head_dim, float *scratch) {
     attn_job j = { out, scratch, q, k, v, n_kv, n_heads, n_kv_heads, head_dim };
     mynah_slm_parallel_for((int)n_heads, attn_task, &j);
+}
+
+void mynah_slm_attention_batch(float *out, const float *q,
+                               const float *k, const float *v,
+                               uint32_t pos0, uint32_t n_q, uint32_t n_heads,
+                               uint32_t n_kv_heads, uint32_t head_dim,
+                               uint32_t q_stride, float *scores) {
+    const uint32_t group  = n_heads / n_kv_heads;
+    const uint32_t kv_dim = n_kv_heads * head_dim;
+    const uint32_t n_kv   = pos0 + n_q;
+    const float    scale  = 1.0f / sqrtf((float)head_dim);
+
+    /* Heads run one after another and BLAS threads inside each, rather than one
+     * head per pool thread: a per-head scores buffer would be n_q * n_kv floats
+     * EACH, which at a 2000-token prompt is 19 MB of scratch to save a
+     * dispatch. The sgemms here are large enough to keep the cores busy on
+     * their own. */
+    for (uint32_t h = 0; h < n_heads; h++) {
+        const uint32_t kvh = h / group;
+
+        /* S[n_q][n_kv] = Q_h * K_h^T * scale.
+         *
+         * Both operands are STRIDED views, not copies: a query row is
+         * q_stride apart and a cached position is kv_dim apart, and the head's
+         * slice sits inside each. lda/ldb say so, so nothing is gathered. */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    (int)n_q, (int)n_kv, (int)head_dim, scale,
+                    q + (size_t)h * head_dim, (int)q_stride,
+                    k + (size_t)kvh * head_dim, (int)kv_dim,
+                    0.0f, scores, (int)n_kv);
+
+        for (uint32_t t = 0; t < n_q; t++) {
+            float *row = scores + (size_t)t * n_kv;
+            const uint32_t len = pos0 + t + 1;      /* the causal mask */
+            mynah_slm_softmax(row, len);
+            /* Zero rather than -inf: the tail is multiplied by V next, and a
+             * zero weight contributes nothing while an -inf would produce NaN.
+             */
+            memset(row + len, 0, (size_t)(n_kv - len) * sizeof *row);
+        }
+
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    (int)n_q, (int)head_dim, (int)n_kv, 1.0f,
+                    scores, (int)n_kv,
+                    v + (size_t)kvh * head_dim, (int)kv_dim,
+                    0.0f, out + (size_t)h * head_dim, (int)q_stride);
+    }
 }

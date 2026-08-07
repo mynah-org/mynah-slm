@@ -21,15 +21,28 @@ fail=0
 ok()   { echo "ok   $1"; }
 bad()  { echo "FAIL $1  <- ${2:-}"; fail=$((fail+1)); }
 
-"$SERVER" -m "$MODEL" --port "$PORT" >/dev/null 2>&1 &
+# The server's own output is KEPT, not sent to /dev/null: when it fails to come
+# up, the reason is in there — a busy port, a bad model path, a crash on load —
+# and a bare "server never came up" turns a one-line diagnosis into a hunt.
+# (Seen once on 2026-08-07 on a loaded machine and not reproduced since; the
+# next occurrence should explain itself.)
+LOG=$(mktemp)
+"$SERVER" -m "$MODEL" --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
-trap 'kill $SRV 2>/dev/null' EXIT
+trap 'kill $SRV 2>/dev/null; rm -f "$LOG"' EXIT
 
-for _ in $(seq 40); do
+for _ in $(seq 80); do
     curl -sf "localhost:$PORT/health" >/dev/null 2>&1 && break
+    kill -0 $SRV 2>/dev/null || break          # it died; stop waiting on it
     sleep 0.25
 done
-curl -sf "localhost:$PORT/health" >/dev/null 2>&1 || { echo "FAIL server never came up"; exit 1; }
+curl -sf "localhost:$PORT/health" >/dev/null 2>&1 || {
+    echo "FAIL server never came up on port $PORT"
+    echo "---- server output ----"
+    cat "$LOG"
+    echo "-----------------------"
+    exit 1
+}
 
 chat() {  # chat <max_tokens> <prompt> [extra-json]
     curl -s -X POST "localhost:$PORT/v1/chat/completions" \

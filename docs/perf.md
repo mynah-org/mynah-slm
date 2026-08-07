@@ -145,7 +145,7 @@ end-to-end tok/s did not move at all while the microbenchmark showed 2.9x,
 which reads as "the kernel does not matter" rather than "the kernel is not
 there". It is a real prerequisite now.
 
-## Batched prefill: 26 -> 292 tok/s, and TTFT 7.6 s -> 0.85 s
+## Batched prefill: 26 -> 370 tok/s, and TTFT 7.6 s -> 0.58 s
 
 Prefill used to be the decode path in a loop: one token, every weight read,
 repeat. Reading 400 MB of weights to advance one position is the definition of
@@ -159,38 +159,56 @@ being memory-bound.
 Measured, `Qwen3-0.6B-Q4_K_M`, 8 threads, local weights. Two prompt lengths,
 because they are bounded by different things:
 
+Attention is batched too, and it had to be — see the two rounds below.
+
 **198 tokens** — a tool-calling turn, the interactive case:
 
-| batch | prefill tok/s | TTFT |
+| batch | projections batched | + attention batched |
 |---|---|---|
-| 1 (the old path) | 26.3 | 7568 ms |
-| 16 | 80.6 | 2501 ms |
-| 32 | 134.1 | 1517 ms |
-| 64 | 184.1 | 1122 ms |
-| **128** (default) | **244.2** | **852 ms** |
-| 256 | 292.2 | 721 ms |
+| 1 (the old path) | 26.3 tok/s, TTFT 7568 ms | — |
+| 32 | 134.1 | — |
+| 64 | 184.1 | — |
+| 128 | 244.2, TTFT 852 ms | 307.6, TTFT 686 ms |
+| **256** (default) | 292.2 | **370.5, TTFT 577 ms** |
 
 **2275 tokens** — a transcript to summarize, which is what the ASR→SLM→TTS
 pipeline actually does:
 
-| batch | prefill tok/s | TTFT |
+| batch | projections batched | + attention batched |
 |---|---|---|
-| 1 (the old path) | 21.5 | 105841 ms |
-| 32 | 79.7 | 28596 ms |
-| 64 | 92.4 | 24675 ms |
-| **128** (default) | **101.7** | **22431 ms** |
-| 256 | 107.0 | 21330 ms |
-| 512 | 100.5 | 22691 ms |
+| 1 (the old path) | 21.5 tok/s, TTFT 105841 ms | — |
+| 64 | 92.4 | 153.1 |
+| 128 | 101.7, TTFT 22431 ms | 201.6, TTFT 11348 ms |
+| **256** (default) | 107.0 | **231.8, TTFT 9878 ms** |
+| 384 | — | 245.8 |
+| 512 | 100.5 | 243.8 |
 
-**9.3x on a short prompt, 4.7x on a long one — and the gap between those two
-numbers is the next bottleneck talking.** If prefill were still bound by the
-projections, tok/s would not care how long the prompt is. It cares a lot: 292
-at 198 tokens against 107 at 2275. That is attention, which is O(n²) over a
-prompt and is still computed one query at a time. Batching it is the next
-change, and it is the one that matters for summarization.
+**14x on a short prompt, 10.8x on a long one.**
 
-Decode is unchanged, as it must be: a batch of one goes down the single-token
-path verbatim.
+The two rounds are worth keeping separate, because the first one's *shape* is
+what pointed at the second. With only the projections batched, prefill ran at
+292 tok/s on a 198-token prompt and 107 on a 2275-token one. A projection-bound
+prefill does not care how long the prompt is; this cared enormously, which is
+O(n²) attention talking. Batching it lifted the long prompt from 101.7 to 201.6
+at the same width — and it barely moved the short one, exactly as the profile
+said it would.
+
+Past 256 the long prompt is flat (245.8 at 384, 246.4 at 1024) while the
+scratch keeps growing, so 256 is the default. `MYNAH_SLM_BATCH` overrides it.
+
+**Decode is unchanged**, which is the part to check rather than assume: a batch
+of one goes down the single-token path verbatim. A first reading suggested
+decode dropped from 17.8 to 15.5 tok/s at very wide batches; interleaved
+repeats put b=64 at 17.6/17.1 and b=256 at 16.8/17.4, i.e. noise. The same
+caution as the SIMD A/B further down — one number here would have invented a
+regression that is not there.
+
+### What the batch costs in memory
+
+At width 256 with a 3072-position context: ~19 MB of scratch (activations 12 MB,
+attention scores 3 MB, the dequantization strip 1.5 MB). Allocated once at
+session init, never in the token loop. It scales with the batch width, which is
+the other reason not to take 384 for 6% more prefill.
 
 ### It is a reorder, and that is checked
 
@@ -212,11 +230,12 @@ not fine for a path that has to agree with decode.
 
 ## What has not been done yet
 
-- **Batched attention.** The projections are batched; attention is not. Query t
-  may read exactly `pos+t+1` keys, so a batch is a triangle rather than a
-  rectangle, and sharing the KV read across it is a separate piece of work.
-  The two prefill tables above are the measurement that says it is now the
-  thing worth doing.
+- **Decode is now the slow half, and it is bandwidth-bound.** 26 tok/s short,
+  17 tok/s at 2000 tokens of context. Prefill is 14x faster than it was;
+  nothing about decode changed, because a single token cannot amortize a weight
+  read. The levers left are quantizing `token_embd` (42% of a step, see below),
+  a bf16 KV cache (halves the traffic attention re-reads every token), and
+  speculative decoding.
 - **SIMD in our own kernels: measured, and mostly not worth it.** See below.
 - **Q4_0 has a kernel now** (NEON + AVX2, 7-10x over the generic path), which
   changes nothing for Qwen3 — it is Q4_K/Q6_K — and everything for Gemma 4,

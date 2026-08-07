@@ -50,6 +50,7 @@ typedef struct {
     uint32_t batch_max;               /* rows these hold */
     float *bx, *bh, *bq, *battn, *bproj, *bgate, *bup;
     float *strip;                     /* [STRIP_ROWS * max_cols] */
+    float *bscores;                   /* [batch_max * n_ctx] attention scores */
 
     mynah_slm_final_cb on_embed;   /* the residual stream before layer 0 */
     mynah_slm_layer_cb on_layer;

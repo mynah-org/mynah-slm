@@ -5,10 +5,10 @@
  * matches the oracle: a fused kernel that is wrong is much harder to find than
  * a slow one that is wrong.
  *
- * Matrix multiplication is deliberately NOT here. Quantized weights are
- * multiplied straight off their stored bytes by ingot, which owns the SIMD for
- * every block type; duplicating that would be a fourth private copy of the
- * thing docs/prior-art.md says to upstream instead.
+ * Products against QUANTIZED WEIGHTS are not here — they live in qmat.c, which
+ * owns the decode-vs-prefill dispatch. What is here is the arithmetic on
+ * activations, where both operands are already f32: attention included, since
+ * its matrices are the KV cache and not a weight tensor.
  *
  * SPDX-License-Identifier: MIT */
 #ifndef MYNAH_SLM_KERNELS_H
@@ -105,5 +105,28 @@ void mynah_slm_attention(float *out, const float *q, const float *k, const float
 void mynah_slm_attention_mt(float *out, const float *q, const float *k, const float *v,
                             uint32_t n_kv, uint32_t n_heads, uint32_t n_kv_heads,
                             uint32_t head_dim, float *scratch);
+
+/* Causal GQA for a BATCH of consecutive query positions — prefill.
+ *
+ *   q, out   [n_q][q_stride], row t is the query at absolute position pos0 + t
+ *   k, v     the layer's caches, [n_kv][kv_dim], oldest first
+ *   scores   [n_q * (pos0 + n_q)] scratch
+ *
+ * The one-query-at-a-time form re-reads the whole KV history for every query,
+ * which over a prompt is O(n^2) memory traffic on top of O(n^2) arithmetic.
+ * Here each head is two sgemms — scores, then the weighted sum of values — so
+ * the history is read once per head instead of once per query.
+ *
+ * CAUSALITY IS A MASK HERE, not a truncation: the batch is a triangle, query t
+ * may read exactly pos0 + t + 1 keys. The tail of each row is zeroed after the
+ * softmax so the second product cannot see the future.
+ *
+ * Not bit-identical to the per-query form — sgemm sums in its own order — but
+ * a reorder of the same arithmetic, which tests/test_batch.c pins. */
+void mynah_slm_attention_batch(float *out, const float *q,
+                               const float *k, const float *v,
+                               uint32_t pos0, uint32_t n_q, uint32_t n_heads,
+                               uint32_t n_kv_heads, uint32_t head_dim,
+                               uint32_t q_stride, float *scores);
 
 #endif /* MYNAH_SLM_KERNELS_H */

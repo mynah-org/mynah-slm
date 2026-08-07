@@ -144,7 +144,7 @@ int mynah_slm_state_init(mynah_slm_state *s, const mynah_slm_model_t *m,
      * the knee, and the scratch it needs is a few MB. MYNAH_SLM_BATCH exists
      * so the next machine gets measured instead of assumed. Never wider than
      * the context. */
-    uint32_t batch = 128;
+    uint32_t batch = 256;
     const char *env = getenv("MYNAH_SLM_BATCH");
     if (env) {
         const long v = strtol(env, NULL, 10);
@@ -165,11 +165,16 @@ int mynah_slm_state_init(mynah_slm_state *s, const mynah_slm_model_t *m,
     s->bgate = alloc_f32((size_t)batch * c->d_ff);
     s->bup   = alloc_f32((size_t)batch * c->d_ff);
     s->strip = alloc_f32((size_t)MYNAH_SLM_STRIP_ROWS * max_cols);
+    /* One head's scores for the whole batch: [batch][n_ctx]. Large enough to
+     * be worth stating — 1.2 MB at a 2000-token context — and still an order
+     * of magnitude under the KV cache it reads. */
+    s->bscores = alloc_f32((size_t)batch * n_ctx);
 
     if (!s->k_cache || !s->v_cache || !s->x || !s->h || !s->q || !s->attn ||
         !s->proj || !s->gate || !s->up || !s->scores || !s->scores_mt ||
         !s->logits || !s->embed_row || !s->bx || !s->bh || !s->bq ||
-        !s->battn || !s->bproj || !s->bgate || !s->bup || !s->strip) {
+        !s->battn || !s->bproj || !s->bgate || !s->bup || !s->strip ||
+        !s->bscores) {
         snprintf(err, errsz, "out of memory for a %u-position context", n_ctx);
         mynah_slm_state_free(s);
         return -1;
@@ -203,6 +208,7 @@ void mynah_slm_state_free(mynah_slm_state *s) {
     mynah_slm_aligned_free(s->bgate);
     mynah_slm_aligned_free(s->bup);
     mynah_slm_aligned_free(s->strip);
+    mynah_slm_aligned_free(s->bscores);
     memset(s, 0, sizeof *s);
 }
 
@@ -293,17 +299,11 @@ int mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
             mynah_slm_rope_apply(&s->rope, k_row, c->n_kv_heads, pos0 + t);
         }
 
-        /* Attention stays one query at a time, and that is not laziness: the
-         * causal mask means query t may read exactly pos0+t+1 keys, so the
-         * batch is a triangle rather than a rectangle. Sharing the KV read
-         * across a batch is a real optimization, and a separate one — this
-         * change is about the projections, which are 98% of prefill. */
-        for (uint32_t t = 0; t < n; t++)
-            mynah_slm_attention_mt(s->battn + (size_t)t * c->q_dim,
-                                   s->bq    + (size_t)t * c->q_dim,
-                                   k_layer, v_layer, pos0 + t + 1,
-                                   c->n_heads, c->n_kv_heads, c->head_dim,
-                                   s->scores_mt);
+        /* One pass over the history for the whole batch instead of one per
+         * query. The triangle is handled by masking inside the kernel. */
+        mynah_slm_attention_batch(s->battn, s->bq, k_layer, v_layer,
+                                  pos0, n, c->n_heads, c->n_kv_heads,
+                                  c->head_dim, c->q_dim, s->bscores);
 
         if (project_batch(m, w->wo, s, s->battn, s->bproj, n) != 0) return -1;
         for (uint32_t t = 0; t < n; t++)
