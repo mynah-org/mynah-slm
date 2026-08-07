@@ -84,11 +84,64 @@ pipe into `mynah-tts`. `--quiet` is the only thing that hides it.
 Text tower only — the vision and audio towers in the Gemma checkpoint are
 ignored on purpose. ASR is [`mynah-asr`](https://github.com/mynah-org/mynah-asr)'s job.
 
-## Building
+## Quickstart
 
-Needs a C11 compiler and a BLAS: Accelerate on macOS (nothing to install),
-`libopenblas-dev` on Linux. `ingot` is vendored in-tree as a subtree, so a
-plain clone builds — there is no submodule to init.
+**1 — Build.** A C11 compiler and a BLAS is the whole list: Accelerate on macOS
+(nothing to install), OpenBLAS on Linux. `ingot` is vendored in-tree as a
+subtree, so a plain clone builds — there is no submodule to init.
+
+```sh
+git clone https://github.com/mynah-org/mynah-slm.git && cd mynah-slm
+make          # macOS: Accelerate, zero deps
+              # Linux: sudo apt install libopenblas-dev  (Fedora: openblas-devel)
+```
+
+**2 — Get a model.** `scripts/download_model.sh` pulls a GGUF checkpoint
+straight from HuggingFace — no account, no token, resumable:
+
+```sh
+scripts/download_model.sh --list                  # every supported checkpoint
+scripts/download_model.sh --model qwen3-0.6b-q4   # 378 MB, the v0.1 default
+```
+
+| if you want… | alias | size |
+|---|---|---|
+| the default — the smallest thing that works well | `qwen3-0.6b-q4` | 378 MB |
+| the least quantization noise (official Qwen build) | `qwen3-0.6b-q8` | 610 MB |
+| the same architecture, scaled up | `qwen3-1.7b-q4` | 1.1 GB |
+| the quality option | `qwen3-4b-q4` | 2.5 GB |
+| the v0.2 production target — **not implemented yet** | `gemma4-e2b-qat` | 1.5 GB |
+
+**3 — Run it.**
+
+```sh
+./mynah-slm run -m models/Qwen3-0.6B-Q4_K_M.gguf -p "Ciao! Come stai?"
+```
+
+```
+Ciao! Sto bene, grazie! Come posso aiutarti oggi?
+[load 0.02s | prompt 19 tok, prefill 28.9 tok/s | gen 12 tok, decode 27.1 tok/s | TTFT 697 ms | 8 threads]
+```
+
+The answer is on stdout and the timing line on stderr, so the pipe into the
+next stage stays clean:
+
+```sh
+# think first, say only the answer, straight into TTS
+./mynah-slm run -m models/Qwen3-0.6B-Q4_K_M.gguf -p "Riassumi in una riga: ..." \
+  --think on | mynah-tts speak
+
+# what is actually inside a checkpoint
+./mynah-slm inspect models/Qwen3-0.6B-Q4_K_M.gguf --tensors Q6_K
+
+# OpenAI-shaped HTTP server, SSE included
+./mynah-slm-server -m models/Qwen3-0.6B-Q4_K_M.gguf --port 8080
+```
+
+Weights are **not** in this repo and never will be; `models/` is gitignored.
+Any GGUF Qwen3 checkpoint works, whether this script fetched it or not.
+
+## Build & test
 
 ```sh
 make            # mynah-slm + mynah-slm-server
@@ -98,23 +151,8 @@ make help       # every target
 ```
 
 `make test` passes without a checkpoint: the tests that need one exit 77 and
-say so. That is also why CI never downloads a model.
-
-## Using it
-
-```sh
-# one-shot generation, streaming, thinking off
-mynah-slm run -m model.gguf -p "Riassumi in una riga: ..." --think off
-
-# what is actually inside a checkpoint
-mynah-slm inspect model.gguf --tensors Q6_K
-
-# OpenAI-shaped HTTP server, SSE included
-mynah-slm-server -m model.gguf --port 8080
-```
-
-Weights are **not** in this repo and never will be. Point `-m` at any GGUF
-Qwen3 checkpoint.
+say so. That is also why CI never downloads a model — and why the forward pass,
+the tokenizer round-trip and generation are covered locally but not by CI.
 
 ## License
 
