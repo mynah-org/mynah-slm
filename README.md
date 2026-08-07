@@ -11,7 +11,7 @@ No Python at runtime, no cloud, no telemetry.
 
 > **Status: v0.1 in progress — Qwen3-0.6B runs end to end.** Generation,
 > streaming, thinking on/off, tool calling and the HTTP server all work today,
-> at **~26 tok/s decode and ~370 tok/s prefill** on an M-series Mac (`Q4_K_M`,
+> at **~36 tok/s decode and ~370 tok/s prefill** on an M-series Mac (`Q4_K_M`,
 > 8 threads, weights staged locally). Constrained decoding and Gemma 4 are not
 > written yet — see [what works today](#what-works-today) for the honest line
 > between the two.
@@ -57,6 +57,7 @@ Qwen3-0.6B is implemented and validated; Gemma 4 is not started.
 | Streaming, with TTFT measured at the first token | ✅ |
 | Thinking `off` / `low` / `on`, reasoning kept off stdout | ✅ |
 | Multi-threading | ✅ 3.56x on 8 threads, bit-identical to the serial path |
+| Our own Q4_K matvec (`src/qmat.c`) | ✅ **1.55x** over ingot's per tensor, decode 28 → **36.5 tok/s** |
 | Batched prefill (projections **and** attention) | ✅ **14x** — 26 → 370 tok/s on a 198-token prompt, TTFT 7.6 s → 0.58 s |
 | HTTP server: `/health`, `/v1/models`, `/v1/chat/completions` (+SSE), `/v1/tokenize` | ✅ |
 | Tool calling: schemas in, calls out, second turn, SSE | ✅ prompt byte-identical to HF; **26/30** with `--think on`, 21/30 without ([docs/tools.md](docs/tools.md)) |
@@ -64,15 +65,14 @@ Qwen3-0.6B is implemented and validated; Gemma 4 is not started.
 | Gemma 4 E2B (v0.2) | ❌ not started |
 
 Speed, on an M-series Mac with `Qwen3-0.6B-Q4_K_M` staged locally — decode
-4.1 → 27.1 tok/s in four measured steps, then prefill 26 → 370 tok/s once it
+4.1 → 36.5 tok/s in five measured steps, and prefill 26 → 370 tok/s once it
 stopped being one token at a time. Each step was found by measuring rather than
 guessing; the method, the per-tensor breakdown and the long-context numbers are
 in [docs/perf.md](docs/perf.md).
 
 ```
-$ mynah-slm run -m models-local/Qwen3-0.6B-Q4_K_M.gguf -p "Ciao! Come stai?" -n 24 --temp 0
-Ciao! Sto bene! Cosa ne hai?
-[load 0.03s | prompt 19 tok, prefill 69.9 tok/s | gen 12 tok, decode 25.2 tok/s | TTFT 318 ms | 8 threads]
+$ mynah-slm run -m models-local/Qwen3-0.6B-Q4_K_M.gguf -p "Racconta una storia breve su un faro." -n 60 --temp 0
+[load 0.01s | prompt 24 tok, prefill 127.5 tok/s | gen 60 tok, decode 36.5 tok/s | TTFT 218 ms | 8 threads]
 ```
 
 Every run reports its own speed on **stderr**, so stdout stays clean enough to

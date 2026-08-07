@@ -35,6 +35,10 @@
 
 #include <stddef.h>
 
+/* The per-32-element input sums our Q4_K kernel reads. Sized for a stack
+ * buffer: cols/32, so 16384 columns. Everything we ship is far under it. */
+#define MYNAH_SLM_XSUM_MAX 512
+
 /* Rows dequantized per pass. Sized so one strip of f32 stays in L2 next to the
  * activations it is about to multiply. */
 #define MYNAH_SLM_STRIP_ROWS 128
@@ -52,5 +56,35 @@
  * assuming it. Returns 0, or -1. */
 int mynah_slm_qmatmat(int type, const void *weights, size_t rows, size_t cols,
                       const float *in, float *out, size_t tokens, float *scratch);
+
+/* ── decode: one token, one row range ──────────────────────────────────────
+ * output[rows] = weights * input[cols], for a slice of the rows.
+ *
+ * Returns 0 when this build has a kernel of its own for `type` and used it,
+ * and non-zero when the caller should fall back to ingot's. That is the whole
+ * contract: we only take over where we have measured a win, everything else
+ * keeps the validated generic path.
+ *
+ * `xsum` holds cols/32 floats and is filled by mynah_slm_matvec_prepare() ONCE
+ * per input vector, not per row range — hoisting it out of the row loop is
+ * most of the point (see qmat.c). Pass NULL to skip our kernels entirely.
+ *
+ * MYNAH_SLM_KERNELS=ingot in the environment forces the fallback, which is how
+ * the A/B in `make bench` is run. */
+int mynah_slm_matvec(int type, const void *weights, size_t rows, size_t cols,
+                     const float *input, const float *xsum, float *output);
+
+/* Per-32-element sums of the input. cols must be a multiple of 32. */
+void mynah_slm_matvec_prepare(const float *input, size_t cols, float *xsum);
+
+/* Does this build have a kernel of its own for `type`? */
+int mynah_slm_matvec_have(int type);
+
+/* Force our kernels on or off, overriding MYNAH_SLM_KERNELS. Exists so
+ * tests/bench_matvec.c can A/B ours against ingot's INTERLEAVED in one
+ * process: two separate runs on a warm laptop disagree by 80% on tensors
+ * neither change touches, which is how a real regression gets called noise
+ * and a real win gets called a regression. */
+void mynah_slm_matvec_set_enabled(int on);
 
 #endif /* MYNAH_SLM_QMAT_H */

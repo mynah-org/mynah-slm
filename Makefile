@@ -68,6 +68,7 @@ help:
 	@echo "  test         unit tests + parity (exit 77 = skipped, model missing)"
 	@echo "  test-parity  C forward pass vs the numpy oracle, stage by stage"
 	@echo "  test-server  end-to-end HTTP checks (needs a minute of generation)"
+	@echo "  bench        per-tensor matvec throughput"
 	@echo "  golden-dump  regenerate the oracle's reference activations"
 	@echo "  debug        -O0 -g rebuild"
 	@echo "  ubsan        UBSan rebuild + test, then clean"
@@ -141,6 +142,14 @@ test-parity: $(PARITY)
 	  cd tools && uv run python -m eval.compare ../$(GOLDEN_DIR) ../$(DUMP_DIR); rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP parity: nothing to compare"; exit 0; else exit $$rc; fi
 
+# Per-tensor matvec throughput — where a decode step goes. Not part of `test`:
+# it measures, and a measurement that runs on every build gets ignored.
+BENCH := tests/bench_matvec
+bench: $(BENCH)
+	@$(BENCH) "$(MODEL)"; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP bench: model missing (scripts/use_model.sh)"; exit 0; \
+	  else exit $$rc; fi
+
 # End-to-end server checks: shape, determinism (sequential and concurrent),
 # SSE framing, and that reasoning never reaches content. Separate from `test`
 # because it spends a minute of real generation.
@@ -207,7 +216,7 @@ leaks: mynah-slm $(TESTS)
 	 else echo "SKIP leaks/inspect: $(MODEL) not found"; fi
 
 clean:
-	rm -rf build mynah-slm mynah-slm-server libmynah_slm.a libmynah_slm$(SOEXT) $(TESTS) $(PARITY) dist
+	rm -rf build mynah-slm mynah-slm-server libmynah_slm.a libmynah_slm$(SOEXT) $(TESTS) $(PARITY) $(BENCH) dist
 	@# Without this, libingot.a survives a clean: update the subtree and the
 	@# next build silently links the previous library.
 	@test -d $(INGOT_DIR) && $(MAKE) -C $(INGOT_DIR) clean || true
@@ -226,4 +235,4 @@ install: mynah-slm mynah-slm-server libmynah_slm.a
 	install -m 644 libmynah_slm.a $(DESTDIR)$(PREFIX)/lib/
 	install -m 644 include/mynah_slm.h $(DESTDIR)$(PREFIX)/include/
 
-.PHONY: all help lib shared test test-parity test-server golden-dump debug ubsan asan leaks clean install update-ingot
+.PHONY: all help lib shared test test-parity test-server bench golden-dump debug ubsan asan leaks clean install update-ingot

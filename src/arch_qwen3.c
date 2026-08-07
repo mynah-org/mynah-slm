@@ -33,6 +33,7 @@ typedef struct {
     const uint8_t *base;
     float         *out;
     const float   *in;
+    const float   *xsum;         /* NULL when ingot's kernel is doing the work */
     size_t         cols, row_bytes, rows_per_chunk, rows;
     int            type, rc;
 } matvec_job;
@@ -44,25 +45,49 @@ static void matvec_chunk(void *ctx, int i) {
     size_t n = j->rows_per_chunk;
     if (first + n > j->rows) n = j->rows - first;
 
-    if (ingot_matvec(j->type, j->base + first * j->row_bytes, n, j->cols,
-                     j->in, j->out + first) != 0)
+    const uint8_t *rows = j->base + first * j->row_bytes;
+    if (j->xsum &&
+        mynah_slm_matvec(j->type, rows, n, j->cols, j->in, j->xsum,
+                         j->out + first) == 0)
+        return;
+
+    if (ingot_matvec(j->type, rows, n, j->cols, j->in, j->out + first) != 0)
         j->rc = -1;              /* benign race: any failure sets the same -1 */
 }
 
 /* Weights are [out, in] row-major, so a projection is out = W · x. */
-static int project(const mynah_slm_model_t *m, const ingot_tensor *w,
-                   const float *in, float *out) {
+int mynah_slm_project(const mynah_slm_model_t *m, const ingot_tensor *w,
+                      const float *in, float *out) {
     const int nth = mynah_slm_threads_count();
 
     /* ne[0] is the INPUT width in ggml order; rank 1 is a single row. */
     const size_t cols = (size_t)w->ne[0];
     const size_t rows = (w->rank >= 2) ? (size_t)w->ne[1] : 1;
 
+    /* Per-32-element sums of the INPUT, for our Q4_K kernel. Computed once
+     * here and shared by every row: that is the hoist the kernel exists for.
+     * On the stack because it is cols/32 floats — 96 for the widest tensor in
+     * this model — and a heap buffer for 384 bytes inside the token loop would
+     * be the expensive part. */
+    float xsum_buf[MYNAH_SLM_XSUM_MAX];
+    const float *xsum = NULL;
+    if (mynah_slm_matvec_have(w->type) && cols % 256 == 0 &&
+        cols / 32 <= MYNAH_SLM_XSUM_MAX) {
+        mynah_slm_matvec_prepare(in, cols, xsum_buf);
+        xsum = xsum_buf;
+    }
+
     uint64_t block_elems = 0, block_bytes = 0;
     if (nth <= 1 || rows < 64 ||
         ingot_type_geometry(w->type, &block_elems, &block_bytes) != 0 ||
-        block_elems == 0 || cols % block_elems != 0)
+        block_elems == 0 || cols % block_elems != 0) {
+        if (xsum) {
+            const uint8_t *b = ingot_gguf_data(m->gguf, w);
+            if (b && mynah_slm_matvec(w->type, b, rows, cols, in, xsum, out) == 0)
+                return 0;
+        }
         return ingot_gguf_matvec(m->gguf, w, in, out);
+    }
 
     const uint8_t *base = ingot_gguf_data(m->gguf, w);
     if (!base) return -1;
@@ -74,7 +99,7 @@ static int project(const mynah_slm_model_t *m, const ingot_tensor *w,
     if ((size_t)chunks > rows) chunks = (int)rows;
 
     matvec_job j = {
-        .base = base, .out = out, .in = in,
+        .base = base, .out = out, .in = in, .xsum = xsum,
         .cols = cols, .row_bytes = (cols / block_elems) * block_bytes,
         .rows_per_chunk = (rows + (size_t)chunks - 1) / (size_t)chunks,
         .rows = rows, .type = w->type, .rc = 0,
@@ -348,7 +373,7 @@ int mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
 
     if (logits_out) {
         const ingot_tensor *head = m->lm_head ? m->lm_head : m->embed;
-        if (project(m, head, s->bh + (size_t)(n - 1) * c->d_model, s->logits) != 0)
+        if (mynah_slm_project(m, head, s->bh + (size_t)(n - 1) * c->d_model, s->logits) != 0)
             return -1;
         memcpy(logits_out, s->logits, c->vocab_size * sizeof(float));
     }
@@ -381,9 +406,9 @@ int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
         mynah_slm_rms_norm(s->h, s->x, (const float *)ingot_gguf_data(m->gguf, w->attn_norm),
                            c->d_model, c->rms_eps);
 
-        if (project(m, w->wq, s->h, s->q)     != 0) return -1;
-        if (project(m, w->wk, s->h, k_slot)   != 0) return -1;
-        if (project(m, w->wv, s->h, v_slot)   != 0) return -1;
+        if (mynah_slm_project(m, w->wq, s->h, s->q)     != 0) return -1;
+        if (mynah_slm_project(m, w->wk, s->h, k_slot)   != 0) return -1;
+        if (mynah_slm_project(m, w->wv, s->h, v_slot)   != 0) return -1;
 
         /* QK-norm before RoPE, per head, weights are head_dim long. */
         if (w->q_norm)
@@ -400,17 +425,17 @@ int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
         mynah_slm_attention_mt(s->attn, s->q, k_layer, v_layer, n_kv,
                                c->n_heads, c->n_kv_heads, c->head_dim, s->scores_mt);
 
-        if (project(m, w->wo, s->attn, s->proj) != 0) return -1;
+        if (mynah_slm_project(m, w->wo, s->attn, s->proj) != 0) return -1;
         mynah_slm_add(s->x, s->proj, c->d_model);
 
         mynah_slm_rms_norm(s->h, s->x, (const float *)ingot_gguf_data(m->gguf, w->ffn_norm),
                            c->d_model, c->rms_eps);
 
-        if (project(m, w->gate, s->h, s->gate) != 0) return -1;
-        if (project(m, w->up,   s->h, s->up)   != 0) return -1;
+        if (mynah_slm_project(m, w->gate, s->h, s->gate) != 0) return -1;
+        if (mynah_slm_project(m, w->up,   s->h, s->up)   != 0) return -1;
         mynah_slm_swiglu(s->gate, s->up, c->d_ff);
 
-        if (project(m, w->down, s->gate, s->proj) != 0) return -1;
+        if (mynah_slm_project(m, w->down, s->gate, s->proj) != 0) return -1;
         mynah_slm_add(s->x, s->proj, c->d_model);
 
         if (s->on_layer) s->on_layer(s->on_layer_ctx, l, s->x, c->d_model);
@@ -424,7 +449,7 @@ int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
      * is 151936 x 1024 — the hottest thing in the loop by a wide margin, and
      * the reason token_embd is not "just a lookup table". */
     const ingot_tensor *head = m->lm_head ? m->lm_head : m->embed;
-    if (project(m, head, s->h, s->logits) != 0) return -1;
+    if (mynah_slm_project(m, head, s->h, s->logits) != 0) return -1;
 
     s->n_past++;
     if (logits_out) memcpy(logits_out, s->logits, c->vocab_size * sizeof(float));

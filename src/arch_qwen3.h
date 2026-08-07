@@ -58,6 +58,13 @@ typedef struct {
     void              *on_layer_ctx;
 } mynah_slm_state;
 
+/* One projection: out[rows] = W · in[cols], threaded by output rows and
+ * bit-identical to the serial call. Exposed for tests/bench_matvec.c, which is
+ * how a kernel regression gets caught as a number rather than as "the engine
+ * feels slower". Not part of the public API. */
+int  mynah_slm_project(const mynah_slm_model_t *m, const ingot_tensor *w,
+                       const float *in, float *out);
+
 int  mynah_slm_state_init(mynah_slm_state *s, const mynah_slm_model_t *m,
                           uint32_t n_ctx, char *err, size_t errsz);
 void mynah_slm_state_free(mynah_slm_state *s);

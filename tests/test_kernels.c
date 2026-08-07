@@ -11,6 +11,11 @@
  * SPDX-License-Identifier: MIT */
 #include "kernels.h"
 
+#include "qmat.h"
+
+#include "ingot/dtype.h"
+#include "ingot/quant.h"
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -263,11 +268,93 @@ static void test_attention(void) {
           "output escaped the range of v — weights do not sum to 1");
 }
 
+/* Our Q4_K matvec against ingot's, on synthetic weights — no checkpoint, so
+ * this runs in CI.
+ *
+ * ingot is the oracle here and that is the right way round: its kernel is
+ * cross-checked against llama.cpp's own reference, so agreeing with it means
+ * agreeing with the format. Ours computes the same sum in a different order —
+ * the scale is applied once per 32-weight sub-block instead of per weight, and
+ * the min term is folded into a precomputed input sum — so the two agree to
+ * rounding, not to the bit.
+ *
+ * The failure this catches is not "slightly off": get the 6-bit scale/min
+ * unpacking or the nibble order wrong and rows come out wildly wrong, which is
+ * exactly what a tolerance of 1e-4 on a normalized error separates from noise.
+ */
+static void test_q4_k_matvec(void) {
+    enum { ROWS = 96, COLS = 512 };            /* COLS a multiple of 256 */
+
+    float *w = malloc((size_t)ROWS * COLS * sizeof *w);
+    float *x = malloc(COLS * sizeof *x);
+    float *a = malloc(ROWS * sizeof *a);
+    float *b = malloc(ROWS * sizeof *b);
+    float  xsum[COLS / 32];
+    unsigned char *packed = malloc((size_t)ROWS * (COLS / 256) * 144);
+    if (!w || !x || !a || !b || !packed) { check("q4_k allocations", 0, "out of memory"); return; }
+
+    /* Deterministic, and with a range wide enough that d and dmin differ per
+     * block — a fixture where every block shares one scale would pass with the
+     * scale unpacking broken. */
+    unsigned seed = 12345u;
+    for (size_t i = 0; i < (size_t)ROWS * COLS; i++) {
+        seed = seed * 1103515245u + 12345u;
+        w[i] = (float)((int)((seed >> 16) & 0x7fffu) - 16384) * 1e-4f *
+               (1.0f + (float)(i / COLS % 7));
+    }
+    for (int i = 0; i < COLS; i++) {
+        seed = seed * 1103515245u + 12345u;
+        x[i] = (float)((int)((seed >> 16) & 0x7fffu) - 16384) * 1e-4f;
+    }
+
+    for (int r = 0; r < ROWS; r++)
+        if (ingot_q4_k_quantize(w + (size_t)r * COLS, COLS,
+                                packed + (size_t)r * (COLS / 256) * 144) != 0) {
+            check("q4_k quantize the fixture", 0, "ingot_q4_k_quantize failed");
+            goto done;
+        }
+
+    mynah_slm_matvec_prepare(x, COLS, xsum);
+    mynah_slm_matvec_set_enabled(1);
+    if (mynah_slm_matvec(INGOT_TYPE_Q4_K, packed, ROWS, COLS, x, xsum, a) != 0) {
+        check("our Q4_K matvec runs", 0, "it declined the call");
+        goto done;
+    }
+    if (ingot_matvec(INGOT_TYPE_Q4_K, packed, ROWS, COLS, x, b) != 0) {
+        check("ingot's Q4_K matvec runs", 0, "ingot_matvec failed");
+        goto done;
+    }
+
+    double worst = 0.0, scale = 0.0;
+    int at = 0;
+    for (int r = 0; r < ROWS; r++) {
+        const double d = fabs((double)a[r] - (double)b[r]);
+        if (d > worst) { worst = d; at = r; }
+        if (fabs((double)b[r]) > scale) scale = fabs((double)b[r]);
+    }
+    const double rel = scale > 0.0 ? worst / scale : worst;
+
+    char detail[160];
+    snprintf(detail, sizeof detail, "rel=%.2e at row %d (ours %.6f, ingot %.6f)",
+             rel, at, a[at], b[at]);
+    check("our Q4_K matvec agrees with ingot's", rel < 1e-4, detail);
+    printf("     %s\n", detail);
+
+    /* And the fallback must be honest about what it does not have. */
+    check("we decline types we have no kernel for",
+          mynah_slm_matvec(INGOT_TYPE_Q6_K, packed, ROWS, COLS, x, xsum, a) != 0,
+          "claimed a Q6_K kernel we did not write");
+
+done:
+    free(w); free(x); free(a); free(b); free(packed);
+}
+
 int main(void) {
     printf("-- norms --\n");        test_rms_norm(); test_rms_norm_per_head();
     printf("\n-- rope --\n");       test_rope();
     printf("\n-- activations --\n");test_activations();
     printf("\n-- attention --\n");  test_attention();
+    printf("\n-- quantized matvec --\n"); test_q4_k_matvec();
 
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASS",
            failures, failures == 1 ? "" : "s");

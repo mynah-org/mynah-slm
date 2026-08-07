@@ -11,24 +11,30 @@ Reproduce with `mynah-slm run ...`; every run prints its own line to stderr.
 ## Where it stands
 
 ```
-$ mynah-slm run -m models-local/Qwen3-0.6B-Q4_K_M.gguf -p "Ciao! Come stai?" -n 24 --temp 0
-Ciao! Sto bene! Cosa ne hai?
-[load 0.02s | prompt 19 tok, prefill 28.9 tok/s | gen 12 tok, decode 27.1 tok/s | TTFT 697 ms | 8 threads]
+$ mynah-slm run -m models-local/Qwen3-0.6B-Q4_K_M.gguf -p "Racconta una storia breve su un faro." -n 60 --temp 0
+[load 0.01s | prompt 24 tok, prefill 127.5 tok/s | gen 60 tok, decode 36.5 tok/s | TTFT 218 ms | 8 threads]
 ```
 
-**27.1 tok/s decode, from 4.1 where this started** — 6.6x, in steps that were
+**36.5 tok/s decode, from 4.1 where this started** — 8.9x, in steps that were
 each found by measuring rather than by guessing:
 
-| | decode tok/s | TTFT |
+| | decode tok/s | TTFT (19-tok prompt) |
 |---|---|---|
 | single-threaded, stock ingot | 4.1 | 5680 ms |
 | + threading (8) | 14.6 | 1326 ms |
 | + fused Q6_K kernel (ingot) | 24.0 | 802 ms |
-| + fused Q4_K kernel (ingot) | **27.1** | **697 ms** |
+| + fused Q4_K kernel (ingot) | 27.1 | 697 ms |
+| + **our Q4_K matvec** (src/qmat.c) | **36.5** | — |
+| + **batched prefill** | 36.5 | **318 ms** |
 
-The last two were the same bug in two places, and the second only became
+Two of those steps were the same bug in two places, and the second only became
 visible once the first was fixed: Q6_K went from 2.8x slower per element than
-Q4_K to nearly 2x faster, which is what made Q4_K worth looking at at all.
+Q4_K to nearly 2x faster, which is what made Q4_K worth looking at at all — and
+then made ITS kernel the slow one, which is the step after that.
+
+Prefill is a separate number and moved further: **26 -> 370 tok/s** on a
+198-token prompt once it stopped being one token at a time. Never quote one for
+the other.
 
 ### The pattern, twice
 
@@ -109,12 +115,19 @@ One matvec, 151936 x 1024, every single token. This is the concrete cost of the
 tied embedding noted in `docs/models.md`: it is not a lookup table, it is the
 hottest GEMV in the loop.
 
-It also makes a quantization question urgent rather than academic. `token_embd`
-is held at Q6_K by the `Q4_K_M` recipe. At Q4_K's measured throughput the same
-matvec would take ~48 ms instead of ~127 ms — a 26% cut in total decode time
-from one tensor. Whether that costs output quality is exactly what M5b has to
-measure; it sits in front of the softmax that picks the token, so the answer is
-not obvious in either direction.
+**This paragraph used to recommend requantizing it to Q4_K, and that was
+wrong** — kept here rather than deleted, because the way it went wrong is the
+point. It was written when Q6_K had no kernel and ran at a third of Q4_K's
+speed, so moving fewer bytes obviously won. Two kernel fixes later the ranking
+had inverted, and `make bench` says the head runs at **29.0 G elem/s at Q6_K**
+while the comparable Q4_K tensors reach 25-26. Requantizing it would move 32%
+fewer bytes on a slower kernel and come out behind.
+
+So `token_embd` at Q4_K is a **footprint** decision (121.7 MiB -> ~83 MiB, on a
+396 MB file), not a speed one, and it still has to clear M5b's quality gate
+because it sits in front of the softmax that picks the token. A number that was
+true stops being true when the thing under it changes; that is what the bench
+is for.
 
 ### 2. ingot's Q6_K matvec was 2.8x slower per element than Q4_K — FIXED upstream
 
@@ -144,6 +157,61 @@ order-only prerequisite, so the rebuilt archive did not relink the binaries:
 end-to-end tok/s did not move at all while the microbenchmark showed 2.9x,
 which reads as "the kernel does not matter" rather than "the kernel is not
 there". It is a real prerequisite now.
+
+## Our own Q4_K matvec: decode 28 -> 36.5 tok/s
+
+`make bench` measures each projection, and it said something specific: Q4_K —
+five of the seven tensors in a layer — ran at 11-14 G elem/s while Q6_K reached
+18-25. Q4_K was the slow kernel, and it is 65% of a decode step.
+
+A Q4_K weight is `d * scale[s] * q - dmin * min[s]`. The obvious kernel
+materializes that per element: unpack the nibble, widen it, multiply, subtract,
+then FMA against the input — three vector ops before the one that counts.
+Distribute the sum instead:
+
+```
+SUM_j w_j x_j  =  d*scale * SUM_j (q_j x_j)  -  dmin*min * SUM_j x_j
+```
+
+The per-element multiply and subtract disappear; the scales apply once per
+32-weight sub-block. And `SUM_j x_j` depends only on the INPUT, so it is
+computed once per matvec and reused across every row — 2048 of them for
+`attn_q`. **That hoist is why the kernel lives in the engine and not in a
+container library**: it needs a per-call preamble the row loop then reads,
+which is a different API shape, not a faster loop.
+
+Interleaved A/B in one process, ours against ingot's, best of three rounds:
+
+| tensor | type | ours | ingot | |
+|---|---|---|---|---|
+| `attn_q` | Q4_K | 0.125 ms | 0.197 ms | **1.58x** |
+| `attn_k` | Q4_K | 0.065 | 0.100 | **1.53x** |
+| `attn_out` | Q4_K | 0.089 | 0.140 | **1.57x** |
+| `ffn_gate` | Q4_K | 0.123 | 0.188 | **1.53x** |
+| `ffn_up` | Q4_K | 0.121 | 0.187 | **1.54x** |
+| `attn_v` | Q6_K | 0.072 | 0.073 | 1.01x |
+| `ffn_down` | Q6_K | 0.154 | 0.151 | 0.98x |
+| `lm_head` | Q6_K | 5.361 | 5.321 | 0.99x |
+
+The Q6_K rows are the control: we do not touch that type, and they land on
+1.00x. A ratio that moved there would mean the harness was measuring the
+machine rather than the kernel — which is exactly what two *separate* runs did,
+disagreeing by 80% on those same untouched tensors. Interleaved, in one
+process, best-of-N.
+
+End to end, interleaved, 60 generated tokens:
+
+| | decode |
+|---|---|
+| ours | **36.5 / 36.5 tok/s** |
+| ingot | 28.0 / 27.8 tok/s |
+
+**+30%, and the greedy output is byte-identical.** Correctness is gated in two
+places rather than assumed: `tests/test_kernels.c` checks our kernel against
+ingot's on synthetic Q4_K weights with no checkpoint (`rel=3.5e-07`, and ingot
+is the right oracle there because it is cross-checked against llama.cpp), and
+the parity gate still holds at `1.50e-06` on layer 0 with 19/19 argmax
+agreement.
 
 ## Batched prefill: 26 -> 370 tok/s, and TTFT 7.6 s -> 0.58 s
 
@@ -230,12 +298,18 @@ not fine for a path that has to agree with decode.
 
 ## What has not been done yet
 
-- **Decode is now the slow half, and it is bandwidth-bound.** 26 tok/s short,
-  17 tok/s at 2000 tokens of context. Prefill is 14x faster than it was;
-  nothing about decode changed, because a single token cannot amortize a weight
-  read. The levers left are quantizing `token_embd` (42% of a step, see below),
-  a bf16 KV cache (halves the traffic attention re-reads every token), and
-  speculative decoding.
+- **Decode is 36.5 tok/s and is NOT yet at the memory roof.** The fastest
+  tensor moves 22 GB/s and the machine has far more than that, so decode is
+  still limited by the kernel and not by the bus. The Q6_K matvec is now the
+  biggest single item (`lm_head`, 5.4 ms of a 26 ms step) and has had no
+  equivalent treatment — its scales are int8 per 16 weights rather than a
+  packed 6-bit pair, so the same distribute-the-sum trick does not transfer
+  unchanged, but the per-element scale multiply is there to remove.
+- **A bf16 KV cache.** At a 2275-token context the caches are ~520 MB, more
+  than the model itself, and attention re-reads them every token. Halving that
+  is the one change that makes the engine both lighter and faster; it needs its
+  own quality measurement, because it moves the numbers the parity gate
+  watches.
 - **SIMD in our own kernels: measured, and mostly not worth it.** See below.
 - **Q4_0 has a kernel now** (NEON + AVX2, 7-10x over the generic path), which
   changes nothing for Qwen3 — it is Q4_K/Q6_K — and everything for Gemma 4,
