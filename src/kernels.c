@@ -2302,6 +2302,113 @@ static int ingot_q6_k_matvec_neon(const void *weights, size_t rows, size_t cols,
 }
 #endif /* INGOT_HAVE_Q4_K_NEON */
 
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+/* The AVX2 twin of the NEON kernel above, and it was worth 4.65x on an LM head
+ * because until now x86 had NO vector path for Q6_K at all: the type fell
+ * through to kquant_apply, which is exactly the dequantize-into-a-256-float-
+ * scratch-then-dot loop that the NEON commit removed on ARM.
+ *
+ * Same layout traps, same shape, one x86 wrinkle worth stating: _mm_srli_epi16
+ * shifts 16-bit lanes, so every byte-wise right shift has to be masked
+ * afterwards or bits from the neighbouring byte walk in. The NEON side gets
+ * vshr_n_u8 and needs no mask, which is precisely the kind of difference that
+ * makes a "port" quietly wrong.
+ *
+ * Each run of 16 outputs shares one scale, so the scale multiply is hoisted out
+ * of the element loop and the four group accumulators fold into the running
+ * total with one FMA each. */
+static inline float q6_hsum256(__m256 v) {
+    __m128 a = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    a = _mm_add_ps(a, _mm_movehl_ps(a, a));
+    a = _mm_add_ss(a, _mm_shuffle_ps(a, a, 0x55));
+    return _mm_cvtss_f32(a);
+}
+
+static float q6_k_dot_block_avx2(const unsigned char *block, const float *input) {
+    const unsigned char *ql = block;
+    const unsigned char *qh = block + 128;
+    const signed char   *sc = (const signed char *)(block + 192);
+    const float d = f16_to_f32(read_u16(block + 208));
+
+    const __m128i nib  = _mm_set1_epi8(0x0f);
+    const __m128i two  = _mm_set1_epi8(0x03);
+    const __m128i bias = _mm_set1_epi8(32);
+
+    __m256 total = _mm256_setzero_ps();
+
+    for (int half = 0; half < 2; half++) {
+        const float *in = input + half * 128;
+
+        for (int is = 0; is < 2; is++) {
+            __m256 a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps();
+            __m256 a3 = _mm256_setzero_ps(), a4 = _mm256_setzero_ps();
+
+            for (int k = 0; k < 16; k += 8) {
+                const int i = is * 16 + k;
+                const __m128i la = _mm_loadl_epi64((const __m128i *)(const void *)(ql + i));
+                const __m128i lb = _mm_loadl_epi64((const __m128i *)(const void *)(ql + i + 32));
+                const __m128i h  = _mm_loadl_epi64((const __m128i *)(const void *)(qh + i));
+
+                const __m128i q1 = _mm_sub_epi8(
+                    _mm_or_si128(_mm_and_si128(la, nib),
+                                 _mm_slli_epi16(_mm_and_si128(h, two), 4)), bias);
+                const __m128i q2 = _mm_sub_epi8(
+                    _mm_or_si128(_mm_and_si128(lb, nib),
+                                 _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(h, 2), two), 4)),
+                    bias);
+                const __m128i q3 = _mm_sub_epi8(
+                    _mm_or_si128(_mm_and_si128(_mm_srli_epi16(la, 4), nib),
+                                 _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(h, 4), two), 4)),
+                    bias);
+                const __m128i q4 = _mm_sub_epi8(
+                    _mm_or_si128(_mm_and_si128(_mm_srli_epi16(lb, 4), nib),
+                                 _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(h, 6), two), 4)),
+                    bias);
+
+#define Q6_ACC_AVX2(acc, q, off)                                               \
+    acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q)),         \
+                          _mm256_loadu_ps(in + (off) + i), acc)
+
+                Q6_ACC_AVX2(a1, q1, 0);
+                Q6_ACC_AVX2(a2, q2, 32);
+                Q6_ACC_AVX2(a3, q3, 64);
+                Q6_ACC_AVX2(a4, q4, 96);
+#undef Q6_ACC_AVX2
+            }
+
+            total = _mm256_fmadd_ps(a1, _mm256_set1_ps(d * (float)sc[is]),     total);
+            total = _mm256_fmadd_ps(a2, _mm256_set1_ps(d * (float)sc[is + 2]), total);
+            total = _mm256_fmadd_ps(a3, _mm256_set1_ps(d * (float)sc[is + 4]), total);
+            total = _mm256_fmadd_ps(a4, _mm256_set1_ps(d * (float)sc[is + 6]), total);
+        }
+        ql += 64;
+        qh += 32;
+        sc += 8;
+    }
+    return q6_hsum256(total);
+}
+
+static int ingot_q6_k_matvec_avx2(const void *weights, size_t rows, size_t cols,
+                                  const float *input, float *output) {
+    if (weights == NULL || input == NULL || output == NULL || rows == 0 ||
+        cols == 0 || cols % INGOT_QK_K != 0) return -1;
+    size_t blocks_per_row = cols / INGOT_QK_K;
+    if (blocks_per_row > SIZE_MAX / INGOT_Q6_K_BYTES) return -1;
+    size_t row_bytes = blocks_per_row * INGOT_Q6_K_BYTES;
+    if (rows > SIZE_MAX / row_bytes) return -1;
+    const unsigned char *source = (const unsigned char *)weights;
+    for (size_t row = 0; row < rows; row++) {
+        const unsigned char *row_data = source + row * row_bytes;
+        float sum = 0.0f;
+        for (size_t block = 0; block < blocks_per_row; block++)
+            sum += q6_k_dot_block_avx2(row_data + block * INGOT_Q6_K_BYTES,
+                                       input + block * INGOT_QK_K);
+        output[row] = sum;
+    }
+    return 0;
+}
+#endif
+
 static int ingot_q6_k_matvec_s(const void *weights, size_t rows, size_t cols,
                                      const float *input, float *output) {
     return kquant_apply(weights, rows, cols, input, output,
@@ -2313,6 +2420,10 @@ int ingot_q6_k_matvec(const void *weights, size_t rows, size_t cols,
 #if defined(INGOT_HAVE_Q4_K_NEON)
     if (ingot_cpu().neon)
         return ingot_q6_k_matvec_neon(weights, rows, cols, input, output);
+#endif
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+    if (ingot_cpu().avx2)
+        return ingot_q6_k_matvec_avx2(weights, rows, cols, input, output);
 #endif
     return ingot_q6_k_matvec_s(weights, rows, cols, input, output);
 }
