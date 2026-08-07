@@ -1,0 +1,62 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install OpenBLAS
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      # third_party/ingot is a subtree with its own CodeQL workflow upstream;
+      # analysing it here would only duplicate those findings against a copy
+      # nobody is allowed to edit in place.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: c-cpp
+          config: |
+            paths-ignore:
+              - third_party
+
+      - name: Build
+        run: make lib
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+
+  clang-tidy:
+    name: clang-tidy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install clang-tidy and OpenBLAS
+        run: sudo apt-get update && sudo apt-get install -y clang-tidy libopenblas-dev
+
+      # Same check set as ingot, so a finding means the same thing in both
+      # repos. Sources only: third_party/ is not ours to fix from here.
+      - name: Run clang-tidy over the sources
+        run: |
+          clang-tidy \
+            -checks='clang-analyzer-core.*,clang-analyzer-unix.*,clang-analyzer-security.*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,-clang-analyzer-deadcode.DeadStores,bugprone-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions,-bugprone-implicit-widening-of-multiplication-result,-bugprone-suspicious-realloc-usage,-bugprone-multi-level-implicit-pointer-conversion,-bugprone-misplaced-widening-cast,-bugprone-branch-clone' \
+            -warnings-as-errors='' \
+            src/*.c cli/*.c server/*.c \
+            -- -std=c11 -Iinclude -Ithird_party/ingot/include \
+               -iquote src -iquote server -D_DEFAULT_SOURCE \
+               -DMYNAH_SLM_BLAS_OPENBLAS -DMYNAH_SLM_BUILD='"ci"'

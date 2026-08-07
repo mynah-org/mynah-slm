@@ -1,0 +1,85 @@
+# Build & Test — WITHOUT weights, deliberately.
+#
+# Every checkpoint this engine runs is hundreds of MB and lives on the NAS, so
+# CI never downloads one: the tests that need a model exit 77 and `make test`
+# prints SKIP for them. What remains is still real work — the ingot container
+# contract, the decoder kernels including their scalar twins, the GGUF metadata
+# census, the tokenizer's special-token wiring — and it is the portability half
+# that an M1 alone can never give: glibc, gcc, OpenBLAS, x86_64.
+#
+# What this does NOT cover, and nobody should read a green tick as covering:
+# the forward pass, the BPE round-trip against the HF fixtures, and generation
+# all sit behind a checkpoint and only run locally. Closing that gap means a
+# synthetic tiny GGUF built in-tree, not a download.
+name: Build & Test
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            name: linux-x86_64 (native)
+            extra: ''
+          # src/kernels.c is NEON / AVX2 / scalar. On a hosted x86 runner the
+          # default -march=native always picks AVX2, so the scalar fallback —
+          # the path any older CPU takes — would never once be compiled, let
+          # alone executed. x86-64-v2 stops short of AVX2 and runs it.
+          - runner: ubuntu-latest
+            name: linux-x86_64 (no AVX2, scalar fallback)
+            extra: '-march=x86-64-v2'
+          - runner: ubuntu-24.04-arm
+            name: linux-aarch64 (neon)
+            extra: ''
+          - runner: macos-latest
+            name: macos-arm64 (accelerate)
+            extra: ''
+
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.name }}
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install OpenBLAS (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      # EXTRA_CFLAGS, never CFLAGS=. A command-line CFLAGS overrides everything
+      # the Makefile computed — the include paths and the quoted
+      # -DMYNAH_SLM_BUILD='"..."' — and the build stops compiling. EXTRA_CFLAGS
+      # is appended last, so a later -march still wins over -march=native.
+      - name: Build CLI and server
+        run: make EXTRA_CFLAGS="${{ matrix.extra }}"
+
+      - name: Tests (model-dependent cases report SKIP)
+        run: make test EXTRA_CFLAGS="${{ matrix.extra }}"
+
+      - name: Static and shared library
+        run: make lib shared EXTRA_CFLAGS="${{ matrix.extra }}"
+
+      - name: Binaries answer
+        run: |
+          ./mynah-slm --version
+          ./mynah-slm-server --help > /dev/null
+
+      # install is public surface that no test touches: a new public header or a
+      # renamed binary breaks packaging silently and would surface first in
+      # somebody else's build.
+      - name: Install into a staging prefix
+        run: |
+          make install DESTDIR="$PWD/staging" PREFIX=/usr
+          test -x staging/usr/bin/mynah-slm
+          test -x staging/usr/bin/mynah-slm-server
+          test -f staging/usr/lib/libmynah_slm.a
+          test -f staging/usr/include/mynah_slm.h

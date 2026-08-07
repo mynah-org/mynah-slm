@@ -1,0 +1,105 @@
+# Memory safety. Same split as mynah-asr and qwen-tts: ASan is Linux-only
+# because on macOS it is extremely slow and hangs with a large model, so the
+# Mac gate is the native `leaks` plus UBSan.
+#
+# Honest scope: with no checkpoint on the runner the model, tokenizer and think
+# tests exit 77, so the sanitizers here walk the GGUF parser, the kernels, the
+# metadata census and the CLI — not the forward pass. That is the part most
+# likely to be handed hostile bytes, but it is not the whole engine.
+name: Memory Safety
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  ubsan:
+    name: UBSan (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            name: x86_64
+          - runner: ubuntu-24.04-arm
+            name: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install OpenBLAS
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      # `make ubsan` rebuilds the whole tree sanitized and RUNS the suite, so
+      # the parsers are exercised rather than only compiled.
+      - name: Build and run the suite under UBSan
+        run: make ubsan
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+
+  asan:
+    name: ASan + UBSan (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            name: x86_64
+          - runner: ubuntu-24.04-arm
+            name: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install OpenBLAS
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - name: Build and run the suite under ASan and UBSan
+        run: make asan
+        env:
+          ASAN_OPTIONS: abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+
+  leaks:
+    name: Leaks (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # ASan hangs on a Mac with a real model, so `leaks` is the memory gate on
+      # this side. test_inspect is the subject: the census grows by realloc and
+      # the fixture writer holds buffers.
+      - name: Run the suite under leaks
+        run: make leaks
+
+  warnings:
+    name: No warnings (${{ matrix.cc }} on ${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            cc: gcc
+          - runner: ubuntu-latest
+            cc: clang
+          - runner: macos-latest
+            cc: clang
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install OpenBLAS (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      # -Werror is a gate, not the default build: a new compiler's new warning
+      # should stop us here, never somebody trying to build the library.
+      - name: Build with -Werror
+        run: make lib CC=${{ matrix.cc }} EXTRA_CFLAGS="-Werror"
