@@ -8856,8 +8856,249 @@ static int kquant_apply(const void *weights, size_t rows, size_t cols,
     return 0;
 }
 
+/* ── fused Q2_K and Q3_K matvecs ────────────────────────────────────────────
+ * Both types had NO vector matvec on EITHER architecture and went through
+ * kquant_apply: dequantize a 256-float scratch per block, then dot it. That is
+ * 1 KB written and re-read per 84 or 110 bytes of weights, the same round trip
+ * removed from Q6_K and then from Q8_0, where it was worth 4.6x and 2.8x.
+ *
+ * Both formats share a shape: 16 groups of 16 values, each group taking one
+ * scale and mapping to 16 CONTIGUOUS inputs — so a group is one accumulator and
+ * the scale is applied once per 16 weights instead of once per weight.
+ *
+ * The 2-bit fields sit at four shifts of the same byte, and the shift is a loop
+ * variable rather than a constant, so vshr_n_u8 (constant shift only) is out.
+ * NEON's vshlq_u8 takes a signed shift VECTOR where negative means right, which
+ * is the whole reason this reads the way it does. */
+#if defined(INGOT_HAVE_Q4_K_NEON)
+static float q2_k_dot_block_neon(const unsigned char *block, const float *input) {
+    const unsigned char *scales = block;
+    const unsigned char *qs = block + 16;
+    const float d    = f16_to_f32(read_u16(block + 80));
+    const float dmin = f16_to_f32(read_u16(block + 82));
+
+    float32x4_t total = vdupq_n_f32(0.0f);
+    const uint8x16_t three = vdupq_n_u8(3);
+    int scale_index = 0;
+    const float *in = input;
+
+    for (int chunk = 0; chunk < INGOT_QK_K; chunk += 128) {
+        for (int j = 0; j < 4; j++) {
+            const int8x16_t sh = vdupq_n_s8((signed char)(-2 * j));
+            for (int half = 0; half < 2; half++) {
+                const unsigned char sc = scales[scale_index++];
+                const uint8x16_t packed = vld1q_u8(qs + half * 16);
+                const uint8x16_t q = vandq_u8(vshlq_u8(packed, sh), three);
+
+                const uint16x8_t l16 = vmovl_u8(vget_low_u8(q));
+                const uint16x8_t h16 = vmovl_u8(vget_high_u8(q));
+
+                const float32x4_t xa = vld1q_f32(in), xb = vld1q_f32(in + 4);
+                const float32x4_t xc = vld1q_f32(in + 8), xd = vld1q_f32(in + 12);
+
+                float32x4_t qa = vdupq_n_f32(0.0f);
+                qa = vmlaq_f32(qa, vcvtq_f32_u32(vmovl_u16(vget_low_u16(l16))), xa);
+                qa = vmlaq_f32(qa, vcvtq_f32_u32(vmovl_u16(vget_high_u16(l16))), xb);
+                qa = vmlaq_f32(qa, vcvtq_f32_u32(vmovl_u16(vget_low_u16(h16))), xc);
+                qa = vmlaq_f32(qa, vcvtq_f32_u32(vmovl_u16(vget_high_u16(h16))), xd);
+
+                const float32x4_t xsum =
+                    vaddq_f32(vaddq_f32(xa, xb), vaddq_f32(xc, xd));
+
+                total = vmlaq_n_f32(total, qa, d * (float)(sc & 0x0f));
+                total = vmlaq_n_f32(total, xsum, -(dmin * (float)(sc >> 4)));
+                in += 16;
+            }
+        }
+        qs += 32;
+    }
+    return vaddvq_f32(total);
+}
+
+static float q3_k_dot_block_neon(const unsigned char *block, const float *input) {
+    const unsigned char *hmask = block;
+    const unsigned char *qs = block + 32;
+    const unsigned char *scales = block + 96;
+    const float d = f16_to_f32(read_u16(block + 108));
+
+    float32x4_t total = vdupq_n_f32(0.0f);
+    const uint8x16_t three = vdupq_n_u8(3);
+    const uint8x16_t four  = vdupq_n_u8(4);
+    const uint8x16_t zero  = vdupq_n_u8(0);
+    int scale_index = 0;
+    unsigned char m = 1;
+    const float *in = input;
+
+    for (int chunk = 0; chunk < INGOT_QK_K; chunk += 128) {
+        for (int j = 0; j < 4; j++) {
+            const int8x16_t sh = vdupq_n_s8((signed char)(-2 * j));
+            const uint8x16_t mv = vdupq_n_u8(m);
+            for (int half = 0; half < 2; half++) {
+                const float dl = d * (float)q3_k_scale(scales, scale_index++);
+                const uint8x16_t packed = vld1q_u8(qs + half * 16);
+                const uint8x16_t hm = vld1q_u8(hmask + half * 16);
+
+                /* quant is 0..3, minus 4 wherever the high-mask bit is CLEAR. */
+                const uint8x16_t q = vandq_u8(vshlq_u8(packed, sh), three);
+                const uint8x16_t clear = vceqq_u8(vandq_u8(hm, mv), zero);
+                const int8x16_t qv = vsubq_s8(vreinterpretq_s8_u8(q),
+                                              vreinterpretq_s8_u8(vandq_u8(clear, four)));
+
+                const int16x8_t l16 = vmovl_s8(vget_low_s8(qv));
+                const int16x8_t h16 = vmovl_s8(vget_high_s8(qv));
+
+                float32x4_t qa = vdupq_n_f32(0.0f);
+                qa = vmlaq_f32(qa, vcvtq_f32_s32(vmovl_s16(vget_low_s16(l16))),
+                               vld1q_f32(in));
+                qa = vmlaq_f32(qa, vcvtq_f32_s32(vmovl_s16(vget_high_s16(l16))),
+                               vld1q_f32(in + 4));
+                qa = vmlaq_f32(qa, vcvtq_f32_s32(vmovl_s16(vget_low_s16(h16))),
+                               vld1q_f32(in + 8));
+                qa = vmlaq_f32(qa, vcvtq_f32_s32(vmovl_s16(vget_high_s16(h16))),
+                               vld1q_f32(in + 12));
+
+                total = vmlaq_n_f32(total, qa, dl);
+                in += 16;
+            }
+            m <<= 1;
+        }
+        qs += 32;
+    }
+    return vaddvq_f32(total);
+}
+#endif
+
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+static inline float qk_hsum256(__m256 v) {
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+    h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
+    return _mm_cvtss_f32(h);
+}
+
+static float q2_k_dot_block_avx2(const unsigned char *block, const float *input) {
+    const unsigned char *scales = block;
+    const unsigned char *qs = block + 16;
+    const float d    = f16_to_f32(read_u16(block + 80));
+    const float dmin = f16_to_f32(read_u16(block + 82));
+
+    __m256 total = _mm256_setzero_ps();
+    int scale_index = 0;
+    const float *in = input;
+
+    for (int chunk = 0; chunk < INGOT_QK_K; chunk += 128) {
+        for (int j = 0; j < 4; j++) {
+            const int shift = 2 * j;
+            for (int half = 0; half < 2; half++) {
+                const unsigned char sc = scales[scale_index++];
+                const unsigned char *p = qs + half * 16;
+
+                __m256 qa = _mm256_setzero_ps(), xs = _mm256_setzero_ps();
+                for (int k = 0; k < 16; k += 8) {
+                    const __m256i w = _mm256_cvtepu8_epi32(
+                        _mm_loadl_epi64((const __m128i *)(const void *)(p + k)));
+                    const __m256i q = _mm256_and_si256(_mm256_srli_epi32(w, shift),
+                                                       _mm256_set1_epi32(3));
+                    const __m256 x = _mm256_loadu_ps(in + k);
+                    qa = _mm256_fmadd_ps(_mm256_cvtepi32_ps(q), x, qa);
+                    xs = _mm256_add_ps(xs, x);
+                }
+                total = _mm256_fmadd_ps(qa, _mm256_set1_ps(d * (float)(sc & 0x0f)), total);
+                total = _mm256_fmadd_ps(xs, _mm256_set1_ps(-(dmin * (float)(sc >> 4))), total);
+                in += 16;
+            }
+        }
+        qs += 32;
+    }
+    return qk_hsum256(total);
+}
+
+static float q3_k_dot_block_avx2(const unsigned char *block, const float *input) {
+    const unsigned char *hmask = block;
+    const unsigned char *qs = block + 32;
+    const unsigned char *scales = block + 96;
+    const float d = f16_to_f32(read_u16(block + 108));
+
+    __m256 total = _mm256_setzero_ps();
+    int scale_index = 0;
+    unsigned char m = 1;
+    const float *in = input;
+
+    for (int chunk = 0; chunk < INGOT_QK_K; chunk += 128) {
+        for (int j = 0; j < 4; j++) {
+            const int shift = 2 * j;
+            const __m256i mv = _mm256_set1_epi32((int)(unsigned int)m);
+            for (int half = 0; half < 2; half++) {
+                const float dl = d * (float)q3_k_scale(scales, scale_index++);
+                const unsigned char *p = qs + half * 16;
+                const unsigned char *h = hmask + half * 16;
+
+                __m256 qa = _mm256_setzero_ps();
+                for (int k = 0; k < 16; k += 8) {
+                    const __m256i w = _mm256_cvtepu8_epi32(
+                        _mm_loadl_epi64((const __m128i *)(const void *)(p + k)));
+                    const __m256i hb = _mm256_cvtepu8_epi32(
+                        _mm_loadl_epi64((const __m128i *)(const void *)(h + k)));
+                    __m256i q = _mm256_and_si256(_mm256_srli_epi32(w, shift),
+                                                 _mm256_set1_epi32(3));
+                    /* 0xFFFFFFFF where the mask bit is CLEAR, then subtract 4. */
+                    const __m256i clear = _mm256_cmpeq_epi32(
+                        _mm256_and_si256(hb, mv), _mm256_setzero_si256());
+                    q = _mm256_sub_epi32(q, _mm256_and_si256(clear, _mm256_set1_epi32(4)));
+                    qa = _mm256_fmadd_ps(_mm256_cvtepi32_ps(q),
+                                         _mm256_loadu_ps(in + k), qa);
+                }
+                total = _mm256_fmadd_ps(qa, _mm256_set1_ps(dl), total);
+                in += 16;
+            }
+            m <<= 1;
+        }
+        qs += 32;
+    }
+    return qk_hsum256(total);
+}
+#endif
+
+/* One row loop for both, since the only differences are the block size and the
+ * dot. */
+#define INGOT_QK_FUSED_MATVEC(NAME, BYTES, DOT)                                \
+    static int NAME(const void *weights, size_t rows, size_t cols,             \
+                    const float *input, float *output) {                       \
+        const size_t blocks_per_row = cols / INGOT_QK_K;                       \
+        if (blocks_per_row > SIZE_MAX / (BYTES)) return -1;                    \
+        const size_t row_bytes = blocks_per_row * (BYTES);                     \
+        if (rows > SIZE_MAX / row_bytes) return -1;                            \
+        const unsigned char *source = (const unsigned char *)weights;          \
+        for (size_t row = 0; row < rows; row++) {                              \
+            const unsigned char *row_data = source + row * row_bytes;          \
+            float sum = 0.0f;                                                  \
+            for (size_t b = 0; b < blocks_per_row; b++)                        \
+                sum += DOT(row_data + b * (BYTES), input + b * INGOT_QK_K);    \
+            output[row] = sum;                                                 \
+        }                                                                      \
+        return 0;                                                              \
+    }
+
+#if defined(INGOT_HAVE_Q4_K_NEON)
+INGOT_QK_FUSED_MATVEC(ingot_q2_k_matvec_neon, INGOT_Q2_K_BYTES, q2_k_dot_block_neon)
+INGOT_QK_FUSED_MATVEC(ingot_q3_k_matvec_neon, INGOT_Q3_K_BYTES, q3_k_dot_block_neon)
+#endif
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+INGOT_QK_FUSED_MATVEC(ingot_q2_k_matvec_avx2, INGOT_Q2_K_BYTES, q2_k_dot_block_avx2)
+INGOT_QK_FUSED_MATVEC(ingot_q3_k_matvec_avx2, INGOT_Q3_K_BYTES, q3_k_dot_block_avx2)
+#endif
+
 int ingot_q3_k_matvec(const void *weights, size_t rows, size_t cols,
                            const float *input, float *output) {
+    if (!qk_args_ok(weights, input, output, rows, cols, INGOT_QK_K)) return -1;
+#if defined(INGOT_HAVE_Q4_K_NEON)
+    if (ingot_cpu().neon)
+        return ingot_q3_k_matvec_neon(weights, rows, cols, input, output);
+#endif
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+    if (ingot_cpu().avx2)
+        return ingot_q3_k_matvec_avx2(weights, rows, cols, input, output);
+#endif
     return kquant_apply(weights, rows, cols, input, output,
                         INGOT_Q3_K_BYTES, q3_dequant_block, 1);
 }
@@ -8870,6 +9111,15 @@ int ingot_q3_k_dequant(const void *weights, size_t rows, size_t cols,
 
 int ingot_q2_k_matvec(const void *weights, size_t rows, size_t cols,
                            const float *input, float *output) {
+    if (!qk_args_ok(weights, input, output, rows, cols, INGOT_QK_K)) return -1;
+#if defined(INGOT_HAVE_Q4_K_NEON)
+    if (ingot_cpu().neon)
+        return ingot_q2_k_matvec_neon(weights, rows, cols, input, output);
+#endif
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+    if (ingot_cpu().avx2)
+        return ingot_q2_k_matvec_avx2(weights, rows, cols, input, output);
+#endif
     return kquant_apply(weights, rows, cols, input, output,
                         INGOT_Q2_K_BYTES, q2_dequant_block, 1);
 }
