@@ -83,6 +83,11 @@ void mynah_slm_softmax(float *x, size_t n);
 
 void mynah_slm_add(float *y, const float *x, size_t n);   /* y += x */
 
+/* y += w * x. Granite scales every residual branch by 0.263 before adding it;
+ * families that do not pass w = 1, and the plain add above stays the path they
+ * take so their arithmetic is unchanged to the bit. */
+void mynah_slm_add_scaled(float *y, const float *x, float w, size_t n);
+
 /* ── attention ────────────────────────────────────────────────────────────── */
 
 /* Causal grouped-query attention for ONE query position against a KV history.
@@ -93,10 +98,15 @@ void mynah_slm_add(float *y, const float *x, size_t n);   /* y += x */
  *   out     [n_heads * head_dim]
  *
  * Causality is structural rather than a mask: the history simply stops at the
- * current token. scratch must hold at least n_kv floats. */
+ * current token. scratch must hold at least n_kv floats.
+ *
+ * `scale` multiplies the scores before the softmax. It is a PARAMETER and not
+ * 1/sqrt(head_dim) computed in here, because it is not always that: Granite
+ * carries its own (0.015625 where 1/sqrt(64) would be 0.125, eight times
+ * smaller) and a model run with the wrong one produces fluent, wrong text. */
 void mynah_slm_attention(float *out, const float *q, const float *k, const float *v,
                          uint32_t n_kv, uint32_t n_heads, uint32_t n_kv_heads,
-                         uint32_t head_dim, float *scratch);
+                         uint32_t head_dim, float scale, float *scratch);
 
 /* The same, one head per task. Heads are fully independent — separate scores,
  * separate output slice — so this is bit-identical to the serial version, not
@@ -104,7 +114,7 @@ void mynah_slm_attention(float *out, const float *q, const float *k, const float
  * buffer would be the one piece of state that makes them dependent. */
 void mynah_slm_attention_mt(float *out, const float *q, const float *k, const float *v,
                             uint32_t n_kv, uint32_t n_heads, uint32_t n_kv_heads,
-                            uint32_t head_dim, float *scratch);
+                            uint32_t head_dim, float scale, float *scratch);
 
 /* Causal GQA for a BATCH of consecutive query positions — prefill.
  *
@@ -127,7 +137,7 @@ void mynah_slm_attention_batch(float *out, const float *q,
                                const float *k, const float *v,
                                uint32_t pos0, uint32_t n_q, uint32_t n_heads,
                                uint32_t n_kv_heads, uint32_t head_dim,
-                               uint32_t q_stride, float *scores);
+                               uint32_t q_stride, float scale, float *scores);
 
 /* ── attention over a PACKED KV cache ──────────────────────────────────────
  * The same two shapes as above, reading K and V through kvcache.h instead of
@@ -148,13 +158,13 @@ void mynah_slm_attention_kv_mt(float *out, const float *q,
                                const struct mynah_slm_kv *cache, uint32_t layer,
                                uint32_t n_kv, uint32_t n_heads,
                                uint32_t n_kv_heads, uint32_t head_dim,
-                               float *scratch);
+                               float scale, float *scratch);
 
 void mynah_slm_attention_kv_batch(float *out, const float *q,
                                   const struct mynah_slm_kv *cache, uint32_t layer,
                                   uint32_t pos0, uint32_t n_q, uint32_t n_heads,
                                   uint32_t n_kv_heads, uint32_t head_dim,
-                                  uint32_t q_stride, float *scores,
+                                  uint32_t q_stride, float scale, float *scores,
                                   float *kscratch, float *vscratch);
 
 #endif /* MYNAH_SLM_KERNELS_H */

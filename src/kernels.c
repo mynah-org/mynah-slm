@@ -229,6 +229,10 @@ void mynah_slm_softmax(float *x, size_t n) {
     for (size_t i = 0; i < n; i++) x[i] *= inv;
 }
 
+void mynah_slm_add_scaled(float *y, const float *x, float w, size_t n) {
+    for (size_t i = 0; i < n; i++) y[i] += w * x[i];
+}
+
 void mynah_slm_add(float *y, const float *x, size_t n) {
     for (size_t i = 0; i < n; i++) y[i] += x[i];
 }
@@ -237,10 +241,9 @@ void mynah_slm_add(float *y, const float *x, size_t n) {
 
 void mynah_slm_attention(float *out, const float *q, const float *k, const float *v,
                          uint32_t n_kv, uint32_t n_heads, uint32_t n_kv_heads,
-                         uint32_t head_dim, float *scratch) {
+                         uint32_t head_dim, float scale, float *scratch) {
     const uint32_t group   = n_heads / n_kv_heads;
     const uint32_t kv_dim  = n_kv_heads * head_dim;
-    const float    scale   = 1.0f / sqrtf((float)head_dim);
 
     for (uint32_t h = 0; h < n_heads; h++) {
         const float   *qh  = q + (size_t)h * head_dim;
@@ -262,10 +265,10 @@ void mynah_slm_attention(float *out, const float *q, const float *k, const float
 /* One head of the loop above, factored out so it can be a task. */
 static void attention_head(float *out, const float *q, const float *k, const float *v,
                            uint32_t h, uint32_t n_kv, uint32_t n_heads,
-                           uint32_t n_kv_heads, uint32_t head_dim, float *scratch) {
+                           uint32_t n_kv_heads, uint32_t head_dim, float scale,
+                           float *scratch) {
     const uint32_t group  = n_heads / n_kv_heads;
     const uint32_t kv_dim = n_kv_heads * head_dim;
-    const float    scale  = 1.0f / sqrtf((float)head_dim);
 
     const float   *qh  = q + (size_t)h * head_dim;
     const uint32_t kvh = h / group;
@@ -286,19 +289,20 @@ typedef struct {
     float *out, *scratch;
     const float *q, *k, *v;
     uint32_t n_kv, n_heads, n_kv_heads, head_dim;
+    float scale;
 } attn_job;
 
 static void attn_task(void *ctx, int i) {
     attn_job *j = ctx;
     attention_head(j->out, j->q, j->k, j->v, (uint32_t)i, j->n_kv,
-                   j->n_heads, j->n_kv_heads, j->head_dim,
+                   j->n_heads, j->n_kv_heads, j->head_dim, j->scale,
                    j->scratch + (size_t)i * j->n_kv);
 }
 
 void mynah_slm_attention_mt(float *out, const float *q, const float *k, const float *v,
                             uint32_t n_kv, uint32_t n_heads, uint32_t n_kv_heads,
-                            uint32_t head_dim, float *scratch) {
-    attn_job j = { out, scratch, q, k, v, n_kv, n_heads, n_kv_heads, head_dim };
+                            uint32_t head_dim, float scale, float *scratch) {
+    attn_job j = { out, scratch, q, k, v, n_kv, n_heads, n_kv_heads, head_dim, scale };
     mynah_slm_parallel_for((int)n_heads, attn_task, &j);
 }
 
@@ -306,11 +310,10 @@ void mynah_slm_attention_batch(float *out, const float *q,
                                const float *k, const float *v,
                                uint32_t pos0, uint32_t n_q, uint32_t n_heads,
                                uint32_t n_kv_heads, uint32_t head_dim,
-                               uint32_t q_stride, float *scores) {
+                               uint32_t q_stride, float scale, float *scores) {
     const uint32_t group  = n_heads / n_kv_heads;
     const uint32_t kv_dim = n_kv_heads * head_dim;
     const uint32_t n_kv   = pos0 + n_q;
-    const float    scale  = 1.0f / sqrtf((float)head_dim);
 
     /* Heads run one after another and BLAS threads inside each, rather than one
      * head per pool thread: a per-head scores buffer would be n_q * n_kv floats
@@ -356,6 +359,7 @@ typedef struct {
     const float *q;
     const mynah_slm_kv *cache;
     uint32_t layer, n_kv, n_heads, n_kv_heads, head_dim;
+    float scale;
 } attn_kv_job;
 
 static void attn_kv_task(void *ctx, int i) {
@@ -363,7 +367,7 @@ static void attn_kv_task(void *ctx, int i) {
     const uint32_t h = (uint32_t)i;
     const uint32_t group = j->n_heads / j->n_kv_heads;
     const uint32_t kvh = h / group;
-    const float scale = 1.0f / sqrtf((float)j->head_dim);
+    const float scale = j->scale;
 
     const float *qh = j->q + (size_t)h * j->head_dim;
     float *scores = j->scratch + (size_t)h * j->n_kv;
@@ -382,9 +386,9 @@ void mynah_slm_attention_kv_mt(float *out, const float *q,
                                const struct mynah_slm_kv *cache, uint32_t layer,
                                uint32_t n_kv, uint32_t n_heads,
                                uint32_t n_kv_heads, uint32_t head_dim,
-                               float *scratch) {
+                               float scale, float *scratch) {
     attn_kv_job j = { out, scratch, q, (const mynah_slm_kv *)cache, layer,
-                      n_kv, n_heads, n_kv_heads, head_dim };
+                      n_kv, n_heads, n_kv_heads, head_dim, scale };
     mynah_slm_parallel_for((int)n_heads, attn_kv_task, &j);
 }
 
@@ -392,12 +396,11 @@ void mynah_slm_attention_kv_batch(float *out, const float *q,
                                   const struct mynah_slm_kv *cache, uint32_t layer,
                                   uint32_t pos0, uint32_t n_q, uint32_t n_heads,
                                   uint32_t n_kv_heads, uint32_t head_dim,
-                                  uint32_t q_stride, float *scores,
+                                  uint32_t q_stride, float scale, float *scores,
                                   float *kscratch, float *vscratch) {
     const mynah_slm_kv *c = (const mynah_slm_kv *)cache;
     const uint32_t group = n_heads / n_kv_heads;
     const uint32_t n_kv  = pos0 + n_q;
-    const float    scale = 1.0f / sqrtf((float)head_dim);
 
     uint32_t gathered = (uint32_t)-1;
     for (uint32_t h = 0; h < n_heads; h++) {

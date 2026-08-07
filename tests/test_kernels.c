@@ -202,12 +202,14 @@ static void test_attention(void) {
     for (int i = 0; i < HEADS * HD; i++) q[i] = frand();
     for (int i = 0; i < NKV * KVH * HD; i++) { k[i] = frand(); v[i] = frand(); }
 
-    mynah_slm_attention(out, q, k, v, NKV, HEADS, KVH, HD, scratch);
+    mynah_slm_attention(out, q, k, v, NKV, HEADS, KVH, HD,
+                        1.0f / sqrtf((float)HD), scratch);
 
     /* With a single position in the cache the softmax is 1.0, so the output is
      * exactly v[0] of that head's KV head. */
     float one[HEADS * HD];
-    mynah_slm_attention(one, q, k, v, 1, HEADS, KVH, HD, scratch);
+    mynah_slm_attention(one, q, k, v, 1, HEADS, KVH, HD,
+                        1.0f / sqrtf((float)HD), scratch);
     int ok = 1;
     for (int i = 0; i < HD; i++) if (!close_to(one[i], v[i], 1e-5f)) ok = 0;
     check("attention over one position returns that value", ok, "not v[0]");
@@ -218,7 +220,8 @@ static void test_attention(void) {
     memcpy(q2, q, sizeof q);
     memcpy(q2 + HD, q2, HD * sizeof(float));
     float o2[HEADS * HD];
-    mynah_slm_attention(o2, q2, k, v, NKV, HEADS, KVH, HD, scratch);
+    mynah_slm_attention(o2, q2, k, v, NKV, HEADS, KVH, HD,
+                        1.0f / sqrtf((float)HD), scratch);
     ok = 1;
     for (int i = 0; i < HD; i++) if (!close_to(o2[i], o2[HD + i], 1e-5f)) ok = 0;
     check("attention groups share their KV head", ok,
@@ -229,7 +232,8 @@ static void test_attention(void) {
      * cache and demand the answer is unchanged. An off-by-one in the history
      * loop fails here and nowhere else — comparing two identical calls would
      * pass no matter what. */
-    mynah_slm_attention(shorter, q, k, v, 3, HEADS, KVH, HD, scratch);
+    mynah_slm_attention(shorter, q, k, v, 3, HEADS, KVH, HD,
+                        1.0f / sqrtf((float)HD), scratch);
     float k2[NKV * KVH * HD], v2[NKV * KVH * HD];
     memcpy(k2, k, sizeof k);
     memcpy(v2, v, sizeof v);
@@ -239,7 +243,8 @@ static void test_attention(void) {
             v2[t * KVH * HD + i] = -999.0f;
         }
     float poisoned[HEADS * HD];
-    mynah_slm_attention(poisoned, q, k2, v2, 3, HEADS, KVH, HD, scratch);
+    mynah_slm_attention(poisoned, q, k2, v2, 3, HEADS, KVH, HD,
+                        1.0f / sqrtf((float)HD), scratch);
     ok = 1;
     for (int i = 0; i < HEADS * HD; i++)
         if (!close_to(shorter[i], poisoned[i], 1e-6f)) ok = 0;

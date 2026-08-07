@@ -39,6 +39,18 @@ typedef struct {
     float    rms_eps;
     float    rope_theta;
 
+    /* muP-style scalars. Granite carries all four in its GGUF; families that
+     * do not use them get neutral values, so there is one forward pass rather
+     * than one per family.
+     *
+     * They are not decoration: attn_scale is 0.015625 for Granite-350m where
+     * 1/sqrt(head_dim) would be 0.125 — eight times larger. A model run with
+     * the wrong one of those produces fluent text and wrong tokens. */
+    float    attn_scale;      /* the softmax scale; default 1/sqrt(head_dim) */
+    float    embed_scale;     /* embeddings are multiplied by this */
+    float    residual_scale;  /* each residual branch is multiplied by this */
+    float    logit_scale;     /* logits are DIVIDED by this */
+
     /* A GGUF carries one terminator; generation_config.json can carry more.
      * Plural from the start so the second one is not an afterthought. */
     uint32_t eos[MYNAH_SLM_MAX_EOS];

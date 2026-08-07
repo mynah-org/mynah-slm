@@ -295,9 +295,11 @@ int mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
     const uint32_t pos0 = s->n_past;
 
     for (uint32_t t = 0; t < n; t++) {
-        if (embed_row(m, tokens[t], s->bx + (size_t)t * c->d_model) != 0) return -1;
-        if (s->on_embed) s->on_embed(s->on_layer_ctx, s->bx + (size_t)t * c->d_model,
-                                     c->d_model);
+        float *row = s->bx + (size_t)t * c->d_model;
+        if (embed_row(m, tokens[t], row) != 0) return -1;
+        if (c->embed_scale != 1.0f)
+            for (uint32_t i = 0; i < c->d_model; i++) row[i] *= c->embed_scale;
+        if (s->on_embed) s->on_embed(s->on_layer_ctx, row, c->d_model);
     }
 
     const int kv_is_f32 = (s->kv.type_k == MYNAH_SLM_KV_F32 &&
@@ -352,17 +354,21 @@ int mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
                                       (const float *)s->kv.k + (size_t)l * per_layer,
                                       (const float *)s->kv.v + (size_t)l * per_layer,
                                       pos0, n, c->n_heads, c->n_kv_heads,
-                                      c->head_dim, c->q_dim, s->bscores);
+                                      c->head_dim, c->q_dim, c->attn_scale,
+                                      s->bscores);
         else
             mynah_slm_attention_kv_batch(s->battn, s->bq, &s->kv, l, pos0, n,
                                          c->n_heads, c->n_kv_heads, c->head_dim,
-                                         c->q_dim, s->bscores,
+                                         c->q_dim, c->attn_scale, s->bscores,
                                          s->kgather, s->vgather);
 
         if (project_batch(m, w->wo, s, s->battn, s->bproj, n) != 0) return -1;
-        for (uint32_t t = 0; t < n; t++)
-            mynah_slm_add(s->bx + (size_t)t * c->d_model,
-                          s->bproj + (size_t)t * c->d_model, c->d_model);
+        for (uint32_t t = 0; t < n; t++) {
+            float *xr = s->bx + (size_t)t * c->d_model;
+            const float *pr = s->bproj + (size_t)t * c->d_model;
+            if (c->residual_scale == 1.0f) mynah_slm_add(xr, pr, c->d_model);
+            else mynah_slm_add_scaled(xr, pr, c->residual_scale, c->d_model);
+        }
 
         for (uint32_t t = 0; t < n; t++)
             mynah_slm_rms_norm(s->bh + (size_t)t * c->d_model,
@@ -378,10 +384,11 @@ int mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
 
         if (project_batch(m, w->down, s, s->bgate, s->bproj, n) != 0) return -1;
         for (uint32_t t = 0; t < n; t++) {
-            mynah_slm_add(s->bx + (size_t)t * c->d_model,
-                          s->bproj + (size_t)t * c->d_model, c->d_model);
-            if (s->on_layer) s->on_layer(s->on_layer_ctx, l,
-                                         s->bx + (size_t)t * c->d_model, c->d_model);
+            float *xr = s->bx + (size_t)t * c->d_model;
+            const float *pr = s->bproj + (size_t)t * c->d_model;
+            if (c->residual_scale == 1.0f) mynah_slm_add(xr, pr, c->d_model);
+            else mynah_slm_add_scaled(xr, pr, c->residual_scale, c->d_model);
+            if (s->on_layer) s->on_layer(s->on_layer_ctx, l, xr, c->d_model);
         }
     }
 
@@ -404,6 +411,8 @@ int mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
         const ingot_tensor *head = m->lm_head ? m->lm_head : m->embed;
         if (mynah_slm_project(m, head, s->bh + (size_t)(n - 1) * c->d_model, s->logits) != 0)
             return -1;
+        if (c->logit_scale != 1.0f)
+            for (uint32_t i = 0; i < c->vocab_size; i++) s->logits[i] /= c->logit_scale;
         memcpy(logits_out, s->logits, c->vocab_size * sizeof(float));
     }
     return 0;
@@ -417,7 +426,11 @@ int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
     const uint32_t pos  = s->n_past;
     const uint32_t n_kv = pos + 1;
 
-    if (embed_row(m, token, s->x) != 0) return -1; /* no sqrt(d_model) scaling */
+    if (embed_row(m, token, s->x) != 0) return -1;
+    /* Gemma multiplies by sqrt(d_model); Granite by its own embedding_scale;
+     * Qwen3 by nothing. All three are one field, defaulted to 1. */
+    if (c->embed_scale != 1.0f)
+        for (uint32_t i = 0; i < c->d_model; i++) s->x[i] *= c->embed_scale;
     if (s->on_embed) s->on_embed(s->on_layer_ctx, s->x, c->d_model);
 
     const int kv_is_f32 = (s->kv.type_k == MYNAH_SLM_KV_F32 &&
@@ -462,14 +475,15 @@ int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
                                    (const float *)s->kv.k + (size_t)l * per_layer,
                                    (const float *)s->kv.v + (size_t)l * per_layer,
                                    n_kv, c->n_heads, c->n_kv_heads, c->head_dim,
-                                   s->scores_mt);
+                                   c->attn_scale, s->scores_mt);
         else
             mynah_slm_attention_kv_mt(s->attn, s->q, &s->kv, l, n_kv,
                                       c->n_heads, c->n_kv_heads, c->head_dim,
-                                      s->scores_mt);
+                                      c->attn_scale, s->scores_mt);
 
         if (mynah_slm_project(m, w->wo, s->attn, s->proj) != 0) return -1;
-        mynah_slm_add(s->x, s->proj, c->d_model);
+        if (c->residual_scale == 1.0f) mynah_slm_add(s->x, s->proj, c->d_model);
+        else mynah_slm_add_scaled(s->x, s->proj, c->residual_scale, c->d_model);
 
         mynah_slm_rms_norm(s->h, s->x, (const float *)ingot_gguf_data(m->gguf, w->ffn_norm),
                            c->d_model, c->rms_eps);
@@ -479,7 +493,8 @@ int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
         mynah_slm_swiglu(s->gate, s->up, c->d_ff);
 
         if (mynah_slm_project(m, w->down, s->gate, s->proj) != 0) return -1;
-        mynah_slm_add(s->x, s->proj, c->d_model);
+        if (c->residual_scale == 1.0f) mynah_slm_add(s->x, s->proj, c->d_model);
+        else mynah_slm_add_scaled(s->x, s->proj, c->residual_scale, c->d_model);
 
         if (s->on_layer) s->on_layer(s->on_layer_ctx, l, s->x, c->d_model);
     }
@@ -493,6 +508,10 @@ int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
      * the reason token_embd is not "just a lookup table". */
     const ingot_tensor *head = m->lm_head ? m->lm_head : m->embed;
     if (mynah_slm_project(m, head, s->h, s->logits) != 0) return -1;
+    /* Granite DIVIDES its logits; softmax is not invariant to that, so it
+     * changes the distribution and not just the scale of the argmax. */
+    if (c->logit_scale != 1.0f)
+        for (uint32_t i = 0; i < c->vocab_size; i++) s->logits[i] /= c->logit_scale;
 
     s->n_past++;
     if (logits_out) memcpy(logits_out, s->logits, c->vocab_size * sizeof(float));

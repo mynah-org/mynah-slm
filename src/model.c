@@ -18,6 +18,7 @@
 #include "mynah_slm.h"
 
 #include <stdarg.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,6 +69,50 @@ static int kv_f32(const ingot_gguf *g, const char *arch, const char *suffix,
     return 0;
 }
 
+/* An integer that a family may declare PER LAYER. Granite inherits its config
+ * class from the hybrid models, so head_count_kv arrives as an array of 28
+ * even when every entry is the same. Accept both shapes, and refuse an array
+ * whose entries differ rather than silently taking the first — that would be a
+ * different model quietly running. */
+static int kv_u32_uniform(const ingot_gguf *g, const char *arch, const char *suffix,
+                          uint32_t *out, char *err, size_t errsz) {
+    char key[128];
+    snprintf(key, sizeof key, "%s.%s", arch, suffix);
+    const ingot_kv *kv = ingot_gguf_kv_find(g, key);
+    if (!kv) return fail(err, errsz, "missing metadata key: %s", key);
+
+    uint64_t v;
+    if (ingot_kv_u64(kv, &v) == 0) { *out = (uint32_t)v; return 0; }
+
+    uint64_t n = 0;
+    if (ingot_kv_arr_len(kv, &n) != 0 || n == 0)
+        return fail(err, errsz, "%s is neither an integer nor an array", key);
+
+    for (uint64_t i = 0; i < n; i++) {
+        int64_t e;
+        if (ingot_kv_arr_i64(kv, i, &e) != 0)
+            return fail(err, errsz, "%s[%llu] is not an integer",
+                        key, (unsigned long long)i);
+        if (i == 0) *out = (uint32_t)e;
+        else if ((uint32_t)e != *out)
+            return fail(err, errsz,
+                        "%s varies per layer (%u at 0, %u at %llu) - unsupported",
+                        key, *out, (uint32_t)e, (unsigned long long)i);
+    }
+    return 0;
+}
+
+/* Optional float with a default: absent is not an error, it is "this family
+ * does not use it". */
+static void kv_f32_opt(const ingot_gguf *g, const char *arch, const char *suffix,
+                       float *out, float dflt) {
+    char key[128];
+    snprintf(key, sizeof key, "%s.%s", arch, suffix);
+    const ingot_kv *kv = ingot_gguf_kv_find(g, key);
+    double v;
+    *out = (kv && ingot_kv_f64(kv, &v) == 0) ? (float)v : dflt;
+}
+
 static int load_config(mynah_slm_config *c, const ingot_gguf *g,
                        char *err, size_t errsz) {
     memset(c, 0, sizeof *c);
@@ -83,12 +128,33 @@ static int load_config(mynah_slm_config *c, const ingot_gguf *g,
         kv_u32(g, arch, "embedding_length",      &c->d_model,    err, errsz) ||
         kv_u32(g, arch, "feed_forward_length",   &c->d_ff,       err, errsz) ||
         kv_u32(g, arch, "attention.head_count",  &c->n_heads,    err, errsz) ||
-        kv_u32(g, arch, "attention.head_count_kv", &c->n_kv_heads, err, errsz) ||
-        kv_u32(g, arch, "attention.key_length",  &c->head_dim,   err, errsz) ||
+        kv_u32_uniform(g, arch, "attention.head_count_kv", &c->n_kv_heads, err, errsz) ||
         kv_u32(g, arch, "context_length",        &c->n_ctx,      err, errsz) ||
         kv_f32(g, arch, "attention.layer_norm_rms_epsilon", &c->rms_eps, err, errsz) ||
         kv_f32(g, arch, "rope.freq_base",        &c->rope_theta, err, errsz))
         return -1;
+
+    /* head_dim has its OWN key and is never d_model / n_heads — for Qwen3-0.6B
+     * those give 128 and 64, and deriving it is the classic way to get that
+     * family wrong. Two families spell the key differently, so try both and
+     * fail rather than fall back to the derivation:
+     *   attention.key_length     Qwen3, Gemma
+     *   rope.dimension_count     Granite (whose rotary covers the whole head) */
+    if (kv_u32(g, arch, "attention.key_length", &c->head_dim, NULL, 0) != 0 &&
+        kv_u32(g, arch, "rope.dimension_count", &c->head_dim, NULL, 0) != 0)
+        return fail(err, errsz,
+                    "no head dimension: neither %s.attention.key_length nor "
+                    "%s.rope.dimension_count is present", arch, arch);
+
+    /* muP scalars. Absent means "this family does not use them", so the
+     * defaults are the neutral values and one forward pass serves both. */
+    kv_f32_opt(g, arch, "attention.scale",  &c->attn_scale,     0.0f);
+    kv_f32_opt(g, arch, "embedding_scale",  &c->embed_scale,    1.0f);
+    kv_f32_opt(g, arch, "residual_scale",   &c->residual_scale, 1.0f);
+    kv_f32_opt(g, arch, "logit_scale",      &c->logit_scale,    1.0f);
+    if (c->attn_scale <= 0.0f)
+        c->attn_scale = 1.0f / sqrtf((float)c->head_dim);
+    if (c->logit_scale == 0.0f) c->logit_scale = 1.0f;
 
     if (c->n_heads == 0 || c->n_kv_heads == 0)
         return fail(err, errsz, "head counts must be non-zero");
