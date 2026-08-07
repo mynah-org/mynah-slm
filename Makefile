@@ -84,7 +84,7 @@ help:
 mynah-slm: $(OBJ) build/cli/main.o $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
-SERVER_OBJ := build/server/main.o build/server/http.o build/server/json.o
+SERVER_OBJ := build/server/main.o build/server/http.o
 mynah-slm-server: $(OBJ) $(SERVER_OBJ) $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
