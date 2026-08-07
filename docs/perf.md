@@ -25,6 +25,7 @@ each found by measuring rather than by guessing:
 | + fused Q6_K kernel (ingot) | 24.0 | 802 ms |
 | + fused Q4_K kernel (ingot) | 27.1 | 697 ms |
 | + **our Q4_K matvec** (src/qmat.c) | **36.5** | — |
+| (ingot later got the same identity, so this edge is now +9-12%, not +30%) | | |
 | + **batched prefill** | 36.5 | **318 ms** |
 
 Two of those steps were the same bug in two places, and the second only became
@@ -209,7 +210,22 @@ End to end, interleaved, 60 generated tokens, four runs across two sessions:
 **+30 to +32%, and the greedy output is byte-identical.** The ratio is what is
 stable; the absolute number drifts about 5% with the thermal state of the
 machine, which is exactly why the comparison is interleaved and why a single
-run of each would be worth nothing. (The lower pair was measured after killing
+run of each would be worth nothing.
+
+**That gap is now +9 to +12%, and we closed it ourselves.** The identity above
+was contributed upstream (ingot `Q4_K: distribute the sum, NEON and AVX2`), so
+ingot's kernel no longer builds each weight before using it and most of our
+advantage went with it — ours 36.1-36.6 tok/s against ingot's 33.1-33.9, six
+interleaved rounds on the same binary. Our absolute number did not move: theirs
+came up.
+
+What survives is exactly the part ingot's API cannot reach. `SUM_j x_j` depends
+only on the INPUT, so a caller that owns the whole matvec hoists it out of the
+row loop once and reuses it across every row; `ingot_q4_k_matvec` is called per
+row-chunk by our thread pool and would recompute it eight times per tensor. So
+this kernel stays where the Q6_K one did not — **the boundary in CLAUDE.md rule
+4 is doing its job in both directions**, and a 1.5x that turned out to be a
+generic improvement is worth more upstream than it was here. (The lower pair was measured after killing
 two idle server processes left over from a test run — they were using no CPU,
 but they held ~800 MB of mapped weights on a 16 GB machine. Check what else is
 running before quoting an absolute.) Correctness is gated in two
