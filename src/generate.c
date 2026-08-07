@@ -5,6 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+void mynah_slm_gen_params_init(mynah_slm_gen_params *p) {
+    if (!p) return;
+    memset(p, 0, sizeof *p);
+    p->think_open = p->think_close = -1;
+    p->tool_open  = p->tool_close  = -1;
+}
+
 static int is_eos(const mynah_slm_gen_params *p, uint32_t id) {
     for (size_t i = 0; i < p->n_eos; i++) if (p->eos[i] == id) return 1;
     return 0;
@@ -34,12 +41,16 @@ long mynah_slm_generate(mynah_slm_state *st, const mynah_slm_tokenizer *tok,
     /* One detokenizer PER CHANNEL. A shared one would carry a half-finished
      * UTF-8 sequence across a marker and complete it on the wrong side. The
      * markers are whole tokens, so no real sequence ever straddles them. */
-    mynah_slm_detok d_answer, d_think;
-    mynah_slm_detok_init(&d_answer, tok);
-    mynah_slm_detok_init(&d_think, tok);
+    enum { CH_ANSWER = 0, CH_THINK, CH_TOOL, CH_N };
+    mynah_slm_detok d[CH_N];
+    for (int i = 0; i < CH_N; i++) mynah_slm_detok_init(&d[i], tok);
 
-    const int split = (p->think_open >= 0 && p->think_close >= 0);
-    int in_think = 0;
+    const mynah_slm_token_cb cb[CH_N] = { p->cb, p->cb_think, p->cb_tool };
+    void *const cb_ctx[CH_N] = { p->cb_ctx, p->cb_think_ctx, p->cb_tool_ctx };
+
+    const int split_think = (p->think_open >= 0 && p->think_close >= 0);
+    const int split_tool  = (p->tool_open  >= 0 && p->tool_close  >= 0);
+    int chan = CH_ANSWER;
 
     char piece[512];
     long produced = 0;
@@ -57,30 +68,29 @@ long mynah_slm_generate(mynah_slm_state *st, const mynah_slm_tokenizer *tok,
         mynah_slm_timing_token(t);
         produced++;
 
-        /* The markers are structure, not content: they open and close the
+        /* The markers are structure, not content: they open and close a
          * channel and are emitted on neither. */
-        if (split && id == (uint32_t)p->think_open)  { in_think = 1; next = id; continue; }
-        if (split && id == (uint32_t)p->think_close) { in_think = 0; next = id; continue; }
+        if (split_think && id == (uint32_t)p->think_open)  { chan = CH_THINK;  next = id; continue; }
+        if (split_think && id == (uint32_t)p->think_close) { chan = CH_ANSWER; next = id; continue; }
+        if (split_tool  && id == (uint32_t)p->tool_open)   { chan = CH_TOOL;   next = id; continue; }
+        if (split_tool  && id == (uint32_t)p->tool_close)  { chan = CH_ANSWER; next = id; continue; }
 
-        mynah_slm_detok    *d  = in_think ? &d_think : &d_answer;
-        mynah_slm_token_cb  cb = in_think ? p->cb_think : p->cb;
-        void               *cx = in_think ? p->cb_think_ctx : p->cb_ctx;
-
-        const long w = mynah_slm_detok_feed(d, id, piece, sizeof piece - 1);
+        const long w = mynah_slm_detok_feed(&d[chan], id, piece, sizeof piece - 1);
         if (w < 0) break;
         piece[w] = '\0';
 
         /* No callback for this channel means the caller wants it discarded —
          * which is the right default for thinking in a speech pipeline. */
-        if (cb && cb(cx, id, piece, (size_t)w) != 0) break;
+        if (cb[chan] && cb[chan](cb_ctx[chan], id, piece, (size_t)w) != 0) break;
         next = id;
     }
 
     mynah_slm_timing_end_decode(t);
 
-    const long w = mynah_slm_detok_finish(&d_answer, piece, sizeof piece - 1);
-    if (w > 0 && p->cb) { piece[w] = '\0'; p->cb(p->cb_ctx, 0, piece, (size_t)w); }
-    mynah_slm_detok_finish(&d_think, piece, sizeof piece - 1);
+    for (int i = 0; i < CH_N; i++) {
+        const long w = mynah_slm_detok_finish(&d[i], piece, sizeof piece - 1);
+        if (w > 0 && cb[i]) { piece[w] = '\0'; cb[i](cb_ctx[i], 0, piece, (size_t)w); }
+    }
 
     return produced;
 }

@@ -43,7 +43,31 @@ typedef struct {
     void              *cb_think_ctx;
     long               think_open;
     long               think_close;
+
+    /* The TOOL-CALL channel, split for the same reason and by the same
+     * mechanism.
+     *
+     * `<tool_call>` and `</tool_call>` are single tokens in Qwen3, so the JSON
+     * a function call is made of never reaches the answer channel and never
+     * gets spoken. What arrives here is the bare JSON, markers already
+     * consumed — feed it to mynah_slm_tool_calls_parse().
+     *
+     * Set tool_open/tool_close to -1 to disable the split, which is what a
+     * caller that passed no tools wants: then a model that emits the markers
+     * anyway is simply talking. */
+    mynah_slm_token_cb cb_tool;
+    void              *cb_tool_ctx;
+    long               tool_open;
+    long               tool_close;
 } mynah_slm_gen_params;
+
+/* Zero the params and DISABLE both channel splits.
+ *
+ * Use this instead of brace-initializing the struct. A marker field left at 0
+ * is not "unset": 0 is a real token id, and the day a model emits it the
+ * answer channel would silently switch to another channel and the user would
+ * lose text. So the disabled value is -1 and it has to be written by someone. */
+void mynah_slm_gen_params_init(mynah_slm_gen_params *p);
 
 /* Runs to completion. Returns the number of tokens generated, or -1.
  * `t` is filled in as it goes and is safe to print afterwards. */

@@ -24,6 +24,10 @@ examples/minimal
 tests/test_*
 !tests/test_*.c
 !tests/test_*.h
+# The compiled test binaries are what this rule is for. A test that happens to
+# be a SHELL SCRIPT is source, and this ignore quietly kept tests/test_server.sh
+# out of the repo for a whole release's worth of commits.
+!tests/test_*.sh
 bench_*
 !bench_*.c
 

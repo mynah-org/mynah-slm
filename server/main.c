@@ -26,6 +26,7 @@
 #include "threads.h"
 #include "timing.h"
 #include "tokenizer.h"
+#include "tools.h"
 
 #include <pthread.h>
 #include <signal.h>
@@ -91,6 +92,15 @@ static int emit_append(emit_ctx *e, const char *text, size_t len) {
     e->used += len;
     e->buf[e->used] = '\0';
     return 0;
+}
+
+/* The tool channel is accumulated, never streamed frame by frame: a function
+ * call is only usable once the JSON is complete, and half of an object is not
+ * a partial answer, it is unparseable. */
+static int tool_cb(void *ctx, uint32_t id, const char *text, size_t len) {
+    (void)id;
+    emit_ctx *e = ctx;
+    return len ? emit_append(e, text, len) : 0;
 }
 
 static int answer_cb(void *ctx, uint32_t id, const char *text, size_t len) {
@@ -188,28 +198,82 @@ static void handle_chat(server_ctx *c, http_conn *conn,
      * borrows a span that a later realloc could move. */
     mynah_slm_message rendered[32];
     char *owned[32];
+    mynah_slm_tool_call *replay[32];
+    size_t n_replay[32];
     size_t n_msg = 0;
+    mynah_slm_tool_set *tools = NULL;
+
+    memset(rendered, 0, sizeof rendered);
+    memset(owned, 0, sizeof owned);
+    memset(replay, 0, sizeof replay);
+    memset(n_replay, 0, sizeof n_replay);
 
     for (size_t i = 0; i < 32; i++) {
-        json_val m, role, content;
+        json_val m, role, content, tc;
         if (json_array_at(&msgs, i, &m) != 0) break;
         if (m.kind != JSON_OBJECT) continue;
-        if (json_object_get(&m, "content", &content) != 0 || content.kind != JSON_STRING) continue;
+
+        const int has_content =
+            (json_object_get(&m, "content", &content) == 0 && content.kind == JSON_STRING);
+
+        /* An assistant turn that only called a function carries no content.
+         * Dropping it would leave the tool result answering nothing, and the
+         * model would see a response to a question it never asked. */
+        if (json_object_get(&m, "tool_calls", &tc) == 0 && tc.kind == JSON_ARRAY) {
+            const size_t span = (size_t)(tc.end - tc.start);
+            const long k = mynah_slm_tool_calls_from_json(tc.start, span, NULL, 0);
+            if (k > 0) {
+                replay[n_msg] = calloc((size_t)k, sizeof **replay);
+                if (replay[n_msg]) {
+                    mynah_slm_tool_calls_from_json(tc.start, span, replay[n_msg], (size_t)k);
+                    n_replay[n_msg] = (size_t)k;
+                }
+            }
+        }
+        if (!has_content && !n_replay[n_msg]) continue;
 
         char r[32] = "user";
         if (json_object_get(&m, "role", &role) == 0 && role.kind == JSON_STRING)
             json_string_copy(&role, r, sizeof r);
 
-        owned[n_msg] = json_string_dup(&content);
-        if (!owned[n_msg]) break;
-        rendered[n_msg].content = owned[n_msg];
+        owned[n_msg] = has_content ? json_string_dup(&content) : NULL;
+        if (has_content && !owned[n_msg]) break;
+        rendered[n_msg].content      = owned[n_msg];
+        rendered[n_msg].tool_calls   = replay[n_msg];
+        rendered[n_msg].n_tool_calls = n_replay[n_msg];
         rendered[n_msg].role =
             !strcmp(r, "system")    ? MYNAH_SLM_ROLE_SYSTEM :
             !strcmp(r, "assistant") ? MYNAH_SLM_ROLE_ASSISTANT :
             !strcmp(r, "tool")      ? MYNAH_SLM_ROLE_TOOL : MYNAH_SLM_ROLE_USER;
         n_msg++;
     }
-    if (n_msg == 0) { http_error(conn, 400, "no usable messages"); return; }
+    if (n_msg == 0) { http_error(conn, 400, "no usable messages"); goto cleanup_msgs; }
+
+    /* Tools go in the system turn, so they are part of the prompt and not a
+     * mode: `tool_choice: "none"` is simply not sending them. */
+    json_val choice;
+    int offer_tools = 1;
+    if (json_object_get(&root, "tool_choice", &choice) == 0 && choice.kind == JSON_STRING) {
+        char tc_s[32] = "auto";
+        json_string_copy(&choice, tc_s, sizeof tc_s);
+        if (!strcmp(tc_s, "none")) offer_tools = 0;
+        else if (strcmp(tc_s, "auto") != 0 && strcmp(tc_s, "required") != 0) {
+            http_error(conn, 400, "tool_choice: only \"auto\" and \"none\" are supported");
+            goto cleanup_msgs;
+        }
+        /* "required" is accepted but not enforced: forcing a call needs
+         * constrained decoding, and pretending otherwise would be a lie the
+         * client only discovers in production. */
+    }
+
+    json_val tools_v;
+    if (offer_tools &&
+        json_object_get(&root, "tools", &tools_v) == 0 && tools_v.kind == JSON_ARRAY) {
+        char terr[160];
+        tools = mynah_slm_tools_parse(tools_v.start, (size_t)(tools_v.end - tools_v.start),
+                                      terr, sizeof terr);
+        if (!tools) { http_error(conn, 400, terr); goto cleanup_msgs; }
+    }
 
     const int stream  = json_get_bool(&root, "stream", 0);
     const int max_new = (int)json_get_number(&root, "max_tokens", 256);
@@ -233,10 +297,16 @@ static void handle_chat(server_ctx *c, http_conn *conn,
     sp.top_k = (uint32_t)json_get_number(&root, "top_k", sp.top_k);
     sp.seed  = (uint64_t)json_get_number(&root, "seed", 0);
 
-    const long need = mynah_slm_render_chat(rendered, n_msg, think, NULL, 0);
+    const mynah_slm_tool *tool_items = mynah_slm_tools_items(tools);
+    const size_t n_tools = mynah_slm_tools_count(tools);
+
+    const long need = mynah_slm_render_chat_tools(rendered, n_msg, tool_items, n_tools,
+                                                  think, NULL, 0);
+    if (need < 0) { http_error(conn, 400, "cannot render these messages"); goto cleanup_msgs; }
     char *text = malloc((size_t)need + 1);
     if (!text) { http_error(conn, 500, "out of memory"); goto cleanup_msgs; }
-    mynah_slm_render_chat(rendered, n_msg, think, text, (size_t)need + 1);
+    mynah_slm_render_chat_tools(rendered, n_msg, tool_items, n_tools, think,
+                                text, (size_t)need + 1);
 
     const long n_prompt = mynah_slm_tokenize(c->tok, text, 1, NULL, 0);
     uint32_t *ids = malloc((size_t)(n_prompt > 0 ? n_prompt : 1) * sizeof *ids);
@@ -260,6 +330,8 @@ static void handle_chat(server_ctx *c, http_conn *conn,
     if (stream) http_begin_sse(conn);
 
     emit_ctx e = { .conn = conn, .id = req_id, .model_name = model_json, .stream = stream };
+    /* Never streamed: a tool call is only usable whole. */
+    emit_ctx e_tool = { .conn = conn, .id = req_id, .model_name = model_json, .stream = 0 };
 
     mynah_slm_timing tm;
     mynah_slm_timing_reset(&tm);
@@ -284,15 +356,20 @@ static void handle_chat(server_ctx *c, http_conn *conn,
     mynah_slm_sampler *sam = mynah_slm_sampler_new(&sp, mynah_slm_vocab_size(c->model));
     const uint32_t eos[] = { mynah_slm_tokenizer_eos(c->tok), 151643u };
 
-    mynah_slm_gen_params gp = {
-        .prompt = ids, .n_prompt = (size_t)n_prompt,
-        .max_new = (uint32_t)max_new,
-        .eos = eos, .n_eos = 2,
-        .cb = answer_cb, .cb_ctx = &e,
-        .think_open  = mynah_slm_token_find(c->tok, "<think>"),
-        .think_close = mynah_slm_token_find(c->tok, "</think>"),
-        .cb_think = NULL,          /* discarded: reasoning is not content */
-    };
+    mynah_slm_gen_params gp;
+    mynah_slm_gen_params_init(&gp);
+    gp.prompt = ids; gp.n_prompt = (size_t)n_prompt;
+    gp.max_new = (uint32_t)max_new;
+    gp.eos = eos; gp.n_eos = 2;
+    gp.cb = answer_cb; gp.cb_ctx = &e;
+    gp.think_open  = mynah_slm_token_find(c->tok, "<think>");
+    gp.think_close = mynah_slm_token_find(c->tok, "</think>");
+    gp.cb_think = NULL;            /* discarded: reasoning is not content */
+    if (tools) {
+        gp.tool_open  = mynah_slm_token_find(c->tok, "<tool_call>");
+        gp.tool_close = mynah_slm_token_find(c->tok, "</tool_call>");
+        gp.cb_tool = tool_cb; gp.cb_tool_ctx = &e_tool;
+    }
     mynah_slm_generate(&st, c->tok, sam, &gp, &tm);
 
     mynah_slm_sampler_free(sam);
@@ -313,13 +390,55 @@ static void handle_chat(server_ctx *c, http_conn *conn,
         tm.load_s * 1000.0, tm.ttft_s * 1000.0,
         mynah_slm_prefill_tok_s(&tm), mynah_slm_decode_tok_s(&tm), tm.n_threads);
 
+    /* A function call is data, not prose: it leaves the answer channel empty
+     * and changes finish_reason. A client that ignores tool_calls must not be
+     * handed the raw JSON in `content` — that is what the channel split in
+     * generate.c is for. */
+    mynah_slm_tool_call parsed[16];
+    size_t n_parsed = 0;
+    char  *calls_json = NULL;
+    if (e_tool.used) {
+        size_t blocks = 0;
+        const long got = mynah_slm_tool_calls_parse(e_tool.buf, e_tool.used, parsed,
+                                                    sizeof parsed / sizeof *parsed, &blocks);
+        if (got > 0) {
+            n_parsed = (size_t)(got < 16 ? got : 16);
+            const size_t nj = mynah_slm_tool_calls_to_json(parsed, n_parsed, NULL, 0) + 1;
+            calls_json = malloc(nj);
+            if (calls_json) mynah_slm_tool_calls_to_json(parsed, n_parsed, calls_json, nj);
+        }
+    }
+    const char *finish = calls_json ? "tool_calls" : "stop";
+
+    /* The newline the template puts between an answer and a call is glue, not
+     * content. Only trimmed when a call actually followed. */
+    if (calls_json && e.buf)
+        while (e.used && (e.buf[e.used - 1] == '\n' || e.buf[e.used - 1] == ' ' ||
+                          e.buf[e.used - 1] == '\t' || e.buf[e.used - 1] == '\r'))
+            e.buf[--e.used] = '\0';
+
     if (stream) {
+        /* One frame carrying the whole call. Splitting a JSON object across
+         * deltas would let a client act on half an argument list. */
+        if (calls_json) {
+            const size_t cap = strlen(calls_json) + 512;
+            char *frame = malloc(cap);
+            if (frame) {
+                const int n = snprintf(frame, cap,
+                    "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+                    "\"model\":%s,\"choices\":[{\"index\":0,"
+                    "\"delta\":{\"tool_calls\":%s},\"finish_reason\":null}]}\n\n",
+                    req_id, model_json, calls_json);
+                http_write(conn, frame, (size_t)n);
+                free(frame);
+            }
+        }
         char last[1024];
         const int n = snprintf(last, sizeof last,
             "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
             "\"model\":%s,\"choices\":[{\"index\":0,\"delta\":{},"
-            "\"finish_reason\":\"stop\"}],%s}\n\ndata: [DONE]\n\n",
-            req_id, model_json, usage);
+            "\"finish_reason\":\"%s\"}],%s}\n\ndata: [DONE]\n\n",
+            req_id, model_json, finish, usage);
         http_write(conn, last, (size_t)n);
     } else {
         char esc_stack[4096];
@@ -328,14 +447,19 @@ static void handle_chat(server_ctx *c, http_conn *conn,
         if (need_esc > sizeof esc_stack) esc = malloc(need_esc);
         if (esc) {
             json_escape(e.buf ? e.buf : "", e.used, esc, need_esc);
-            size_t cap = need_esc + 1024;
+            size_t cap = need_esc + 1024 + (calls_json ? strlen(calls_json) : 0);
             char *out = malloc(cap);
             if (out) {
+                /* OpenAI sends content: null when the turn was only a call. */
                 const int n = snprintf(out, cap,
                     "{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":%s,"
                     "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
-                    "\"content\":%s},\"finish_reason\":\"stop\"}],%s}\n",
-                    req_id, model_json, esc, usage);
+                    "\"content\":%s%s%s},\"finish_reason\":\"%s\"}],%s}\n",
+                    req_id, model_json,
+                    (calls_json && e.used == 0) ? "null" : esc,
+                    calls_json ? ",\"tool_calls\":" : "",
+                    calls_json ? calls_json : "",
+                    finish, usage);
                 http_respond(conn, 200, "application/json", out, (size_t)n);
                 free(out);
             }
@@ -343,12 +467,20 @@ static void handle_chat(server_ctx *c, http_conn *conn,
         }
     }
 
+    mynah_slm_tool_calls_free(parsed, n_parsed);
+    free(calls_json);
+    free(e_tool.buf);
     free(e.buf);
     free(ids);
     free(text);
 
 cleanup_msgs:
-    for (size_t i = 0; i < n_msg; i++) free(owned[i]);
+    mynah_slm_tools_free(tools);
+    for (size_t i = 0; i < 32; i++) {
+        free(owned[i]);
+        mynah_slm_tool_calls_free(replay[i], n_replay[i]);
+        free(replay[i]);
+    }
 }
 
 /* ── routing ──────────────────────────────────────────────────────────────── */

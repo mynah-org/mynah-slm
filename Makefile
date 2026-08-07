@@ -107,7 +107,7 @@ $(OBJ): | $(INGOT_LIB)
 # test_ingot needs no model: it pins the container-layer contract (block
 # geometry, dequant coverage) so a bad subtree update fails here and not
 # three modules later.
-TESTS := tests/test_ingot tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer
+TESTS := tests/test_ingot tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer tests/test_tools
 
 # The parity harness is built like the others but driven separately: it dumps
 # activations, and tools/eval/compare.py is what judges them.
@@ -198,6 +198,10 @@ leaks: mynah-slm $(TESTS)
 	@# test_inspect is the one that allocates (the census grows by realloc and
 	@# the fixture writer holds buffers): it is the real subject here.
 	leaks --atExit -- tests/test_inspect 2>&1 | tail -2
+	@# test_tools allocates on every path too — tool sets, parsed calls, the
+	@# rendered prompt — and unlike the others it needs no checkpoint, so this
+	@# stays a fast check.
+	leaks --atExit -- tests/test_tools 2>&1 | tail -2
 	@if [ -e "$(MODEL)" ]; then \
 	   leaks --atExit -- ./mynah-slm inspect "$(MODEL)" 2>&1 | tail -3; \
 	 else echo "SKIP leaks/inspect: $(MODEL) not found"; fi

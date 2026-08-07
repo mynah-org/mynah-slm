@@ -508,17 +508,23 @@ check = [
     { name = "torch" },
     { name = "transformers" },
 ]
+fixtures = [
+    { name = "jinja2" },
+    { name = "transformers" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "gguf", specifier = ">=0.10" },
+    { name = "jinja2", marker = "extra == 'fixtures'", specifier = ">=3.1" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "safetensors", marker = "extra == 'check'", specifier = ">=0.4" },
     { name = "tokenizers", specifier = ">=0.20" },
     { name = "torch", marker = "extra == 'check'", specifier = ">=2.4" },
     { name = "transformers", marker = "extra == 'check'", specifier = ">=4.51" },
+    { name = "transformers", marker = "extra == 'fixtures'", specifier = ">=4.51" },
 ]
-provides-extras = ["check"]
+provides-extras = ["fixtures", "check"]
 
 [[package]]
 name = "networkx"

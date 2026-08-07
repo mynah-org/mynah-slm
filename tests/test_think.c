@@ -65,7 +65,7 @@ int main(int argc, char **argv) {
     if (open_id < 0 || close_id < 0) return 1;
 
     /* A prompt that reliably makes a reasoning model think first. */
-    mynah_slm_message msg = { MYNAH_SLM_ROLE_USER, "Quanto fa 17+25?" };
+    mynah_slm_message msg = { .role = MYNAH_SLM_ROLE_USER, .content = "Quanto fa 17+25?" };
     const long need = mynah_slm_render_chat(&msg, 1, MYNAH_SLM_THINK_ON, NULL, 0);
     char *text = malloc((size_t)need + 1);
     mynah_slm_render_chat(&msg, 1, MYNAH_SLM_THINK_ON, text, (size_t)need + 1);
@@ -98,14 +98,14 @@ int main(int argc, char **argv) {
     mynah_slm_timing_start(&tm);
     mynah_slm_timing_end_load(&tm);
 
-    mynah_slm_gen_params gp = {
-        .prompt = ids, .n_prompt = (size_t)n_prompt,
-        .max_new = 24,                     /* enough to be well inside the block */
-        .eos = eos, .n_eos = 2,
-        .cb = sink_cb, .cb_ctx = &answer,
-        .cb_think = sink_cb, .cb_think_ctx = &think,
-        .think_open = open_id, .think_close = close_id,
-    };
+    mynah_slm_gen_params gp;
+    mynah_slm_gen_params_init(&gp);
+    gp.prompt = ids; gp.n_prompt = (size_t)n_prompt;
+    gp.max_new = 24;                       /* enough to be well inside the block */
+    gp.eos = eos; gp.n_eos = 2;
+    gp.cb = sink_cb; gp.cb_ctx = &answer;
+    gp.cb_think = sink_cb; gp.cb_think_ctx = &think;
+    gp.think_open = open_id; gp.think_close = close_id;
     const long n = mynah_slm_generate(&st, tok, sam, &gp, &tm);
     check("generation produced tokens", n > 0, "nothing came out");
 

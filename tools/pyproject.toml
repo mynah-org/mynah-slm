@@ -14,6 +14,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Regenerating tests/fixtures/chat_tools.txt: HF renders the Jinja chat
+# template our C writes out by hand, and that rendering is the ground truth.
+# transformers without torch is enough — no model is loaded, only the template.
+fixtures = [
+    "transformers>=4.51",
+    "jinja2>=3.1",
+]
+
 # Only for proving the ORACLE itself right against transformers. Never needed
 # to run the oracle, and never installed in CI.
 check = [

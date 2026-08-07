@@ -14,6 +14,7 @@
 #include "threads.h"
 #include "timing.h"
 #include "tokenizer.h"
+#include "tools.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,10 +34,15 @@ static void usage(FILE *f) {
         "  mynah-slm run -m <model.gguf> -p \"prompt\" [-n 128] [--think off|low|on]\n"
         "                [--temp T] [--top-k K] [--top-p P] [--min-p M] [--seed S]\n"
         "                [--raw] [--no-stream] [--quiet] [--ctx N] [--show-think]\n"
+        "                [--tools tools.json]\n"
         "                [-t N | --threads N]   (default: performance cores)\n"
         "\n"
         "  Reasoning NEVER reaches stdout: it is discarded, or written to stderr\n"
         "  with --show-think. stdout is the answer, so `| mynah-tts` is safe.\n"
+        "\n"
+        "  --tools takes an OpenAI-shaped array of function schemas. A call the\n"
+        "  model makes is printed to stdout as one JSON line — {\"tool_calls\":[..]}\n"
+        "  — and never mixed into the answer text, so `| jq` works.\n"
         "\n"
         "  Timings go to stderr, so stdout stays pipeable into mynah-tts.\n"
         "  mynah-slm --version\n"
@@ -199,6 +205,28 @@ static int think_cb(void *ctx, uint32_t id, const char *text, size_t len) {
     return 0;
 }
 
+/* Read a whole file. Returns NULL on failure; caller frees. */
+static char *slurp_file(const char *path, size_t *len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    size_t cap = 8192, n = 0;
+    char *buf = malloc(cap);
+    while (buf) {
+        if (n + 1 >= cap) {
+            char *g = realloc(buf, cap *= 2);
+            if (!g) { free(buf); buf = NULL; break; }
+            buf = g;
+        }
+        const size_t got = fread(buf + n, 1, cap - n - 1, f);
+        n += got;
+        if (got == 0) break;
+    }
+    fclose(f);
+    if (buf) buf[n] = '\0';
+    if (len) *len = n;
+    return buf;
+}
+
 typedef struct { char *buf; size_t used, cap; } collect;
 
 static int collect_cb(void *ctx, uint32_t id, const char *text, size_t len) {
@@ -217,13 +245,29 @@ static int collect_cb(void *ctx, uint32_t id, const char *text, size_t len) {
 }
 
 typedef struct {
-    const char *model, *prompt, *system;
+    const char *model, *prompt, *system, *tools_path;
     int   max_new, raw, stream, quiet, think, ctx, show_think, threads;
     mynah_slm_sampler_params sp;
 } run_opts;
 
 static int cmd_run(run_opts *o) {
     char err[256];
+
+    /* Tool schemas first: a bad file must fail before a 400 MB checkpoint is
+     * mapped, not after. */
+    mynah_slm_tool_set *tools = NULL;
+    if (o->tools_path) {
+        size_t tlen = 0;
+        char *tjson = slurp_file(o->tools_path, &tlen);
+        if (!tjson) {
+            fprintf(stderr, "mynah-slm: cannot read %s\n", o->tools_path);
+            return 1;
+        }
+        tools = mynah_slm_tools_parse(tjson, tlen, err, sizeof err);
+        free(tjson);
+        if (!tools) { fprintf(stderr, "mynah-slm: %s\n", err); return 1; }
+    }
+
     mynah_slm_timing tm;
     mynah_slm_timing_reset(&tm);
     tm.n_threads = mynah_slm_threads_init(o->threads);
@@ -247,10 +291,13 @@ static int cmd_run(run_opts *o) {
         if (o->system) { msgs[n].role = MYNAH_SLM_ROLE_SYSTEM; msgs[n].content = o->system; n++; }
         msgs[n].role = MYNAH_SLM_ROLE_USER; msgs[n].content = o->prompt; n++;
 
-        const long need = mynah_slm_render_chat(msgs, n, o->think, NULL, 0);
+        const mynah_slm_tool *ts = mynah_slm_tools_items(tools);
+        const size_t n_ts = mynah_slm_tools_count(tools);
+
+        const long need = mynah_slm_render_chat_tools(msgs, n, ts, n_ts, o->think, NULL, 0);
         if (need < 0) { fprintf(stderr, "mynah-slm: cannot render the prompt\n"); return 1; }
         text = malloc((size_t)need + 1);
-        if (text) mynah_slm_render_chat(msgs, n, o->think, text, (size_t)need + 1);
+        if (text) mynah_slm_render_chat_tools(msgs, n, ts, n_ts, o->think, text, (size_t)need + 1);
     }
     if (!text) { fprintf(stderr, "mynah-slm: out of memory\n"); return 1; }
 
@@ -276,26 +323,64 @@ static int cmd_run(run_opts *o) {
      * runs past the end of the turn. */
     const uint32_t eos[] = { mynah_slm_tokenizer_eos(tok), 151643u };
 
-    collect col = {0};
-    mynah_slm_gen_params gp = {
-        .prompt = ids, .n_prompt = (size_t)n_prompt,
-        .max_new = (uint32_t)o->max_new,
-        .eos = eos, .n_eos = sizeof eos / sizeof *eos,
-        .cb = o->stream ? stream_cb : collect_cb,
-        .cb_ctx = o->stream ? NULL : (void *)&col,
-        /* Resolved by name: an id hardcoded here would be right for exactly
-         * one vocabulary. -1 when the model has no think markers at all, which
-         * simply disables the split. */
-        .think_open  = mynah_slm_token_find(tok, "<think>"),
-        .think_close = mynah_slm_token_find(tok, "</think>"),
-        /* NULL discards the channel — the right default for a speech pipeline. */
-        .cb_think     = o->show_think ? think_cb : NULL,
-        .cb_think_ctx = NULL,
-    };
+    collect col = {0}, calls = {0};
+    mynah_slm_gen_params gp;
+    mynah_slm_gen_params_init(&gp);
+    gp.prompt = ids; gp.n_prompt = (size_t)n_prompt;
+    gp.max_new = (uint32_t)o->max_new;
+    gp.eos = eos; gp.n_eos = sizeof eos / sizeof *eos;
+    gp.cb     = o->stream ? stream_cb : collect_cb;
+    gp.cb_ctx = o->stream ? NULL : (void *)&col;
+    /* Resolved by name: an id hardcoded here would be right for exactly one
+     * vocabulary. -1 when the model has no such marker, which simply disables
+     * the split. */
+    gp.think_open  = mynah_slm_token_find(tok, "<think>");
+    gp.think_close = mynah_slm_token_find(tok, "</think>");
+    /* NULL discards the channel — the right default for a speech pipeline. */
+    gp.cb_think     = o->show_think ? think_cb : NULL;
+    gp.cb_think_ctx = NULL;
+
+    /* Only split the tool channel when tools were offered. Without them the
+     * markers are not structure, they are the model quoting XML at us. */
+    if (tools) {
+        gp.tool_open  = mynah_slm_token_find(tok, "<tool_call>");
+        gp.tool_close = mynah_slm_token_find(tok, "</tool_call>");
+        gp.cb_tool     = collect_cb;
+        gp.cb_tool_ctx = &calls;
+    }
 
     const long n = mynah_slm_generate(&st, tok, sam, &gp, &tm);
     if (!o->stream && col.buf) fputs(col.buf, stdout);
     fputc('\n', stdout);
+
+    /* One JSON line, after the text, so a caller can read the answer as text
+     * and the calls as data without either parsing the other. */
+    if (calls.used) {
+        mynah_slm_tool_call parsed[16];
+        size_t blocks = 0;
+        const long got = mynah_slm_tool_calls_parse(calls.buf, calls.used, parsed,
+                                                    sizeof parsed / sizeof *parsed,
+                                                    &blocks);
+        /* `got` counts what the model produced, which can exceed the array —
+         * and is negative on a bad argument. Only what was WRITTEN gets freed. */
+        const size_t kept = got > 0 ? (size_t)(got < 16 ? got : 16) : 0;
+        if (got > 0) {
+            const size_t need = mynah_slm_tool_calls_to_json(parsed, kept, NULL, 0) + 1;
+            char *js = malloc(need);
+            if (js) {
+                mynah_slm_tool_calls_to_json(parsed, kept, js, need);
+                printf("{\"tool_calls\":%s}\n", js);
+                free(js);
+            }
+        }
+        /* A block that did not parse is the model failing at JSON, and that is
+         * exactly the thing worth knowing about a 0.6B. Reported, not hidden. */
+        const size_t lost = blocks - (size_t)(got > 0 ? got : 0);
+        if (lost)
+            fprintf(stderr, "mynah-slm: %zu malformed tool call%s discarded\n",
+                    lost, lost == 1 ? "" : "s");
+        mynah_slm_tool_calls_free(parsed, kept);
+    }
 
     if (!o->quiet) {
         char line[256];
@@ -304,8 +389,10 @@ static int cmd_run(run_opts *o) {
     }
 
     free(col.buf);
+    free(calls.buf);
     free(ids);
     free(text);
+    mynah_slm_tools_free(tools);
     mynah_slm_sampler_free(sam);
     mynah_slm_state_free(&st);
     mynah_slm_tokenizer_free(tok);
@@ -335,6 +422,7 @@ int main(int argc, char **argv) {
             if      (!strcmp(a, "-m"))          { NEEDV(); o.model = v; }
             else if (!strcmp(a, "-p"))          { NEEDV(); o.prompt = v; }
             else if (!strcmp(a, "--system"))    { NEEDV(); o.system = v; }
+            else if (!strcmp(a, "--tools"))     { NEEDV(); o.tools_path = v; }
             else if (!strcmp(a, "-n"))          { NEEDV(); o.max_new = atoi(v); }
             else if (!strcmp(a, "--ctx"))       { NEEDV(); o.ctx = atoi(v); }
             else if (!strcmp(a, "-t") || !strcmp(a, "--threads")) { NEEDV(); o.threads = atoi(v); }
