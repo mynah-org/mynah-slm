@@ -314,9 +314,19 @@ static int cmd_ppl(const char *model_path, const char *path, int threads,
 
     if (scored == 0) { fprintf(stderr, "mynah-slm: nothing scored\n"); return 1; }
     const double mean = nll / (double)scored;
-    printf("k=%-4s v=%-4s  tokens %ld  nll %.5f  ppl %.3f  kv %.1f MB\n",
+
+    /* Bits per BYTE as well as perplexity, because perplexity is per TOKEN and
+     * two models with different tokenizers do not agree on what a token is.
+     * A vocabulary that splits Japanese into more pieces gets an easier job per
+     * piece and a flattering perplexity; bits/byte is the same question asked
+     * of the same text. (The first token is not scored, so its bytes are
+     * counted but not predicted — a sub-1% bias on a passage this size, and
+     * the same bias for both models.) */
+    const size_t n_bytes = strlen(text);
+    printf("k=%-4s v=%-4s  tokens %ld  nll %.5f  ppl %.3f  bits/byte %.4f  kv %.1f MB\n",
            mynah_slm_kv_type_name(kv_k), mynah_slm_kv_type_name(kv_v),
            scored, mean, exp(mean),
+           n_bytes ? (nll / 0.6931471805599453) / (double)n_bytes : 0.0,
            (double)mynah_slm_kv_bytes(&st.kv) / (1024.0 * 1024.0));
 
     free(logits); free(ids); free(text);

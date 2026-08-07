@@ -64,6 +64,7 @@ Qwen3-0.6B is implemented and validated; Gemma 4 is not started.
 | HTTP server: `/health`, `/v1/models`, `/v1/chat/completions` (+SSE), `/v1/tokenize` | ✅ |
 | Tool calling: schemas in, calls out, second turn, SSE | ✅ prompt byte-identical to HF; **26/30** with `--think on`, 21/30 without ([docs/tools.md](docs/tools.md)) |
 | Constrained decoding (`strict` mode, JSON schema) | ❌ not written |
+| Second model family: **Granite 4.0 350m** (dense) | ✅ runs — muP scalars, interleaved RoPE, its own chat template, all config-driven |
 | Gemma 4 E2B (v0.2) | ❌ not started |
 
 Speed, on an M-series Mac with `Qwen3-0.6B-Q4_K_M` staged locally — decode
@@ -85,6 +86,7 @@ pipe into `mynah-tts`. `--quiet` is the only thing that hides it.
 | | Model | Why |
 |---|---|---|
 | Baseline | **Qwen3-0.6B / 1.7B / 4B** (Apache 2.0) | dense GQA + QK-norm, 100+ languages, `/think` `/no_think`, tool calling |
+| Light / agentic | **Granite 4.0 350m** (Apache 2.0) | **runs today.** Better at tool calling (27/30 vs 25/30, and no thinking tax), a quarter of the KV cache, 226 MB at Q4. Weaker multilingual — 27% behind on Italian. [The full comparison](docs/models.md#granite-40-350m--the-light-alternative-measured-against-qwen3) |
 | Production | **Gemma 4 E2B-it QAT Q4_0** (Apache 2.0) | 2.3B effective, 35+ languages, native tool calling, built-in reasoning, 128K context |
 
 Text tower only — the vision and audio towers in the Gemma checkpoint are
