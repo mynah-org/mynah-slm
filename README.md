@@ -86,7 +86,7 @@ pipe into `mynah-tts`. `--quiet` is the only thing that hides it.
 | | Model | Why |
 |---|---|---|
 | Baseline | **Qwen3-0.6B / 1.7B / 4B** (Apache 2.0) | dense GQA + QK-norm, 100+ languages, `/think` `/no_think`, tool calling |
-| Light / agentic | **Granite 4.0 350m** (Apache 2.0) | **runs today.** Better at tool calling (27/30 vs 25/30, and no thinking tax), a quarter of the KV cache, 226 MB at Q4. Weaker multilingual — 27% behind on Italian. [The full comparison](docs/models.md#granite-40-350m--the-light-alternative-measured-against-qwen3) |
+| Light / agentic | **Granite 4.0 350m** (Apache 2.0) | **runs today.** Better at tool calling (27/30 at Q8_0 vs 25/30, and no thinking tax), a quarter of the KV cache, 226 MB and 47 tok/s at Q4. Weaker multilingual — 27% behind on Italian. [The full comparison](docs/models.md#granite-40-350m--the-light-alternative-measured-against-qwen3), including [the Q4/Q5/Q6/Q8 ladder](docs/models.md#the-quantization-ladder--is-there-a-middle-ground) |
 | Production | **Gemma 4 E2B-it QAT Q4_0** (Apache 2.0) | 2.3B effective, 35+ languages, native tool calling, built-in reasoning, 128K context |
 
 Text tower only — the vision and audio towers in the Gemma checkpoint are

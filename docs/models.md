@@ -187,13 +187,91 @@ which says the 12-language claim is about what IBM validated, not a hard edge.
 whose first language is Italian. Note also that this compares Granite at Q8_0
 against Qwen3 at Q4_K_M — Qwen3 at Q8_0 would widen the gap further.
 
+### The quantization ladder — is there a middle ground?
+
+The Q4-versus-Q8 gap above invites an obvious question: does Q5_K_M or Q6_K buy
+the quality without the size? All four are the SAME build
+(`ibm-granite/granite-4.0-350m-GGUF`), which is the precondition for the
+comparison meaning anything. Interleaved, **mean of three** rounds, staged
+locally, M1, 8 threads. (The speed table further up reports best-of-three, so
+its Q4_K_M reads 49.3 where this one reads 47.4 — same runs, different
+statistic. Means are used here because the question is a ranking across four
+close candidates, where one lucky round would decide it.)
+
+| | Q4_K_M | Q5_K_M | Q6_K | Q8_0 |
+|---|---|---|---|---|
+| file | **226 MB** | 252 MB | 279 MB | 361 MB |
+| bits/weight | 5.30 | 5.91 | 6.57 | 8.50 |
+| decode, short | **47.4 tok/s** | 34.4 | 42.2 | 34.0 |
+| decode at 2.3K | **37.2 tok/s** | 28.5 | 33.5 | 27.9 |
+| prefill at 2.3K | **303.6 tok/s** | 297.2 | 286.2 | 303.3 |
+| bits/byte, mean of 16 langs | 1.8928 | 1.8094 | 1.7936 | **1.7800** |
+| tool calls | 25/30 | 23/30 | 22/30 | **27/30** |
+
+**Prefill barely moves** — 286 to 304 tok/s across a ladder that spans 60% more
+bits. That is the expected shape, not an anomaly: prefill dequantizes a row
+strip and hands it to `sgemm`, so it is compute-bound and the weight format
+only changes the strip-filling cost. Decode reads the whole weight set per
+token and is bandwidth-bound, which is why the same ladder spreads it 34 to 47.
+
+**Two things here disagree, and the disagreement is the finding.**
+
+Perplexity is monotone and behaves exactly as theory says: every extra bit
+helps, with sharply diminishing returns. Q4→Q5 closes 74% of the whole Q4→Q8
+quality gap; Q5→Q6 another 14%; Q6→Q8 the last 12%. By that instrument **Q6_K
+is within 0.8% of Q8_0** and is a genuine middle ground.
+
+The tool-call score is NOT monotone: 25, 23, 22, 27. A score cannot legitimately
+fall and then rise as precision increases, so at least part of that ordering is
+noise. It is: 30 binary decisions give a 95% interval of roughly **±4.5 cases**,
+which makes Q4, Q5 and Q6 statistically indistinguishable from one another.
+Only the Q8_0 lead (5 cases over Q6_K) reaches the edge of what this suite can
+resolve, and "at the edge" is not "established". **The honest reading is that
+the eval has 30 cases and cannot rank the middle of this ladder** — reported
+here rather than smoothed over, because picking Q6_K over Q4_K_M on a 22-vs-25
+that is within noise would be picking on nothing.
+
+What the failure MODES show is more useful than the totals: Q4_K_M errs by
+staying silent (4 answered instead of calling), while Q5_K_M and Q6_K err by
+over-calling (6 spurious calls each, on 15 negative cases). More bits made the
+model more eager, not more accurate — and eagerness is the correctable one.
+
+**Q5_K_M is the one to skip.** Not strictly dominated — it is 27 MB smaller
+than Q6_K, and that is the only thing it buys. For those 27 MB it gives up 19%
+of the decode rate (34.4 against 42.2) and comes out worse on perplexity too,
+which is the unusual part: it is beaten by a file with MORE bits on both axes
+at once. That is not a bits effect, it is a kernel effect, and `make bench`
+localizes it: on the identical `ffn_gate` shape Q5_K moves **13.9 G elem/s
+against Q6_K's 16.3**, both on ingot's NEON path. Unpacking 5 bits from a
+nibble plane plus a separate one-bit plane costs more ALU per weight than
+Q6_K's 4+2 split; fewer bits on disk, more work per weight.
+
+The same measurement explains why Q4_K_M is so far ahead of everything —
+**and it is not only the bits.** Q4_K is the one type we have written a matvec
+for, and it beats ingot's by 1.3–1.7x on every layer tensor. Q5_K, Q6_K and
+Q8_0 have no kernel of ours to call, so they land within noise of ingot
+(0.8–1.2x, scattered either side of 1.0 with no consistent win). Q4_K_M's speed
+is a kernel we own as much as a format we chose.
+
+That locates where the remaining time sits, with a number on it: in a Q4_K_M
+decode step, **46% of the matvec time is spent on Q6_K tensors** (`attn_v`,
+`ffn_down`, and the tied `lm_head`) running ingot's kernel rather than ours.
+
+Whether writing our own would win there is **not** established, and docs/perf.md
+argues for caution: ingot's Q6_K matvec was rewritten upstream and is already
+efficient per element — 24.2 G elem/s on this model's head, above every Q4_K
+tensor here. The honest statement is that 46% of the step is on code we have
+not tried to beat, which makes it the place to measure next, not a speedup
+already banked.
+
 ### The verdict, and it is a split one
 
 | use it for | model |
 |---|---|
 | tool calling and agent loops | **granite-350m Q8_0** — better decisions, no thinking tax, smaller KV |
 | multilingual chat and summarization | **Qwen3-0.6B** — better on 14 of 16 languages, and by 27% on Italian |
-| the smallest thing that still works | **granite-350m Q4_K_M** — 226 MB, 49 tok/s, 25/30 on tools |
+| the smallest thing that still works | **granite-350m Q4_K_M** — 226 MB, 47 tok/s, 25/30 on tools |
+| a middle ground | **granite-350m Q6_K** if you want one — within 0.8% of Q8_0 on perplexity, 24% faster, 82 MB smaller. Not Q5_K_M, which is dominated |
 
 **Qwen3-0.6B stays the v0.1 default**, because the ASR→SLM→TTS pipeline this
 engine exists for is multilingual first and Italian in particular, and that is
@@ -201,12 +279,29 @@ exactly where Granite is weakest. Granite is documented as the light/agentic
 alternative rather than the default — and if the priority ever inverts toward
 footprint, the measurement to re-run is this page.
 
-Granite's real cost is the quantization cliff: 27/30 needs Q8_0 at 361 MB,
-which is no longer light. At Q4_K_M it is 226 MB and 25/30 — the same score as
-Qwen3, at 60% of the size and 1.4x the speed, but with the language gap intact.
+Granite's cost sits in the quantization choice: the 27/30 was measured at Q8_0,
+361 MB, which is no longer light. At Q4_K_M it is 226 MB and 25/30 — the same
+score as Qwen3, at 60% of the size and 1.5x the speed, but with the language
+gap intact.
+
+**An earlier version of this page called that a "cliff". The ladder above says
+it is not one.** Perplexity across Q4/Q5/Q6/Q8 is a smooth curve with ordinary
+diminishing returns, and the apparent cliff was an artifact of reading a
+30-case tool eval as though it could resolve 2 cases. What survives is the
+weaker and better-supported claim: Q8_0 is the best of the four on both
+instruments, and how much that is worth depends on whether 135 MB and 28% of
+the decode rate buy more than they cost for a given deployment.
 
 ### Traps, for whoever ports the next family
 
+- **`granite-4.0-h-350m` is a DIFFERENT MODEL, not a variant name.** The `-h-`
+  repo is the Mamba-2 hybrid: arch `granitehybrid`, 32 blocks, SSM layers,
+  `head_count_kv` genuinely varying per layer (0 on the SSM ones). The dense
+  350m we run is `ibm-granite/granite-4.0-350m-GGUF`, arch `granite`, 28
+  blocks. Both ship files named `granite-4.0-...` and only the repo tells them
+  apart. We load the hybrid far enough to reject it by name — the
+  "head_count_kv varies per layer" refusal in `src/model.c` is what catches it,
+  which is the argument for refusing rather than reading element 0.
 - **Interleaved RoPE, not NeoX split-half.** llama.cpp's converter permutes q
   and k for Llama-family checkpoints; Granite inherits that path. Both variants
   produce fluent English: perplexity 412 wrong against 122 right on one
