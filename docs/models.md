@@ -117,10 +117,10 @@ locally. Ratios travel; absolutes do not (see docs/perf.md).
 | | Qwen3-0.6B Q4_K_M | granite-350m **Q8_0** | granite-350m Q4_K_M |
 |---|---|---|---|
 | file | 378 MB | 361 MB | **226 MB** |
-| decode, short context | 31.5 tok/s | **54.8** | 42.2 |
-| decode at 2.3K context | 23.8 tok/s | **39.6** | 35.8 |
-| prefill at 2.3K context | 227 tok/s | 290 | **302** |
-| TTFT, tool-calling turn (~200 tok) | 545 ms | 446 ms | **398 ms** |
+| decode, short context | 32.2 tok/s | **55.8** | 39.5 |
+| decode at 2.3K context | 22.3 tok/s | **39.7** | 36.0 |
+| prefill at 2.3K context | 223 tok/s | **301** | 298 |
+| TTFT, tool-calling turn (~200 tok) | 532 ms | 397 ms | **392 ms** |
 | KV cache per position | 1024 floats | **256** | **256** |
 | vocabulary (= LM head rows) | 151936 | **100352** | **100352** |
 
@@ -207,26 +207,31 @@ close candidates, where one lucky round would decide it.)
 |---|---|---|---|---|
 | file | **226 MB** | 252 MB | 279 MB | 361 MB |
 | bits/weight | 5.30 | 5.91 | 6.57 | 8.50 |
-| decode, short | 42.2 tok/s | 33.0 | 39.1 | **54.8** |
-| decode at 2.3K | 35.8 tok/s | 28.9 | 32.3 | **39.6** |
-| prefill at 2.3K | **301.5 tok/s** | 296.3 | 286.4 | 289.8 |
+| decode, short | 39.5 tok/s | 38.4 | 39.5 | **55.8** |
+| decode at 2.3K | 36.0 tok/s | 31.6 | 33.6 | **39.7** |
+| prefill at 2.3K | 298.0 tok/s | 296.1 | 287.0 | **301.1** |
 | bits/byte, mean of 16 langs | 1.8928 | 1.8094 | 1.7936 | **1.7800** |
 | tool calls | 25/30 | 23/30 | 22/30 | **27/30** |
 
-**The speed rows were re-measured after a kernel fix and they inverted.** Q8_0
-used to read 34.0 tok/s here and was the slowest of the four; ingot had no
-vector matvec for it on either architecture and it was round-tripping every
-block through a scratch array (docs/perf.md). With that fixed it went to 54.8 —
-**+61% while every other model in the same interleaved round drifted DOWN 5-10%
-on a warming machine**, which is what makes the number believable: the controls
-moved together and one row moved against them.
+**Two of these speed rows moved after kernel work in ingot, and the ladder
+changed shape twice.** Q8_0 read 34.0 here and was the SLOWEST of the four:
+ingot had no vector matvec for it on either architecture and was round-tripping
+every block through a scratch array. Q5_K_M read 34.4 and was 25% behind its
+neighbours: its NEON kernel materialized each weight instead of distributing
+the sum, and x86 had no kernel at all. Both fixed upstream (docs/perf.md).
 
-So the ladder no longer has a speed-versus-quality trade at all. **Q8_0 is now
-the best on both axes** — lowest bits/byte, best tool score, and the fastest to
-decode — and the only thing it costs is 135 MB of file. That follows from what
-the kernel work established: this decode is ALU-bound rather than
+Absolutes drift — Q4_K_M reads 39.5 in this round against 47.4 in the first,
+same binary, warmer machine — so only compare WITHIN a round. Within this one:
+
+- **Q8_0 +64%**, from last place to first by a wide margin.
+- **Q5_K_M +12%**, from 25% behind its neighbours to level with them.
+
+So the ladder no longer has a speed-versus-quality trade at all. **Q8_0 is best
+on every measured axis** — lowest bits/byte, best tool score, fastest decode —
+and costs only 135 MB of file. That follows from what the kernel work
+established rather than contradicting it: this decode is ALU-bound, not
 bandwidth-bound, so the format that decodes with ONE multiply beats the ones
-that reassemble weights from three bit planes, even though it reads more bytes.
+that reassemble weights from bit planes, even reading 1.6x the bytes.
 
 **Prefill barely moves** — 286 to 304 tok/s across a ladder that spans 60% more
 bits. That is the expected shape, not an anomaly: prefill dequantizes a row
@@ -256,15 +261,16 @@ staying silent (4 answered instead of calling), while Q5_K_M and Q6_K err by
 over-calling (6 spurious calls each, on 15 negative cases). More bits made the
 model more eager, not more accurate — and eagerness is the correctable one.
 
-**Q5_K_M is the one to skip.** Not strictly dominated — it is 27 MB smaller
-than Q6_K, and that is the only thing it buys. For those 27 MB it gives up 19%
-of the decode rate (34.4 against 42.2) and comes out worse on perplexity too,
-which is the unusual part: it is beaten by a file with MORE bits on both axes
-at once. That is not a bits effect, it is a kernel effect, and `make bench`
-localizes it: on the identical `ffn_gate` shape Q5_K moves **13.9 G elem/s
-against Q6_K's 16.3**, both on ingot's NEON path. Unpacking 5 bits from a
-nibble plane plus a separate one-bit plane costs more ALU per weight than
-Q6_K's 4+2 split; fewer bits on disk, more work per weight.
+**Q5_K_M used to be the one to skip, and that is no longer true** — kept here
+because it is the clearest case on this page of a *kernel* masquerading as a
+*format*. It read 34.4 against Q6_K's 42.2 while being 27 MB SMALLER, and
+`make bench` localized it: on the identical `ffn_gate` shape Q5_K moved 13.9
+G elem/s against Q6_K's 16.3. Not a bits effect — Q5_K's NEON kernel was the
+only K-quant still building each weight before using it (multiply by d*scale,
+subtract dmin*min, then the multiply-add) instead of distributing the sum the
+way Q4_K does. Rewritten upstream, it runs at **17.5 G elem/s** and the model
+went 34.4 -> 38.4 tok/s, level with its neighbours. A format that looked
+dominated was a kernel nobody had measured.
 
 The same measurement explains why Q4_K_M is so far ahead of everything —
 **and it is not only the bits.** Q4_K is the one type we have written a matvec
@@ -293,7 +299,7 @@ llama.cpp by ingot's own suite. Full arc in docs/perf.md.
 | tool calling and agent loops | **granite-350m Q8_0** — better decisions, no thinking tax, smaller KV, and since the kernel fix the fastest of the four to decode |
 | multilingual chat and summarization | **Qwen3-0.6B** — better on 14 of 16 languages, and by 27% on Italian |
 | the smallest thing that still works | **granite-350m Q4_K_M** — 226 MB, 47 tok/s, 25/30 on tools |
-| the smallest file that is still good | **granite-350m Q6_K** — within 0.8% of Q8_0 on perplexity for 82 MB less. It is no longer the *fast* middle ground: since the Q8_0 kernel landed, Q8_0 decodes faster than it. Not Q5_K_M, which loses on every axis but size |
+| the smallest file that is still good | **granite-350m Q6_K** — within 0.8% of Q8_0 on perplexity for 82 MB less. No longer the *fast* middle ground: Q8_0 now decodes faster than it. Q5_K_M is a legitimate point again too, 27 MB smaller at the same speed |
 
 **Qwen3-0.6B stays the v0.1 default**, because the ASR→SLM→TTS pipeline this
 engine exists for is multilingual first and Italian in particular, and that is

@@ -261,6 +261,49 @@ Q4_K_M. It is ALU-bound, so the format that costs one multiply per weight beats
 the ones that cost a bit-plane reassembly, and the extra bytes are affordable.
 The formats were never the ranking; the kernels were.
 
+## Q5_K: a format that looked dominated was a kernel nobody had measured
+
+The quantization ladder in docs/models.md had an entry that made no sense.
+Q5_K_M decoded at 34.4 tok/s while Q6_K — a bigger file, more bits per weight —
+did 42.2. A format cannot cost more time AND less space than the one above it
+unless something other than the format is doing the work.
+
+`make bench` put it on one line: on the identical `ffn_gate` shape, **Q5_K
+moved 13.9 G elem/s against Q6_K's 16.3**, both on ingot's NEON path.
+
+Q5_K's kernel was the last K-quant still building each weight before using it —
+multiply by `d*scale`, subtract `dmin*min`, then the multiply-add that actually
+matters — which is the exact form `src/qmat.c` replaced for Q4_K months ago.
+Distribute the sum instead:
+
+```
+SUM_j w_j x_j  =  d*scale * SUM_j (q_j x_j)  -  dmin*min * SUM_j x_j
+```
+
+The quants accumulate against the input, the inputs accumulate on their own,
+and scale and min apply once per 32-weight sub-block rather than once per
+weight. Folded into a running vector with `vmlaq_n_f32`, the min term as a
+negative multiplier since NEON has no `vmlsq_n_f32`, so a block still costs one
+horizontal reduction. Fewer roundings, not more.
+
+x86 got the first Q5_K kernel it has ever had, same identity. NEON's `vtst_u8`
+has no one-instruction x86 twin, so the 5th bit costs three ops there: AND the
+selector, compare-equal against zero, `andnot` against 16.
+
+| Granite Q5_K_M, ARM, 8 threads | before | after | |
+|---|---|---|---|
+| `ffn_gate` `[2048 x 1024]` | 13.9 G elem/s | **17.5** | 1.26x |
+| `attn_out` `[1024 x 1024]` | 10.3 G elem/s | **15.5** | 1.51x |
+| **end-to-end decode** | 34.4 tok/s | **38.4** | **1.12x** |
+
+Which closes the anomaly: Q5_K_M now sits level with Q4_K_M and Q6_K (38.4
+against 39.5 and 39.5 in one interleaved round) while staying 27 MB smaller
+than Q6_K. **The page used to call it "the rung to skip". It was not the rung.**
+
+Upstream as ingot `Q5_K: distribute the sum, and an AVX2 kernel where there was
+none`. Held at 8.91e-07 against dequant-then-dot on ARM, 1.90e-06 as x86_64
+with AVX2 live.
+
 ## The Q6_K kernel that ended up in ingot instead
 
 This one is worth reading as a whole, because it ends somewhere other than
