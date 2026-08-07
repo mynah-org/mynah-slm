@@ -17,6 +17,8 @@ Each is one line:
     <name>\\t<rendered prompt, with \\n \\t \\r \\\\ escaped>
 
     uv run --extra fixtures python gen_chat_fixture.py > ../tests/fixtures/chat_tools.txt
+    uv run --extra fixtures python gen_chat_fixture.py ../reference/granite-4.0-350m \
+        > ../tests/fixtures/chat_tools_granite.txt
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ import sys
 
 from transformers import AutoTokenizer
 
-REF = os.path.join(os.path.dirname(__file__), "..", "reference", "qwen3-0.6b")
+DEFAULT_REF = os.path.join(os.path.dirname(__file__), "..", "reference", "qwen3-0.6b")
 
 WEATHER = {
     "type": "function",
@@ -118,14 +120,21 @@ def escape(s: str) -> str:
 
 
 def main() -> int:
-    tok = AutoTokenizer.from_pretrained(REF)
+    # Which family to render. The cases are the same either way — that is the
+    # point of the fixture: two templates, one set of situations, and the C
+    # renderer has to match both byte for byte.
+    ref = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_REF
+    tok = AutoTokenizer.from_pretrained(ref)
     for name, kw in CASES:
+        extra = {}
+        if "enable_thinking" in (tok.chat_template or ""):
+            extra["enable_thinking"] = kw["enable_thinking"]
         text = tok.apply_chat_template(
             kw["messages"],
             tools=kw["tools"],
             add_generation_prompt=True,
-            enable_thinking=kw["enable_thinking"],
             tokenize=False,
+            **extra,
         )
         print(f"{name}\t{escape(text)}")
     print(f"{len(CASES)} cases", file=sys.stderr)

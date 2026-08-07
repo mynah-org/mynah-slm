@@ -92,17 +92,22 @@ static void diff_report(const char *name, const char *want, const char *got) {
     printf("       got  ...%.60s\n", got + from);
 }
 
+/* Which family the cases below are rendered with. Set per fixture file. */
+static const mynah_slm_chat_family *family;
+
 static void render_case(const char *name, const mynah_slm_message *msgs, size_t n,
                         const mynah_slm_tool *tools, size_t n_tools,
                         mynah_slm_think think) {
     const char *want = expected(name);
     if (!want) { check(name, 0, "case missing from the fixture"); return; }
 
-    const long need = mynah_slm_render_chat_tools(msgs, n, tools, n_tools, think, NULL, 0);
+    const long need = mynah_slm_render_chat_tools(family, msgs, n, tools, n_tools,
+                                                  think, NULL, 0);
     if (need < 0) { check(name, 0, "render returned an error"); return; }
 
     char *got = malloc((size_t)need + 1);
-    mynah_slm_render_chat_tools(msgs, n, tools, n_tools, think, got, (size_t)need + 1);
+    mynah_slm_render_chat_tools(family, msgs, n, tools, n_tools, think, got,
+                                (size_t)need + 1);
 
     const int ok = strcmp(want, got) == 0;
     check(name, ok, "differs from HF");
@@ -185,7 +190,8 @@ static void test_rendering(void) {
     /* A NULL content is only legal on a turn that carried calls instead. */
     mynah_slm_message bad = { MYNAH_SLM_ROLE_USER, NULL, NULL, 0 };
     check("a message with no content is rejected",
-          mynah_slm_render_chat_tools(&bad, 1, NULL, 0, MYNAH_SLM_THINK_OFF, NULL, 0) < 0,
+          mynah_slm_render_chat_tools(family, &bad, 1, NULL, 0,
+                                      MYNAH_SLM_THINK_OFF, NULL, 0) < 0,
           "rendered a message that has nothing in it");
 }
 
@@ -353,17 +359,31 @@ static void test_tool_set(void) {
           mynah_slm_tools_parse("[]", 2, err, sizeof err) == NULL, err);
 }
 
-int main(int argc, char **argv) {
-    const char *fixture = argc > 1 ? argv[1] : "tests/fixtures/chat_tools.txt";
-
+/* One fixture per family, the SAME ten situations in each. Two templates
+ * rendered from one set of cases is what makes the family table credible: if
+ * the renderer had a Qwen-shaped assumption baked in, Granite would show it. */
+static int run_family(const char *arch, const char *fixture) {
+    for (size_t i = 0; i < n_fx; i++) { free(fx_name[i]); free(fx_text[i]); }
+    n_fx = 0;
     if (load_fixture(fixture) != 0) {
         printf("FAIL cannot open %s (uv run --extra fixtures python "
                "gen_chat_fixture.py)\n", fixture);
-        return 1;
+        failures++;
+        return -1;
     }
-    printf("     %zu rendering cases from %s\n\n", n_fx, fixture);
-
+    printf("-- %s, %zu cases from %s --\n", arch, n_fx, fixture);
+    family = mynah_slm_chat_family_for(arch);
     test_rendering();
+    printf("\n");
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    const char *fixture = argc > 1 ? argv[1] : "tests/fixtures/chat_tools.txt";
+    const char *granite = argc > 2 ? argv[2] : "tests/fixtures/chat_tools_granite.txt";
+
+    run_family("qwen3", fixture);
+    run_family("granite", granite);
     printf("\n");
     test_parsing();
     printf("\n");

@@ -39,15 +39,31 @@ class Qwen3Config:
         self.d_model = int(kv(p + "embedding_length"))
         self.d_ff = int(kv(p + "feed_forward_length"))
         self.n_heads = int(kv(p + "attention.head_count"))
-        self.n_kv_heads = int(kv(p + "attention.head_count_kv"))
+        # head_count_kv may be declared PER LAYER (Granite inherits the hybrid
+        # config class and writes an array of 28). Uniform is required.
+        kvh = kv(p + "attention.head_count_kv")
+        kvh = np.atleast_1d(kvh)
+        if len(set(int(x) for x in kvh)) != 1:
+            raise ValueError(f"{p}attention.head_count_kv varies per layer")
+        self.n_kv_heads = int(kvh[0])
         # head_dim is its own key on purpose: for Qwen3-0.6B it is 128 while
         # d_model/n_heads would give 64. Deriving it is the classic bug.
-        self.head_dim = int(kv(p + "attention.key_length"))
+        # Granite spells the same thing rope.dimension_count.
+        self.head_dim = int(kv(p + "attention.key_length",
+                               kv(p + "rope.dimension_count")))
         self.n_ctx = int(kv(p + "context_length"))
         # These two are FLOAT32 KVs. Reading them through an integer accessor
         # yields 0 without an error — the same trap that hit inspect --meta.
         self.rms_eps = float(kv(p + "attention.layer_norm_rms_epsilon"))
         self.rope_theta = float(kv(p + "rope.freq_base"))
+
+        # muP scalars. Absent means the family does not use them, so the
+        # defaults are the neutral values — the same contract as src/model.c.
+        self.attn_scale = float(kv(p + "attention.scale", 0.0)) or \
+            1.0 / float(np.sqrt(self.head_dim))
+        self.embed_scale = float(kv(p + "embedding_scale", 1.0))
+        self.residual_scale = float(kv(p + "residual_scale", 1.0))
+        self.logit_scale = float(kv(p + "logit_scale", 1.0)) or 1.0
 
         self.eos_ids = {int(kv("tokenizer.ggml.eos_token_id"))}
         # generation_config.json carries a second terminator that the GGUF does
@@ -101,6 +117,12 @@ class Qwen3Weights:
             raise KeyError(f"tensor not found: {name}")
         return dequantize(t.data, t.tensor_type).astype(np.float32)
 
+    def opt(self, name: str):
+        """Optional tensor. Absent is a legitimate answer — Granite has no
+        QK-norm, and a family without one must be distinguishable from a file
+        that is missing a tensor it should have."""
+        return None if self._t.get(name) is None else self.get(name)
+
     def _layer(self, i: int) -> dict:
         p = f"blk.{i}."
         return {
@@ -109,8 +131,8 @@ class Qwen3Weights:
             "wk": self.get(p + "attn_k.weight"),
             "wv": self.get(p + "attn_v.weight"),
             "wo": self.get(p + "attn_output.weight"),
-            "q_norm": self.get(p + "attn_q_norm.weight"),
-            "k_norm": self.get(p + "attn_k_norm.weight"),
+            "q_norm": self.opt(p + "attn_q_norm.weight"),
+            "k_norm": self.opt(p + "attn_k_norm.weight"),
             "ffn_norm": self.get(p + "ffn_norm.weight"),
             "gate": self.get(p + "ffn_gate.weight"),
             "up": self.get(p + "ffn_up.weight"),

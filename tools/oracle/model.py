@@ -72,7 +72,7 @@ def silu(x: np.ndarray) -> np.ndarray:
     return out
 
 
-def gqa_attention(q, k, v, n_heads, n_kv_heads, head_dim):
+def gqa_attention(q, k, v, n_heads, n_kv_heads, head_dim, scale=None):
     """Causal grouped-query attention.
 
     q is [seq, n_heads, head_dim]; k and v are [seq, n_kv_heads, head_dim].
@@ -80,7 +80,8 @@ def gqa_attention(q, k, v, n_heads, n_kv_heads, head_dim):
     """
     seq = q.shape[0]
     group = n_heads // n_kv_heads
-    scale = 1.0 / np.sqrt(head_dim)
+    if scale is None:
+        scale = 1.0 / np.sqrt(head_dim)
 
     out = np.empty((seq, n_heads, head_dim), dtype=np.float32)
     causal = np.triu(np.full((seq, seq), -np.inf, dtype=np.float32), k=1)
@@ -110,7 +111,10 @@ class Qwen3Model:
         tokens = np.asarray(tokens, dtype=np.int64)
         positions = np.arange(len(tokens), dtype=np.int64)
 
-        x = self.w.embed[tokens].astype(np.float32)   # no sqrt(d_model) scaling
+        x = self.w.embed[tokens].astype(np.float32)
+        # Gemma multiplies by sqrt(d_model), Granite by its own scalar, Qwen3
+        # by nothing. One field, defaulted to 1.
+        x = x * cfg.embed_scale
         if dump is not None:
             dump["embed"] = x.copy()
 
@@ -123,17 +127,22 @@ class Qwen3Model:
 
             # QK-norm: RMSNorm over head_dim, per head. The weights are [128],
             # i.e. head_dim, which is how you can tell from the file alone.
-            q = rms_norm(q, layer["q_norm"], cfg.rms_eps)
-            k = rms_norm(k, layer["k_norm"], cfg.rms_eps)
+            # Granite has none, and absent is not the same as identity-shaped.
+            if layer.get("q_norm") is not None:
+                q = rms_norm(q, layer["q_norm"], cfg.rms_eps)
+            if layer.get("k_norm") is not None:
+                k = rms_norm(k, layer["k_norm"], cfg.rms_eps)
 
             q = rope_neox(q, positions, cfg.rope_theta)
             k = rope_neox(k, positions, cfg.rope_theta)
 
-            a = gqa_attention(q, k, v, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim)
-            x = x + a.reshape(-1, cfg.q_dim) @ layer["wo"].T
+            a = gqa_attention(q, k, v, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim,
+                              cfg.attn_scale)
+            x = x + cfg.residual_scale * (a.reshape(-1, cfg.q_dim) @ layer["wo"].T)
 
             h = rms_norm(x, layer["ffn_norm"], cfg.rms_eps)
-            x = x + (silu(h @ layer["gate"].T) * (h @ layer["up"].T)) @ layer["down"].T
+            x = x + cfg.residual_scale * (
+                (silu(h @ layer["gate"].T) * (h @ layer["up"].T)) @ layer["down"].T)
 
             if dump is not None and i in dump.get("_layers", ()):
                 dump[f"layer{i}"] = x.copy()
@@ -144,7 +153,7 @@ class Qwen3Model:
 
         # Tied embeddings: the LM head IS the embedding matrix. There is no
         # separate output.weight in this checkpoint.
-        logits = x @ self.w.embed.T
+        logits = (x @ self.w.embed.T) / cfg.logit_scale
         if dump is not None:
             dump["logits"] = logits.copy()
         return logits

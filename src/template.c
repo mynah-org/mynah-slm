@@ -5,18 +5,56 @@
 #include <stdio.h>
 #include <string.h>
 
-/* The tool preamble, word for word from the model's own chat template. It is
- * not advice we are giving the model: it is the exact string it was trained
- * against, so every character of it is load-bearing. */
-static const char TOOLS_HEAD[] =
-    "# Tools\n\nYou may call one or more functions to assist with the user "
-    "query.\n\nYou are provided with function signatures within "
-    "<tools></tools> XML tags:\n<tools>";
-static const char TOOLS_TAIL[] =
-    "\n</tools>\n\nFor each function call, return a json object with function "
-    "name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n"
-    "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
-    "</tool_call>";
+/* The preambles, word for word from each model's own chat template. They are
+ * not advice we are giving the model: they are the exact strings it was
+ * trained against, so every character is load-bearing. */
+static const mynah_slm_chat_family CHATML = {
+    .name       = "chatml",
+    .role_open  = "<|im_start|>",
+    .role_close = "\n",
+    .turn_end   = "<|im_end|>\n",
+    .tools_prefix =
+        "# Tools\n\nYou may call one or more functions to assist with the user "
+        "query.\n\nYou are provided with function signatures within "
+        "<tools></tools> XML tags:\n<tools>",
+    .tools_suffix =
+        "\n</tools>\n\nFor each function call, return a json object with function "
+        "name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n"
+        "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
+        "</tool_call>",
+    .default_system = NULL,
+    .think_prefill  = 1,
+};
+
+static const mynah_slm_chat_family GRANITE = {
+    .name       = "granite",
+    .role_open  = "<|start_of_role|>",
+    .role_close = "<|end_of_role|>",
+    .turn_end   = "<|end_of_text|>\n",
+    .tools_prefix =
+        "You are a helpful assistant with access to the following tools. You may "
+        "call one or more tools to assist with the user query.\n\nYou are "
+        "provided with function signatures within <tools></tools> XML tags:\n"
+        "<tools>",
+    .tools_suffix =
+        "\n</tools>\n\nFor each tool call, return a json object with function "
+        "name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n"
+        "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
+        "</tool_call>. If a tool does not exist in the provided list of tools, "
+        "notify the user that you do not have the ability to fulfill the request.",
+    /* Granite always opens with a system turn, cannned when the caller gave
+     * neither one nor tools. Leaving it out is not "no system prompt", it is a
+     * prompt shape the model never saw. */
+    .default_system =
+        "You are a helpful assistant. Please ensure responses are professional, "
+        "accurate, and safe.",
+    .think_prefill = 0,
+};
+
+const mynah_slm_chat_family *mynah_slm_chat_family_for(const char *arch) {
+    if (arch && strcmp(arch, "granite") == 0) return &GRANITE;
+    return &CHATML;
+}
 
 static const char *role_name(mynah_slm_role r) {
     switch (r) {
@@ -61,19 +99,26 @@ static void put_tool(cursor *c, const mynah_slm_tool *t) {
     put(c, "}}");
 }
 
-static void put_turn(cursor *c, mynah_slm_role role, const char *content) {
-    put(c, "<|im_start|>");
-    put(c, role_name(role));
-    put(c, "\n");
-    put(c, content);
-    put(c, "<|im_end|>\n");
+static void put_open(cursor *c, const mynah_slm_chat_family *f, const char *role) {
+    put(c, f->role_open);
+    put(c, role);
+    put(c, f->role_close);
 }
 
-long mynah_slm_render_chat_tools(const mynah_slm_message *msgs, size_t n,
+static void put_turn(cursor *c, const mynah_slm_chat_family *f,
+                     mynah_slm_role role, const char *content) {
+    put_open(c, f, role_name(role));
+    put(c, content);
+    put(c, f->turn_end);
+}
+
+long mynah_slm_render_chat_tools(const mynah_slm_chat_family *f,
+                                 const mynah_slm_message *msgs, size_t n,
                                  const mynah_slm_tool *tools, size_t n_tools,
                                  mynah_slm_think think, char *out, size_t max) {
     if (!msgs && n) return -1;
     if (n_tools && !tools) return -1;
+    if (!f) f = &CHATML;
 
     cursor c = { .buf = out, .max = max, .used = 0 };
 
@@ -83,18 +128,20 @@ long mynah_slm_render_chat_tools(const mynah_slm_message *msgs, size_t n,
     if (head_system && !msgs[0].content) return -1;
 
     if (n_tools) {
-        put(&c, "<|im_start|>system\n");
+        put_open(&c, f, "system");
         if (head_system) { put(&c, msgs[0].content); put(&c, "\n\n"); }
-        put(&c, TOOLS_HEAD);
+        put(&c, f->tools_prefix);
         for (size_t i = 0; i < n_tools; i++) {
             if (!tools[i].name) return -1;
             put(&c, "\n");
             put_tool(&c, &tools[i]);
         }
-        put(&c, TOOLS_TAIL);
-        put(&c, "<|im_end|>\n");
+        put(&c, f->tools_suffix);
+        put(&c, f->turn_end);
     } else if (head_system) {
-        put_turn(&c, MYNAH_SLM_ROLE_SYSTEM, msgs[0].content);
+        put_turn(&c, f, MYNAH_SLM_ROLE_SYSTEM, msgs[0].content);
+    } else if (f->default_system) {
+        put_turn(&c, f, MYNAH_SLM_ROLE_SYSTEM, f->default_system);
     }
 
     for (size_t i = head_system ? 1 : 0; i < n; i++) {
@@ -107,11 +154,11 @@ long mynah_slm_render_chat_tools(const mynah_slm_message *msgs, size_t n,
         switch (m->role) {
             case MYNAH_SLM_ROLE_SYSTEM:
             case MYNAH_SLM_ROLE_USER:
-                put_turn(&c, m->role, content);
+                put_turn(&c, f, m->role, content);
                 break;
 
             case MYNAH_SLM_ROLE_ASSISTANT:
-                put(&c, "<|im_start|>assistant\n");
+                put_open(&c, f, "assistant");
                 put(&c, content);
                 for (size_t k = 0; k < m->n_tool_calls; k++) {
                     if (!m->tool_calls) return -1;
@@ -126,7 +173,7 @@ long mynah_slm_render_chat_tools(const mynah_slm_message *msgs, size_t n,
                     put(&c, m->tool_calls[k].arguments ? m->tool_calls[k].arguments : "{}");
                     put(&c, "}\n</tool_call>");
                 }
-                put(&c, "<|im_end|>\n");
+                put(&c, f->turn_end);
                 break;
 
             case MYNAH_SLM_ROLE_TOOL: {
@@ -137,29 +184,40 @@ long mynah_slm_render_chat_tools(const mynah_slm_message *msgs, size_t n,
                  */
                 const int opens = (i == 0) || (msgs[i - 1].role != MYNAH_SLM_ROLE_TOOL);
                 const int closes = (i + 1 == n) || (msgs[i + 1].role != MYNAH_SLM_ROLE_TOOL);
-                if (opens) put(&c, "<|im_start|>user");
+                /* ChatML opens the turn WITHOUT its trailing newline here — the
+                 * one before <tool_response> is the template's. Granite's
+                 * marker carries its own terminator, so both are just
+                 * role_open + "user" + role_close minus ChatML's newline. */
+                if (opens) {
+                    put(&c, f->role_open);
+                    put(&c, "user");
+                    if (f->role_close[0] != '\n') put(&c, f->role_close);
+                }
                 put(&c, "\n<tool_response>\n");
                 put(&c, content);
                 put(&c, "\n</tool_response>");
-                if (closes) put(&c, "<|im_end|>\n");
+                if (closes) put(&c, f->turn_end);
                 break;
             }
         }
     }
 
-    put(&c, "<|im_start|>assistant\n");
+    put_open(&c, f, "assistant");
 
     /* Qwen3 suppresses reasoning by PRE-FILLING an empty think block rather
      * than by instructing the model not to think — that is what its own
      * template emits for enable_thinking=false, and an instruction would be
-     * something the model could decline. */
-    if (think == MYNAH_SLM_THINK_OFF) put(&c, "<think>\n\n</think>\n\n");
+     * something the model could decline. Families without the mechanism get
+     * nothing rather than an invented equivalent. */
+    if (f->think_prefill && think == MYNAH_SLM_THINK_OFF)
+        put(&c, "<think>\n\n</think>\n\n");
 
     if (c.buf && c.max) c.buf[c.used < c.max ? c.used : c.max - 1] = '\0';
     return (long)c.used;
 }
 
-long mynah_slm_render_chat(const mynah_slm_message *msgs, size_t n,
+long mynah_slm_render_chat(const mynah_slm_chat_family *f,
+                           const mynah_slm_message *msgs, size_t n,
                            mynah_slm_think think, char *out, size_t max) {
-    return mynah_slm_render_chat_tools(msgs, n, NULL, 0, think, out, max);
+    return mynah_slm_render_chat_tools(f, msgs, n, NULL, 0, think, out, max);
 }

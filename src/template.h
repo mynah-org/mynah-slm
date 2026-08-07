@@ -46,10 +46,40 @@ typedef struct {
     size_t                     n_tool_calls;
 } mynah_slm_message;
 
+/* ── families ──────────────────────────────────────────────────────────────
+ * Two so far, and they differ by less than they look. Qwen3 opens a turn with
+ * `<|im_start|>role\n` and closes it with `<|im_end|>`, Granite with
+ * `<|start_of_role|>role<|end_of_role|>` and `<|end_of_text|>`. The tool-call
+ * and tool-response BODIES are byte-identical between them, which is why this
+ * is a table of strings and not a second renderer.
+ *
+ * The fields are what the two templates actually disagree on; anything they
+ * agree on is in the renderer, once. */
+typedef struct {
+    const char *name;
+    const char *role_open;       /* before the role name */
+    const char *role_close;      /* after it */
+    const char *turn_end;        /* closes a turn, newline included */
+    const char *tools_prefix;    /* the preamble before the <tools> list */
+    const char *tools_suffix;    /* the instruction after it */
+    /* Granite emits a canned system turn when the caller supplied neither a
+     * system message nor tools. Qwen3 emits nothing. NULL means nothing. */
+    const char *default_system;
+    /* Qwen3 suppresses reasoning by PRE-FILLING an empty think block. Granite
+     * has no such mechanism, so `think` simply does not apply to it. */
+    int         think_prefill;
+} mynah_slm_chat_family;
+
+/* By `general.architecture`. Unknown families get ChatML, which is what most
+ * of the small-model world emits — stated as a default rather than pretended
+ * to be detection. */
+const mynah_slm_chat_family *mynah_slm_chat_family_for(const char *arch);
+
 /* Render `n` messages plus the assistant's opening. Returns the number of
  * bytes the full rendering needs (excluding the NUL), like snprintf, so a
  * caller can size a buffer with out=NULL. Negative on error. */
-long mynah_slm_render_chat(const mynah_slm_message *msgs, size_t n,
+long mynah_slm_render_chat(const mynah_slm_chat_family *f,
+                           const mynah_slm_message *msgs, size_t n,
                            mynah_slm_think think, char *out, size_t max);
 
 /* The same, with the function schemas the model may call. `tools` goes into
@@ -62,7 +92,8 @@ long mynah_slm_render_chat(const mynah_slm_message *msgs, size_t n,
  * A ROLE_ASSISTANT turn is rendered WITHOUT a reasoning block. HF's template
  * only replays reasoning for the final assistant turn, and we always append
  * the generation prompt instead of ending on one, so the two agree. */
-long mynah_slm_render_chat_tools(const mynah_slm_message *msgs, size_t n,
+long mynah_slm_render_chat_tools(const mynah_slm_chat_family *f,
+                                 const mynah_slm_message *msgs, size_t n,
                                  const mynah_slm_tool *tools, size_t n_tools,
                                  mynah_slm_think think, char *out, size_t max);
 

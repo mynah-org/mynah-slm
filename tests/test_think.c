@@ -66,9 +66,9 @@ int main(int argc, char **argv) {
 
     /* A prompt that reliably makes a reasoning model think first. */
     mynah_slm_message msg = { .role = MYNAH_SLM_ROLE_USER, .content = "Quanto fa 17+25?" };
-    const long need = mynah_slm_render_chat(&msg, 1, MYNAH_SLM_THINK_ON, NULL, 0);
+    const long need = mynah_slm_render_chat(mynah_slm_chat_family_for(mynah_slm_arch(m)), &msg, 1, MYNAH_SLM_THINK_ON, NULL, 0);
     char *text = malloc((size_t)need + 1);
-    mynah_slm_render_chat(&msg, 1, MYNAH_SLM_THINK_ON, text, (size_t)need + 1);
+    mynah_slm_render_chat(mynah_slm_chat_family_for(mynah_slm_arch(m)), &msg, 1, MYNAH_SLM_THINK_ON, text, (size_t)need + 1);
 
     /* With thinking ON the template must NOT pre-fill an empty think block —
      * that is what suppresses reasoning, and it would make this test vacuous. */
