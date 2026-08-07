@@ -292,6 +292,32 @@ per-call specialization belongs. ingot's version then measured *faster* than
 ours, and our copy was deleted. One implementation, validated against
 llama.cpp by ingot's own suite. Full arc in docs/perf.md.
 
+### Below 4 bits: Q2_K does not hold, Q3_K barely does
+
+The quantization policy says to go under 4 bits **when quality holds**, gated by
+a measurement. Here it is, same English passage, same model:
+
+| | file | bits/weight | ppl | bits/byte | decode |
+|---|---|---|---|---|---|
+| Q2_K | 172 MB | 4.02 | **26400** | **3.3801** | 44.9 tok/s |
+| Q3_K_M | 199 MB | 4.65 | 241.3 | 1.8213 | 48.4-49.1 |
+| Q4_K_M | 226 MB | 5.30 | 161.2 | 1.6875 | 39.5 |
+| Q8_0 | 361 MB | 8.50 | **121.7** | **1.5942** | **55.8** |
+
+**Q2_K is destroyed at this size** — twice the bits/byte of Q8_0, a perplexity
+near what a uniform guess over a 100352-token vocabulary gives, and generated
+text that is word salad. Not a candidate, and the 54 MB it saves over Q4_K_M
+were never the question.
+
+Q3_K_M survives. It costs **8% of bits/byte against Q4_K_M to save 27 MB**,
+which is a poor trade at 350M — the sub-4-bit idea needs a bigger model to pay
+off, where the same relative loss buys hundreds of megabytes instead of tens.
+
+Note the `bits/weight` column against the name: a "2-bit" checkpoint of this
+model is **4.02** bits/weight and a "3-bit" one is 4.65, for the same reason the
+Qwen3 census gives 5.24 for a "4-bit" file. A 350M model with a 100352-entry
+vocabulary is dominated by tensors the recipe refuses to push that low.
+
 ### The verdict, and it is a split one
 
 | use it for | model |

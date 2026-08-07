@@ -235,6 +235,74 @@ is the right oracle there because it is cross-checked against llama.cpp), and
 the parity gate still holds at `1.50e-06` on layer 0 with 19/19 argmax
 agreement.
 
+## Q2_K and Q3_K: the last two formats with no kernel at all
+
+After Q8_0, two K-quants were still going through `kquant_apply` on **both**
+architectures — dequantize a 256-float scratch per block, then dot it. 1 KB
+written and re-read per 84 or 110 bytes of weights.
+
+Fused matvecs upstream, NEON and AVX2 for each (ingot `Q2_K and Q3_K: fused
+matvecs`). Both formats share a shape worth stating once: 16 groups of 16
+values, each group taking one scale and mapping to 16 CONTIGUOUS inputs, so a
+group is one accumulator and the scale applies once per 16 weights. Q2_K's min
+term distributes the same way Q4_K's and Q5_K's now do; Q3_K's sign comes from a
+separate high-mask plane, so its quant is 0..3 minus 4 wherever the bit is
+CLEAR — a compare-against-zero and an AND, not a select.
+
+One portability note that shaped both kernels: the 2-bit fields sit at four
+shifts of the same byte and the shift is a **loop variable**, which rules out
+`vshr_n_u8` (constant shift only). NEON's `vshlq_u8` takes a signed shift
+*vector* where negative means right; x86's `_mm256_srli_epi32` takes the
+variable directly but needs the quants widened to 32-bit lanes first. The two
+twins are shaped differently on purpose.
+
+A/B with the same binary and only the archive swapped, ARM, 8 threads:
+
+| | before | after | |
+|---|---|---|---|
+| `ffn_gate` Q2_K `[2048 x 1024]` | 9.30 G elem/s | **17.39** | 1.87x |
+| `ffn_gate` Q3_K `[2048 x 1024]` | 11.00 G elem/s | **19.63** | 1.78x |
+| `ffn_down` Q3_K `[1024 x 2048]` | 11.30 G elem/s | **20.02** | 1.77x |
+| **Q2_K model, end-to-end decode** | 34.9 tok/s | **44.9** | **1.29x** |
+| **Q3_K_M model, end-to-end decode** | 37.1-37.8 tok/s | **48.4-49.1** | **1.32x** |
+
+**The Q3_K_M row is a correction I had to make on myself.** A first pass
+measured it at +2% and I nearly wrote that the kernel barely mattered there.
+That run was not interleaved — two separate builds, one after the other, on a
+machine whose thermal state had moved. Interleaved, three rounds, before and
+after alternating: +32%, and the three pairs agree to within 1%. This is the
+same trap documented at the top of `tests/bench_matvec.c`, walked into again by
+the person who wrote the warning.
+
+With this, **every ggml K-quant in ingot has a fused matvec on both
+architectures.** The scratch round-trip is gone from the library.
+
+### And the quality answer nobody had measured either
+
+CLAUDE.md's quantization policy says to go below 4 bits *when quality holds*,
+gated by measurement rather than vibes. Same English passage, same model, four
+rungs:
+
+| | file | bits/weight | ppl | bits/byte |
+|---|---|---|---|---|
+| Q2_K | 172 MB | 4.02 | **26400** | **3.3801** |
+| Q3_K_M | 199 MB | 4.65 | 241.3 | 1.8213 |
+| Q4_K_M | 226 MB | 5.30 | 161.2 | 1.6875 |
+| Q8_0 | 361 MB | 8.50 | **121.7** | **1.5942** |
+
+**Q2_K does not hold at 350M — it is destroyed**, twice the bits/byte of Q8_0
+and a perplexity near what a uniform guess over a 100352-token vocabulary would
+give. Its generated text is word salad. Q3_K_M survives but costs 8% of
+bits/byte against Q4_K_M to save 27 MB, which is a bad trade at this size.
+
+Worth knowing how that was checked, because the first evidence was misleading:
+the greedy output differed between the old and new kernels, which looks exactly
+like a kernel bug. It was not. All three code paths — fused, ingot's own scalar
+fallback, and the previous build — agree on **nll to six significant figures**
+(10.18112). A model this degenerate is chaotic under greedy decoding, so a
+1e-7 difference flips an argmax and the text diverges. A 24-token sample cannot
+tell a broken kernel from a broken format; perplexity can.
+
 ## Q8_0: the simplest format was the slowest, and a kernel fixed a model choice
 
 `make bench` on the Granite Q8_0 checkpoint said something that could not be
