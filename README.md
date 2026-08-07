@@ -40,8 +40,8 @@ HTTP server. They are composed by the application, never by each other.
   [`ingot`](https://github.com/mynah-org/ingot), converging on one in-memory
   representation right after load
 - **Streaming-first** — token-by-token is the primary API, not an add-on
-- **Tool calling** *(planned)* — the engine will *emit* tool calls and never
-  execute them. Execution belongs to the application
+- **Tool calling** — the engine *emits* tool calls and never executes them.
+  Execution belongs to the application
 
 ## What works today
 
@@ -57,7 +57,8 @@ Qwen3-0.6B is implemented and validated; Gemma 4 is not started.
 | Thinking `off` / `low` / `on`, reasoning kept off stdout | ✅ |
 | Multi-threading | ✅ 3.56x on 8 threads, bit-identical to the serial path |
 | HTTP server: `/health`, `/v1/models`, `/v1/chat/completions` (+SSE), `/v1/tokenize` | ✅ |
-| Tool calling | ❌ not written |
+| Tool calling: schemas in, calls out, second turn, SSE | ✅ prompt byte-identical to HF; **26/30** with `--think on`, 21/30 without ([docs/tools.md](docs/tools.md)) |
+| Constrained decoding (`strict` mode, JSON schema) | ❌ not written |
 | Gemma 4 E2B (v0.2) | ❌ not started |
 
 Speed, on an M-series Mac with `Qwen3-0.6B-Q4_K_M` staged locally — 4.1 → 27.1
@@ -130,6 +131,13 @@ next stage stays clean:
 # think first, say only the answer, straight into TTS
 ./mynah-slm run -m models/Qwen3-0.6B-Q4_K_M.gguf -p "Riassumi in una riga: ..." \
   --think on | mynah-tts speak
+
+# tool calling: schemas in, one JSON line out. The engine never executes them.
+# --think on is worth it here: 26/30 against 21/30 on the decision suite.
+./mynah-slm run -m models/Qwen3-0.6B-Q4_K_M.gguf --think on \
+  --tools docs/examples/weather.json -p "What is the weather in Verona?"
+#> {"tool_calls":[{"index":0,"id":"call_0","type":"function",
+#>   "function":{"name":"get_weather","arguments":"{\"city\": \"Verona\"}"}}]}
 
 # what is actually inside a checkpoint
 ./mynah-slm inspect models/Qwen3-0.6B-Q4_K_M.gguf --tensors Q6_K
