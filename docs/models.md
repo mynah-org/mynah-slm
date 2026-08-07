@@ -117,12 +117,17 @@ locally. Ratios travel; absolutes do not (see docs/perf.md).
 | | Qwen3-0.6B Q4_K_M | granite-350m **Q8_0** | granite-350m Q4_K_M |
 |---|---|---|---|
 | file | 378 MB | 361 MB | **226 MB** |
-| decode, short context | 35.7 tok/s | 34.6 | **49.3** |
-| decode at 2.3K context | 24.1 tok/s | 27.5 | **35.7** |
-| prefill at 2.3K context | 229 tok/s | 302 | **306** |
-| TTFT, tool-calling turn (~200 tok) | 560 ms | 428 ms | **401 ms** |
+| decode, short context | 31.5 tok/s | **54.8** | 42.2 |
+| decode at 2.3K context | 23.8 tok/s | **39.6** | 35.8 |
+| prefill at 2.3K context | 227 tok/s | 290 | **302** |
+| TTFT, tool-calling turn (~200 tok) | 545 ms | 446 ms | **398 ms** |
 | KV cache per position | 1024 floats | **256** | **256** |
 | vocabulary (= LM head rows) | 151936 | **100352** | **100352** |
+
+Re-measured after the Q8_0 kernel landed in ingot (see the ladder below and
+docs/perf.md). **Granite at Q8_0 stopped being the slow-but-good option and
+became the fast one**, which is the rare case of a kernel fix changing a model
+recommendation rather than a benchmark table.
 
 The KV row is the one that matters on a laptop: four times smaller per
 position, so a 32K-token conversation costs a quarter of the memory before any
@@ -202,11 +207,26 @@ close candidates, where one lucky round would decide it.)
 |---|---|---|---|---|
 | file | **226 MB** | 252 MB | 279 MB | 361 MB |
 | bits/weight | 5.30 | 5.91 | 6.57 | 8.50 |
-| decode, short | **47.4 tok/s** | 34.4 | 42.2 | 34.0 |
-| decode at 2.3K | **37.2 tok/s** | 28.5 | 33.5 | 27.9 |
-| prefill at 2.3K | **303.6 tok/s** | 297.2 | 286.2 | 303.3 |
+| decode, short | 42.2 tok/s | 33.0 | 39.1 | **54.8** |
+| decode at 2.3K | 35.8 tok/s | 28.9 | 32.3 | **39.6** |
+| prefill at 2.3K | **301.5 tok/s** | 296.3 | 286.4 | 289.8 |
 | bits/byte, mean of 16 langs | 1.8928 | 1.8094 | 1.7936 | **1.7800** |
 | tool calls | 25/30 | 23/30 | 22/30 | **27/30** |
+
+**The speed rows were re-measured after a kernel fix and they inverted.** Q8_0
+used to read 34.0 tok/s here and was the slowest of the four; ingot had no
+vector matvec for it on either architecture and it was round-tripping every
+block through a scratch array (docs/perf.md). With that fixed it went to 54.8 —
+**+61% while every other model in the same interleaved round drifted DOWN 5-10%
+on a warming machine**, which is what makes the number believable: the controls
+moved together and one row moved against them.
+
+So the ladder no longer has a speed-versus-quality trade at all. **Q8_0 is now
+the best on both axes** — lowest bits/byte, best tool score, and the fastest to
+decode — and the only thing it costs is 135 MB of file. That follows from what
+the kernel work established: this decode is ALU-bound rather than
+bandwidth-bound, so the format that decodes with ONE multiply beats the ones
+that reassemble weights from three bit planes, even though it reads more bytes.
 
 **Prefill barely moves** — 286 to 304 tok/s across a ladder that spans 60% more
 bits. That is the expected shape, not an anomaly: prefill dequantizes a row
@@ -270,10 +290,10 @@ llama.cpp by ingot's own suite. Full arc in docs/perf.md.
 
 | use it for | model |
 |---|---|
-| tool calling and agent loops | **granite-350m Q8_0** — better decisions, no thinking tax, smaller KV |
+| tool calling and agent loops | **granite-350m Q8_0** — better decisions, no thinking tax, smaller KV, and since the kernel fix the fastest of the four to decode |
 | multilingual chat and summarization | **Qwen3-0.6B** — better on 14 of 16 languages, and by 27% on Italian |
 | the smallest thing that still works | **granite-350m Q4_K_M** — 226 MB, 47 tok/s, 25/30 on tools |
-| a middle ground | **granite-350m Q6_K** if you want one — within 0.8% of Q8_0 on perplexity, 24% faster, 82 MB smaller. Not Q5_K_M, which is dominated |
+| the smallest file that is still good | **granite-350m Q6_K** — within 0.8% of Q8_0 on perplexity for 82 MB less. It is no longer the *fast* middle ground: since the Q8_0 kernel landed, Q8_0 decodes faster than it. Not Q5_K_M, which loses on every axis but size |
 
 **Qwen3-0.6B stays the v0.1 default**, because the ASR→SLM→TTS pipeline this
 engine exists for is multilingual first and Italian in particular, and that is
@@ -286,13 +306,17 @@ Granite's cost sits in the quantization choice: the 27/30 was measured at Q8_0,
 score as Qwen3, at 60% of the size and 1.5x the speed, but with the language
 gap intact.
 
-**An earlier version of this page called that a "cliff". The ladder above says
-it is not one.** Perplexity across Q4/Q5/Q6/Q8 is a smooth curve with ordinary
-diminishing returns, and the apparent cliff was an artifact of reading a
-30-case tool eval as though it could resolve 2 cases. What survives is the
-weaker and better-supported claim: Q8_0 is the best of the four on both
-instruments, and how much that is worth depends on whether 135 MB and 28% of
-the decode rate buy more than they cost for a given deployment.
+**An earlier version of this page called that a "cliff", then said the choice
+was 135 MB against 28% of the decode rate. Both are now wrong**, and they are
+kept here because of how they went wrong. The cliff was an artifact of reading
+a 30-case tool eval as though it could resolve 2 cases — perplexity across
+Q4/Q5/Q6/Q8 is a smooth curve. The decode-rate half was true when written and
+was killed by a kernel: Q8_0 had no vector matvec anywhere in ingot, and once
+it did, Q8_0 became the fastest of the four rather than the slowest.
+
+What survives is stronger than either: **Q8_0 wins on every measured axis
+except file size.** The remaining question is only whether 135 MB matters for a
+given deployment, and that is a question a benchmark cannot answer.
 
 ### Traps, for whoever ports the next family
 

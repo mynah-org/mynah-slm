@@ -219,6 +219,48 @@ is the right oracle there because it is cross-checked against llama.cpp), and
 the parity gate still holds at `1.50e-06` on layer 0 with 19/19 argmax
 agreement.
 
+## Q8_0: the simplest format was the slowest, and a kernel fixed a model choice
+
+`make bench` on the Granite Q8_0 checkpoint said something that could not be
+right: the **LM head ran at 14.8 G elem/s**, against Q6_K's 24-30 on the
+identical shape. Q8_0 decodes with one multiply — `w = d * q`, 32 int8 and one
+f16 scale — while Q6_K reassembles every weight from a nibble plane, a 2-bit
+plane and a per-16 scale. The simpler format had no business being half the
+speed.
+
+It was the last K-quant still round-tripping through scratch. `ingot_q8_0_matvec`
+had no vector path **on either architecture** — not NEON, not AVX2 — and went
+through dequantize-a-block-into-a-32-float-array then dot it: 128 bytes written
+and re-read per 34 bytes of weights. The same shape of bug as Q6_K in §2, still
+sitting there because nobody had put a per-tensor measurement next to it.
+
+Fused matvec upstream, NEON and AVX2 (ingot `5379a13`), scale applied once per
+block against the block accumulator, block accumulators folded into a row-level
+vector so a row costs one horizontal reduction:
+
+| Granite Q8_0, ARM, 8 threads | before | after | |
+|---|---|---|---|
+| `lm_head` `[100352 x 1024]` | 6.93 ms | **2.44 ms** | 2.84x |
+| whole matvec decode step | 34.3 ms | **13.7 ms** | 2.50x |
+| **end-to-end decode** | 34.0 tok/s | **54.8 tok/s** | **1.61x** |
+
+The end-to-end number is the one to trust, and it was taken in the same
+interleaved round as three other checkpoints: **every one of them drifted DOWN
+5-10% on a warming machine while Q8_0 went up 61%.** Controls moving together
+while one row moves against them is what separates a kernel from an afternoon.
+
+**This changed a model recommendation, not just a table.** Q8_0 was the
+best-quality rung of the Granite ladder and the slowest; it is now the
+best-quality rung *and the fastest*, ahead of Q4_K_M (54.8 against 42.2). The
+whole ladder in docs/models.md had to be re-measured and two of its conclusions
+retracted.
+
+It also follows from what §2-4 established rather than contradicting it. If this
+decode were bandwidth-bound, Q8_0 could not win — it reads 1.6x the bytes of
+Q4_K_M. It is ALU-bound, so the format that costs one multiply per weight beats
+the ones that cost a bit-plane reassembly, and the extra bytes are affordable.
+The formats were never the ranking; the kernels were.
+
 ## The Q6_K kernel that ended up in ingot instead
 
 This one is worth reading as a whole, because it ends somewhere other than
