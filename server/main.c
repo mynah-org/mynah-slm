@@ -301,12 +301,13 @@ static void handle_chat(server_ctx *c, http_conn *conn,
     const mynah_slm_tool *tool_items = mynah_slm_tools_items(tools);
     const size_t n_tools = mynah_slm_tools_count(tools);
 
-    const long need = mynah_slm_render_chat_tools(rendered, n_msg, tool_items, n_tools,
-                                                  think, NULL, 0);
+    const mynah_slm_chat_family *fam = mynah_slm_chat_family_for(mynah_slm_arch(c->model));
+    const long need = mynah_slm_render_chat_tools(fam, rendered, n_msg, tool_items,
+                                                  n_tools, think, NULL, 0);
     if (need < 0) { http_error(conn, 400, "cannot render these messages"); goto cleanup_msgs; }
     char *text = malloc((size_t)need + 1);
     if (!text) { http_error(conn, 500, "out of memory"); goto cleanup_msgs; }
-    mynah_slm_render_chat_tools(rendered, n_msg, tool_items, n_tools, think,
+    mynah_slm_render_chat_tools(fam, rendered, n_msg, tool_items, n_tools, think,
                                 text, (size_t)need + 1);
 
     const long n_prompt = mynah_slm_tokenize(c->tok, text, 1, NULL, 0);

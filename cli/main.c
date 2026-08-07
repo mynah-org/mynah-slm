@@ -382,11 +382,16 @@ static int cmd_run(run_opts *o) {
 
         const mynah_slm_tool *ts = mynah_slm_tools_items(tools);
         const size_t n_ts = mynah_slm_tools_count(tools);
+        /* The turn markers are the model's, not ChatML's by assumption:
+         * Granite uses <|start_of_role|> and would silently see a prompt shape
+         * it was never trained on. */
+        const mynah_slm_chat_family *fam = mynah_slm_chat_family_for(mynah_slm_arch(m));
 
-        const long need = mynah_slm_render_chat_tools(msgs, n, ts, n_ts, o->think, NULL, 0);
+        const long need = mynah_slm_render_chat_tools(fam, msgs, n, ts, n_ts, o->think, NULL, 0);
         if (need < 0) { fprintf(stderr, "mynah-slm: cannot render the prompt\n"); return 1; }
         text = malloc((size_t)need + 1);
-        if (text) mynah_slm_render_chat_tools(msgs, n, ts, n_ts, o->think, text, (size_t)need + 1);
+        if (text) mynah_slm_render_chat_tools(fam, msgs, n, ts, n_ts, o->think, text,
+                                              (size_t)need + 1);
     }
     if (!text) { fprintf(stderr, "mynah-slm: out of memory\n"); return 1; }
 
