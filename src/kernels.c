@@ -2633,6 +2633,94 @@ static void q8_0_dequant_block(const unsigned char *block, float *output) {
         output[i] = (float)qs[i] * d;
 }
 
+/* ── fused Q8_0 matvec ──────────────────────────────────────────────────────
+ * Q8_0 is the simplest format in the file — 32 int8 and one f16 scale, w = d*q
+ * — and until now it was the SLOWEST per element of the K-quants, because it
+ * was the only one still going through dequantize-a-block-into-scratch and dot
+ * it. That is 128 bytes written and re-read per 34 bytes of weights, and it is
+ * the same round trip the Q6_K commit removed.
+ *
+ * Measured on a 100352 x 1024 LM head at Q8_0: 14.8 G elem/s, against Q6_K's
+ * 24-30 on the identical shape. A format that decodes with one multiply had no
+ * business being half the speed of one that decodes from three bit planes.
+ *
+ * The scale is applied ONCE per 32-weight block against the block accumulator,
+ * and the block accumulators fold into a row-level vector, so a row costs one
+ * horizontal reduction rather than one per block. */
+#if defined(INGOT_HAVE_Q4_K_NEON)
+static int ingot_q8_0_matvec_neon(const void *weights, size_t rows, size_t cols,
+                                  const float *input, float *output) {
+    const size_t blocks = cols / INGOT_Q8_0_K;
+    const size_t row_bytes = blocks * INGOT_Q8_0_BYTES;
+    const unsigned char *source = (const unsigned char *)weights;
+
+    for (size_t row = 0; row < rows; row++) {
+        const unsigned char *row_data = source + row * row_bytes;
+        float32x4_t total = vdupq_n_f32(0.0f);
+
+        for (size_t b = 0; b < blocks; b++) {
+            const unsigned char *block = row_data + b * INGOT_Q8_0_BYTES;
+            const float d = f16_to_f32(read_u16(block));
+            const signed char *qs = (const signed char *)(block + 2);
+            const float *in = input + b * INGOT_Q8_0_K;
+
+            float32x4_t acc = vdupq_n_f32(0.0f);
+            for (int i = 0; i < INGOT_Q8_0_K; i += 16) {
+                const int8x16_t v  = vld1q_s8(qs + i);
+                const int16x8_t lo = vmovl_s8(vget_low_s8(v));
+                const int16x8_t hi = vmovl_s8(vget_high_s8(v));
+                acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))),
+                                vld1q_f32(in + i));
+                acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))),
+                                vld1q_f32(in + i + 4));
+                acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))),
+                                vld1q_f32(in + i + 8));
+                acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi))),
+                                vld1q_f32(in + i + 12));
+            }
+            total = vmlaq_n_f32(total, acc, d);
+        }
+        output[row] = vaddvq_f32(total);
+    }
+    return 0;
+}
+#endif
+
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+static int ingot_q8_0_matvec_avx2(const void *weights, size_t rows, size_t cols,
+                                  const float *input, float *output) {
+    const size_t blocks = cols / INGOT_Q8_0_K;
+    const size_t row_bytes = blocks * INGOT_Q8_0_BYTES;
+    const unsigned char *source = (const unsigned char *)weights;
+
+    for (size_t row = 0; row < rows; row++) {
+        const unsigned char *row_data = source + row * row_bytes;
+        __m256 total = _mm256_setzero_ps();
+
+        for (size_t b = 0; b < blocks; b++) {
+            const unsigned char *block = row_data + b * INGOT_Q8_0_BYTES;
+            const float d = f16_to_f32(read_u16(block));
+            const signed char *qs = (const signed char *)(block + 2);
+            const float *in = input + b * INGOT_Q8_0_K;
+
+            __m256 acc = _mm256_setzero_ps();
+            for (int i = 0; i < INGOT_Q8_0_K; i += 8) {
+                const __m128i v = _mm_loadl_epi64((const __m128i *)(const void *)(qs + i));
+                acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v)),
+                                      _mm256_loadu_ps(in + i), acc);
+            }
+            total = _mm256_fmadd_ps(acc, _mm256_set1_ps(d), total);
+        }
+        __m128 h = _mm_add_ps(_mm256_castps256_ps128(total),
+                              _mm256_extractf128_ps(total, 1));
+        h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+        h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
+        output[row] = _mm_cvtss_f32(h);
+    }
+    return 0;
+}
+#endif
+
 static int ingot_q8_0_matvec_s(const void *weights, size_t rows, size_t cols,
                                      const float *input, float *output) {
     if (weights == NULL || input == NULL || output == NULL || rows == 0 ||
@@ -2658,6 +2746,23 @@ static int ingot_q8_0_matvec_s(const void *weights, size_t rows, size_t cols,
 
 int ingot_q8_0_matvec(const void *weights, size_t rows, size_t cols,
                            const float *input, float *output) {
+    /* The argument check lived only in the scalar body, so it has to happen
+     * before the dispatch now that there is something to dispatch to. */
+    if (weights == NULL || input == NULL || output == NULL || rows == 0 ||
+        cols == 0 || cols % INGOT_Q8_0_K != 0) return -1;
+    {
+        const size_t blocks = cols / INGOT_Q8_0_K;
+        if (blocks > SIZE_MAX / INGOT_Q8_0_BYTES) return -1;
+        if (rows > SIZE_MAX / (blocks * INGOT_Q8_0_BYTES)) return -1;
+    }
+#if defined(INGOT_HAVE_Q4_K_NEON)
+    if (ingot_cpu().neon)
+        return ingot_q8_0_matvec_neon(weights, rows, cols, input, output);
+#endif
+#if defined(INGOT_HAVE_Q4_K_AVX2)
+    if (ingot_cpu().avx2)
+        return ingot_q8_0_matvec_avx2(weights, rows, cols, input, output);
+#endif
     return ingot_q8_0_matvec_s(weights, rows, cols, input, output);
 }
 
