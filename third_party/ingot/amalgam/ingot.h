@@ -405,7 +405,15 @@ ingot_cpu_caps ingot_cpu(void);
 /* Cap the SIMD level by hand: "auto" (default), "scalar", "avx2", "vnni".
  * A level above what the CPU supports is silently downgraded. Returns the
  * effective level (0 scalar, 1 avx2/neon, 2 vnni/dotprod). The environment
- * variable INGOT_CAPS does the same thing without a code change. */
+ * variable INGOT_CAPS does the same thing without a code change.
+ *
+ * INGOT_CAPS_ASSUME=avx2|neon|dotprod|vnni goes the OTHER way: it trusts the
+ * BUILD rather than CPUID, turning on a feature the CPU did not report. Only
+ * what was compiled in can be forced, so it cannot conjure an instruction the
+ * binary does not contain. It exists for emulators that under-report — Rosetta
+ * 2 executes AVX2 without advertising it, and without this the x86 kernels
+ * cannot be exercised on an Apple Silicon machine at all. A testing tool: it
+ * will fault on hardware that genuinely lacks the feature. */
 int ingot_cpu_set_level(const char *name);
 
 /* ── thread injection ───────────────────────────────────────────────────────
@@ -457,6 +465,12 @@ int ingot_q2_k_matvec(const void *weights, size_t rows, size_t cols,
 int ingot_q2_k_dequant(const void *weights, size_t rows, size_t cols, float *output);
 int ingot_q2_k_matmat(const void *weights, size_t rows, size_t cols,
                       const float *input, float *output, size_t tokens);
+
+/* Q4_0: 32 weights in 18 bytes, split-half nibbles biased by 8. What Gemma 4
+ * QAT checkpoints ship as, which is why it has a hand-written kernel. */
+int ingot_q4_0_matvec(const void *weights, size_t rows, size_t cols,
+                      const float *input, float *output);
+int ingot_q4_0_dequant(const void *weights, size_t rows, size_t cols, float *output);
 
 int ingot_q8_0_matvec(const void *weights, size_t rows, size_t cols,
                       const float *input, float *output);
