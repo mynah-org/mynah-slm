@@ -29,9 +29,20 @@ long mynah_slm_generate(mynah_slm_state *st, const mynah_slm_tokenizer *tok,
      * cost — and it is exactly the kind of saving that has to be free of any
      * behaviour change, since the last token's logits are computed the same
      * way either way. */
-    for (size_t i = 0; i + 1 < p->n_prompt; i++) {
-        if (mynah_slm_forward(st, p->prompt[i], NULL) != 0) return -1;
-        mynah_slm_sampler_accept(sam, p->prompt[i]);
+    const size_t n_pre = p->n_prompt - 1;
+    const uint32_t bmax = mynah_slm_batch_max(st);
+    for (size_t i = 0; i < n_pre; ) {
+        size_t take = n_pre - i;
+        if (take > bmax) take = bmax;
+
+        /* One call per batch instead of one per token: the weights are read
+         * once for the whole group, which is the difference between prefill
+         * being memory-bound and being compute-bound. A batch of one falls
+         * back to the single-token path inside forward_batch. */
+        if (mynah_slm_forward_batch(st, p->prompt + i, (uint32_t)take, NULL) != 0)
+            return -1;
+        for (size_t k = 0; k < take; k++) mynah_slm_sampler_accept(sam, p->prompt[i + k]);
+        i += take;
     }
     mynah_slm_timing_end_prefill(t, (uint32_t)p->n_prompt);
 

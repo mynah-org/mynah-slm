@@ -43,6 +43,14 @@ typedef struct {
     float *logits;     /*                          [vocab]    */
     float *embed_row;  /* decoded embedding row    [d_model]  */
 
+    /* ── prefill batch ──────────────────────────────────────────────────────
+     * The same buffers as above, one row per token in the batch, plus the
+     * dequantization strip the batched product needs. Allocated once at init
+     * like everything else: prefill runs inside the token loop too. */
+    uint32_t batch_max;               /* rows these hold */
+    float *bx, *bh, *bq, *battn, *bproj, *bgate, *bup;
+    float *strip;                     /* [STRIP_ROWS * max_cols] */
+
     mynah_slm_final_cb on_embed;   /* the residual stream before layer 0 */
     mynah_slm_layer_cb on_layer;
     mynah_slm_final_cb on_final;
@@ -60,5 +68,23 @@ void mynah_slm_state_reset(mynah_slm_state *s);
  * it. `logits_out` may be NULL when only the cache update matters (prefill of
  * everything but the last token). Returns 0, or -1 with the context full. */
 int  mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out);
+
+/* Advance `n` tokens at once — prefill.
+ *
+ * Same model, same cache, same result to within a summation reorder: the only
+ * difference is that a weight is read once for the whole batch instead of once
+ * per token, which is what turns prefill from memory-bound into compute-bound.
+ * `logits_out` receives the LAST token's logits, the only ones anybody wants
+ * from a prompt.
+ *
+ * n must be <= mynah_slm_batch_max(). n == 1 is forwarded to the one-token
+ * path verbatim, so decode never changes shape. */
+int  mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
+                             uint32_t n, float *logits_out);
+
+/* Rows the batch scratch was sized for. `MYNAH_SLM_BATCH` in the environment
+ * overrides the default — it is how the width gets measured rather than
+ * assumed. */
+uint32_t mynah_slm_batch_max(const mynah_slm_state *s);
 
 #endif /* MYNAH_SLM_ARCH_QWEN3_H */

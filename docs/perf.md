@@ -145,16 +145,78 @@ end-to-end tok/s did not move at all while the microbenchmark showed 2.9x,
 which reads as "the kernel does not matter" rather than "the kernel is not
 there". It is a real prerequisite now.
 
+## Batched prefill: 26 -> 292 tok/s, and TTFT 7.6 s -> 0.85 s
+
+Prefill used to be the decode path in a loop: one token, every weight read,
+repeat. Reading 400 MB of weights to advance one position is the definition of
+memory-bound, and a prompt pays it per token.
+
+`mynah_slm_forward_batch()` runs N tokens at once. A weight strip is
+dequantized once and multiplied against all N activations with `sgemm`
+(`src/qmat.c`), so the weight read is amortized N-fold and the problem stops
+being memory-bound.
+
+Measured, `Qwen3-0.6B-Q4_K_M`, 8 threads, local weights. Two prompt lengths,
+because they are bounded by different things:
+
+**198 tokens** — a tool-calling turn, the interactive case:
+
+| batch | prefill tok/s | TTFT |
+|---|---|---|
+| 1 (the old path) | 26.3 | 7568 ms |
+| 16 | 80.6 | 2501 ms |
+| 32 | 134.1 | 1517 ms |
+| 64 | 184.1 | 1122 ms |
+| **128** (default) | **244.2** | **852 ms** |
+| 256 | 292.2 | 721 ms |
+
+**2275 tokens** — a transcript to summarize, which is what the ASR→SLM→TTS
+pipeline actually does:
+
+| batch | prefill tok/s | TTFT |
+|---|---|---|
+| 1 (the old path) | 21.5 | 105841 ms |
+| 32 | 79.7 | 28596 ms |
+| 64 | 92.4 | 24675 ms |
+| **128** (default) | **101.7** | **22431 ms** |
+| 256 | 107.0 | 21330 ms |
+| 512 | 100.5 | 22691 ms |
+
+**9.3x on a short prompt, 4.7x on a long one — and the gap between those two
+numbers is the next bottleneck talking.** If prefill were still bound by the
+projections, tok/s would not care how long the prompt is. It cares a lot: 292
+at 198 tokens against 107 at 2275. That is attention, which is O(n²) over a
+prompt and is still computed one query at a time. Batching it is the next
+change, and it is the one that matters for summarization.
+
+Decode is unchanged, as it must be: a batch of one goes down the single-token
+path verbatim.
+
+### It is a reorder, and that is checked
+
+`sgemm` sums in its own order, so batched prefill is *not* bit-identical to N
+matvecs. `tests/test_batch.c` holds it to being a reorder and nothing more:
+
+```
+width 128: rel=1.47e-06 at 99734, argmax 576 vs 576, n_past 95 vs 95
+```
+
+1.5e-06 against the 1e-4 the parity gate holds layer 0 to, the same argmax, and
+— separately checked, because wrong K/V positions would still score the prompt
+fine — twelve greedy tokens generated after the prompt, identical either way.
+
+This is also why the product is ours and not `ingot_matmat`: from two tokens up
+ingot's batched Q4_K quantizes the ACTIVATIONS to int8, ~2.4e-3 relative. That
+is 20x this gate. Fine for a container library's general-purpose kernel,
+not fine for a path that has to agree with decode.
+
 ## What has not been done yet
 
-- **Batched prefill.** Prefill currently runs the same one-token path as decode
-  (deliberately — see `arch_qwen3.c`), so it gets no batching benefit. Moving it
-  to `ingot_matmat` should help substantially, with the caveat in ingot's
-  precision contract: from two tokens up, Q4_K/Q5_K batched matmat quantizes
-  activations to int8 by default (rel error ~2.4e-3). That would blow the
-  parity gate's 1e-4 tolerance at layer 0, so the parity path must keep using
-  the exact twins or `INGOT_SDOT=0`. **Not yet wired** — noting it before it
-  becomes a confusing test failure.
+- **Batched attention.** The projections are batched; attention is not. Query t
+  may read exactly `pos+t+1` keys, so a batch is a triangle rather than a
+  rectangle, and sharing the KV read across it is a separate piece of work.
+  The two prefill tables above are the measurement that says it is now the
+  thing worth doing.
 - **SIMD in our own kernels: measured, and mostly not worth it.** See below.
 - **Q4_0 has a kernel now** (NEON + AVX2, 7-10x over the generic path), which
   changes nothing for Qwen3 — it is Q4_K/Q6_K — and everything for Gemma 4,

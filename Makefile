@@ -107,7 +107,7 @@ $(OBJ): | $(INGOT_LIB)
 # test_ingot needs no model: it pins the container-layer contract (block
 # geometry, dequant coverage) so a bad subtree update fails here and not
 # three modules later.
-TESTS := tests/test_ingot tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer tests/test_tools
+TESTS := tests/test_batch tests/test_ingot tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer tests/test_tools
 
 # The parity harness is built like the others but driven separately: it dumps
 # activations, and tools/eval/compare.py is what judges them.
