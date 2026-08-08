@@ -24,6 +24,14 @@ MODELS=(
   # The repo also holds gemma-4-E2B-it-mmproj.gguf — the multimodal projector,
   # which we deliberately do not download: mynah-slm is the text tower only.
   "gemma4-e2b-qat|google/gemma-4-E2B-it-qat-q4_0-gguf|gemma-4-E2B_q4_0-it.gguf|1.5 GB|v0.2 PRODUCTION target — Q4_0 because that is what QAT ships"
+  "granite-350m-q4|ibm-granite/granite-4.0-350m-GGUF|granite-4.0-350m-Q4_K_M.gguf|226 MB|Granite 4.0 350m, the small/fast rung"
+  "granite-350m-q8|ibm-granite/granite-4.0-350m-GGUF|granite-4.0-350m-Q8_0.gguf|361 MB|Granite 4.0 350m — the rung to USE: 27/30 tool calls, and the fastest of the ladder"
+  # LFM2.5 is NOT Apache/MIT: LFM Open License v1.0, commercial use only under
+  # $10M annual revenue. Opt-in candidate (TASKS.md M6b), never a default and
+  # never bundled. See the LICENSE file in the same HF repo before shipping
+  # anything built on it.
+  "lfm2.5-2.6b-q4|LiquidAI/LFM2.5-2.6B-GGUF|LFM2.5-2.6B-Q4_K_M.gguf|1.67 GB|CANDIDATE, non-free license — 22 short-conv + 8 GQA layers, 16 languages"
+  "lfm2.5-2.6b-q8|LiquidAI/LFM2.5-2.6B-GGUF|LFM2.5-2.6B-Q8_0.gguf|2.87 GB|the same at Q8_0, for the quality end of the trial"
 )
 
 DEST_DEFAULT="$(cd "$(dirname "$0")/.." && pwd)/models"
