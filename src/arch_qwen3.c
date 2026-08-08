@@ -147,6 +147,21 @@ int mynah_slm_state_init_kv(mynah_slm_state *s, const mynah_slm_model_t *m,
     s->kv_v = kv_v;
     const mynah_slm_config *c = &m->cfg;
 
+    /* This decoder runs attention layers only. A hybrid family (LFM2: 22 of 30
+     * layers are a short convolution — docs/lfm2-arch.md) loads its config and
+     * binds its tensors perfectly well, and would then arrive here and walk
+     * into a NULL wq. Refuse it by name instead: the container being readable
+     * is not the same as the model being runnable, and the difference has to be
+     * a message rather than a segfault. */
+    for (uint32_t i = 0; i < c->n_layers; i++)
+        if (c->layer_op[i] != MYNAH_SLM_OP_ATTN) {
+            snprintf(err, errsz,
+                     "%s layer %u is a short convolution, which this decoder "
+                     "does not implement yet (%u of %u layers)",
+                     c->arch, i, c->n_layers - c->n_attn_layers, c->n_layers);
+            return -1;
+        }
+
     if (n_ctx == 0 || n_ctx > c->n_ctx) n_ctx = c->n_ctx;
     s->model = m;
     s->n_ctx = n_ctx;

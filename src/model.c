@@ -69,36 +69,68 @@ static int kv_f32(const ingot_gguf *g, const char *arch, const char *suffix,
     return 0;
 }
 
-/* An integer that a family may declare PER LAYER. Granite inherits its config
- * class from the hybrid models, so head_count_kv arrives as an array of 28
- * even when every entry is the same. Accept both shapes, and refuse an array
- * whose entries differ rather than silently taking the first — that would be a
- * different model quietly running. */
-static int kv_u32_uniform(const ingot_gguf *g, const char *arch, const char *suffix,
-                          uint32_t *out, char *err, size_t errsz) {
+/* head_count_kv, which a family may declare as a scalar or PER LAYER, and
+ * which is also where a hybrid family declares its layer map.
+ *
+ * Three shapes exist in the wild:
+ *   scalar             every layer attends, with that many KV heads
+ *   array, all equal   the same thing written per layer (Granite)
+ *   array with ZEROS   a HYBRID: 0 means "this layer is not an attention layer"
+ *
+ * The third is LFM2 — 22 zeros and 8 eights on an irregular pattern
+ * (docs/lfm2-arch.md). This used to be a uniform-only reader that refused any
+ * array whose entries differed, and that was the right refusal for the code as
+ * it stood: taking element 0 would have built a model with ZERO KV heads,
+ * which is not a smaller model but a broken one.
+ *
+ * So this reads the array as the layer map it is, and keeps the old refusal
+ * for the case it was really guarding: non-zero entries that DISAGREE, which
+ * would be a different architecture wearing the same metadata. */
+static int load_layer_map(mynah_slm_config *c, const ingot_gguf *g,
+                          const char *arch, char *err, size_t errsz) {
     char key[128];
-    snprintf(key, sizeof key, "%s.%s", arch, suffix);
+    snprintf(key, sizeof key, "%s.attention.head_count_kv", arch);
     const ingot_kv *kv = ingot_gguf_kv_find(g, key);
     if (!kv) return fail(err, errsz, "missing metadata key: %s", key);
 
-    uint64_t v;
-    if (ingot_kv_u64(kv, &v) == 0) { *out = (uint32_t)v; return 0; }
+    c->layer_op = calloc(c->n_layers, sizeof *c->layer_op);
+    c->kv_slot  = calloc(c->n_layers, sizeof *c->kv_slot);
+    if (!c->layer_op || !c->kv_slot)
+        return fail(err, errsz, "out of memory for the %u-layer map", c->n_layers);
 
+    uint64_t scalar;
     uint64_t n = 0;
-    if (ingot_kv_arr_len(kv, &n) != 0 || n == 0)
+    if (ingot_kv_u64(kv, &scalar) == 0) {
+        c->n_kv_heads = (uint32_t)scalar;          /* homogeneous, the usual case */
+    } else if (ingot_kv_arr_len(kv, &n) == 0 && n > 0) {
+        if (n != c->n_layers)
+            return fail(err, errsz, "%s has %llu entries for %u layers",
+                        key, (unsigned long long)n, c->n_layers);
+        for (uint64_t i = 0; i < n; i++) {
+            int64_t e;
+            if (ingot_kv_arr_i64(kv, i, &e) != 0)
+                return fail(err, errsz, "%s[%llu] is not an integer",
+                            key, (unsigned long long)i);
+            if (e == 0) { c->layer_op[i] = MYNAH_SLM_OP_SHORTCONV; continue; }
+            if (c->n_kv_heads == 0) c->n_kv_heads = (uint32_t)e;
+            else if ((uint32_t)e != c->n_kv_heads)
+                return fail(err, errsz,
+                            "%s disagrees between attention layers (%u vs %u at "
+                            "%llu) - unsupported",
+                            key, c->n_kv_heads, (uint32_t)e,
+                            (unsigned long long)i);
+        }
+        if (c->n_kv_heads == 0)
+            return fail(err, errsz, "%s is all zeros: no attention layer anywhere", key);
+    } else {
         return fail(err, errsz, "%s is neither an integer nor an array", key);
-
-    for (uint64_t i = 0; i < n; i++) {
-        int64_t e;
-        if (ingot_kv_arr_i64(kv, i, &e) != 0)
-            return fail(err, errsz, "%s[%llu] is not an integer",
-                        key, (unsigned long long)i);
-        if (i == 0) *out = (uint32_t)e;
-        else if ((uint32_t)e != *out)
-            return fail(err, errsz,
-                        "%s varies per layer (%u at 0, %u at %llu) - unsupported",
-                        key, *out, (uint32_t)e, (unsigned long long)i);
     }
+
+    /* A conv layer holds no cache, so the caches are numbered separately from
+     * the layers: 8 slots for LFM2's 30 layers. */
+    for (uint32_t i = 0; i < c->n_layers; i++)
+        c->kv_slot[i] = (c->layer_op[i] == MYNAH_SLM_OP_ATTN)
+                      ? c->n_attn_layers++ : MYNAH_SLM_NO_KV;
     return 0;
 }
 
@@ -128,11 +160,18 @@ static int load_config(mynah_slm_config *c, const ingot_gguf *g,
         kv_u32(g, arch, "embedding_length",      &c->d_model,    err, errsz) ||
         kv_u32(g, arch, "feed_forward_length",   &c->d_ff,       err, errsz) ||
         kv_u32(g, arch, "attention.head_count",  &c->n_heads,    err, errsz) ||
-        kv_u32_uniform(g, arch, "attention.head_count_kv", &c->n_kv_heads, err, errsz) ||
         kv_u32(g, arch, "context_length",        &c->n_ctx,      err, errsz) ||
         kv_f32(g, arch, "attention.layer_norm_rms_epsilon", &c->rms_eps, err, errsz) ||
         kv_f32(g, arch, "rope.freq_base",        &c->rope_theta, err, errsz))
         return -1;
+
+    if (load_layer_map(c, g, arch, err, errsz) != 0)
+        return -1;
+
+    /* The FIR length for the short-conv layers. Optional: absent means this
+     * family has none, and load_layer_map will have marked every layer as
+     * attention anyway. */
+    kv_u32(g, arch, "shortconv.l_cache", &c->conv_taps, NULL, 0);
 
     /* head_dim has its OWN key and is never d_model / n_heads — for Qwen3-0.6B
      * those give 128 and 64, and deriving it is the classic way to get that
@@ -141,10 +180,27 @@ static int load_config(mynah_slm_config *c, const ingot_gguf *g,
      *   attention.key_length     Qwen3, Gemma
      *   rope.dimension_count     Granite (whose rotary covers the whole head) */
     if (kv_u32(g, arch, "attention.key_length", &c->head_dim, NULL, 0) != 0 &&
-        kv_u32(g, arch, "rope.dimension_count", &c->head_dim, NULL, 0) != 0)
-        return fail(err, errsz,
-                    "no head dimension: neither %s.attention.key_length nor "
-                    "%s.rope.dimension_count is present", arch, arch);
+        kv_u32(g, arch, "rope.dimension_count", &c->head_dim, NULL, 0) != 0) {
+        /* LFM2 publishes NEITHER key. Deriving is safe there and only there,
+         * because its projections are square (attn_q is [2048, 2048]) — which
+         * is precisely the assumption Qwen3 breaks. Keep the fallback per
+         * architecture: making it global would turn the Qwen3 trap back into a
+         * silently wrong model instead of a clear error.
+         *
+         * Two independent confirmations that 64 is right for LFM2.5-2.6B:
+         * attn_q_norm is [64] (a per-head norm, so its length IS head_dim) and
+         * attn_k is [512, 2048] over 8 KV heads. */
+        static const char *const DERIVE_HEAD_DIM[] = { "lfm2", NULL };
+        int may_derive = 0;
+        for (size_t i = 0; DERIVE_HEAD_DIM[i]; i++)
+            if (strcmp(arch, DERIVE_HEAD_DIM[i]) == 0) may_derive = 1;
+
+        if (!may_derive || c->n_heads == 0 || c->d_model % c->n_heads != 0)
+            return fail(err, errsz,
+                        "no head dimension: neither %s.attention.key_length nor "
+                        "%s.rope.dimension_count is present", arch, arch);
+        c->head_dim = c->d_model / c->n_heads;
+    }
 
     /* Which RoPE pairing the stored weights expect. There is no metadata key
      * for it — llama.cpp carries the same knowledge as a per-architecture
@@ -214,7 +270,7 @@ static const ingot_tensor *bind_opt(const ingot_gguf *g, const char *name) {
 }
 
 static int bind_layer(mynah_slm_layer *l, const ingot_gguf *g, uint32_t i,
-                      char *err, size_t errsz) {
+                      mynah_slm_op op, char *err, size_t errsz) {
     char n[128];
     int rc = 0;
 
@@ -225,17 +281,25 @@ static int bind_layer(mynah_slm_layer *l, const ingot_gguf *g, uint32_t i,
     snprintf(n, sizeof n, "blk.%u." suffix, i); \
     l->field = bind_opt(g, n)
 
+    /* Named attn_norm on every layer, conv ones included — see model.h. */
     REQ(attn_norm, "attn_norm.weight");
-    REQ(wq,        "attn_q.weight");
-    REQ(wk,        "attn_k.weight");
-    REQ(wv,        "attn_v.weight");
-    REQ(wo,        "attn_output.weight");
     REQ(ffn_norm,  "ffn_norm.weight");
     REQ(gate,      "ffn_gate.weight");
     REQ(up,        "ffn_up.weight");
     REQ(down,      "ffn_down.weight");
-    OPT(q_norm,    "attn_q_norm.weight");
-    OPT(k_norm,    "attn_k_norm.weight");
+
+    if (op == MYNAH_SLM_OP_SHORTCONV) {
+        REQ(conv_in,  "shortconv.in_proj.weight");
+        REQ(conv_w,   "shortconv.conv.weight");
+        REQ(conv_out, "shortconv.out_proj.weight");
+    } else {
+        REQ(wq,        "attn_q.weight");
+        REQ(wk,        "attn_k.weight");
+        REQ(wv,        "attn_v.weight");
+        REQ(wo,        "attn_output.weight");
+        OPT(q_norm,    "attn_q_norm.weight");
+        OPT(k_norm,    "attn_k_norm.weight");
+    }
 
 #undef REQ
 #undef OPT
@@ -265,7 +329,15 @@ mynah_slm_model_t *mynah_slm_load(const char *path, char *err, size_t errsz) {
 
     int rc = 0;
     m->embed    = bind_req(m->gguf, err, errsz, &rc, "token_embd.weight");
-    m->out_norm = bind_req(m->gguf, err, errsz, &rc, "output_norm.weight");
+    /* The final norm before the LM head. LFM2 spells it `token_embd_norm`,
+     * which reads like a norm on the way IN and is not one: upstream it is
+     * `model.embedding_norm`, applied once to the last hidden state
+     * (docs/lfm2-arch.md). Same slot, different name. */
+    m->out_norm = bind_opt(m->gguf, "output_norm.weight");
+    if (!m->out_norm) m->out_norm = bind_opt(m->gguf, "token_embd_norm.weight");
+    if (!m->out_norm && !rc)
+        rc = fail(err, errsz, "missing tensor: neither output_norm.weight nor "
+                              "token_embd_norm.weight is present");
     /* Absent means tied embeddings: token_embd is also the output projection.
      * Qwen3 GGUFs are like this. The safetensors of the same model ships a
      * redundant lm_head.weight instead — see docs/qwen3-arch.md. */
@@ -279,7 +351,8 @@ mynah_slm_model_t *mynah_slm_load(const char *path, char *err, size_t errsz) {
         return NULL;
     }
     for (uint32_t i = 0; i < m->cfg.n_layers; i++) {
-        if (bind_layer(&m->layers[i], m->gguf, i, err, errsz) != 0) {
+        if (bind_layer(&m->layers[i], m->gguf, i,
+                       (mynah_slm_op)m->cfg.layer_op[i], err, errsz) != 0) {
             mynah_slm_free(m);
             return NULL;
         }
@@ -303,6 +376,8 @@ mynah_slm_model_t *mynah_slm_load(const char *path, char *err, size_t errsz) {
 
 void mynah_slm_free(mynah_slm_model_t *m) {
     if (!m) return;
+    free(m->cfg.layer_op);
+    free(m->cfg.kv_slot);
     free(m->layers);
     if (m->gguf) ingot_gguf_close(m->gguf);
     free(m);

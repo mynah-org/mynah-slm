@@ -136,7 +136,7 @@ next stage stays clean:
 
 ```sh
 # think first, say only the answer, straight into TTS
-./mynah-slm run -m models/Qwen3-0.6B-Q4_K_M.gguf -p "Riassumi in una riga: ..." \
+./mynah-slm run -m models/Qwen3-0.6B-Q4_K_M.gguf -p "Summarize in one line: ..." \
   --think on | mynah-tts speak
 
 # tool calling: schemas in, one JSON line out. The engine never executes them.
