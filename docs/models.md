@@ -441,3 +441,91 @@ assigned to which tensors. The census above is the recipe, made visible.
 
 This is also why `inspect` reports bits/weight over the whole file: it is the
 number that predicts RAM, and it is always worse than the headline.
+
+## LFM2.5-2.6B — tried, measured, rejected (2026-08-08)
+
+**Verdict: NO-GO as a target. Not a default, not a recommendation, not a
+download we suggest.** The engine supports it and will keep supporting it; that
+is a different question from whether anyone should use it here.
+
+> **Licence, next to the numbers where it belongs.** LFM Open License v1.0
+> (`general.license.name = lfm1.0`, stated in the GGUF itself). Commercial use
+> only under $10M annual revenue. Even had it won, it could never have been a
+> bundled default — which is why it was an opt-in download from the start.
+
+### Why it looked worth the trial
+
+22 short-conv + 8 GQA layers, so only 8 of 30 hold a KV cache and the other 22
+carry a state that is CONSTANT in the context length. On a CPU that is the
+right shape. 16 languages declared in its own metadata, Italian among them —
+the axis where Granite had lost to Qwen3. Agentic-first, 128K context.
+
+### What killed it: the same passage, both models, Q4_K_M
+
+bits per byte, lower is better. Read ACROSS a row; the columns are not
+comparable between languages (docs — `tools/eval/lang_ppl.py`).
+
+| | LFM2.5-2.6B | Qwen3-0.6B | |
+|---|---|---|---|
+| en | **1.2599** | 1.4243 | LFM2 -11.5% |
+| el | **1.1702** | 1.3116 | LFM2 -10.8% |
+| ja | **1.5348** | 1.5749 | LFM2 -2.5% |
+| de | **1.6685** | 1.6759 | LFM2 -0.4% |
+| fr | 1.4385 | **1.4103** | Qwen3 |
+| ar | 1.4199 | **1.3192** | Qwen3 |
+| nl | 1.8666 | **1.7694** | Qwen3 |
+| pt | 1.5233 | **1.4110** | Qwen3 +8.0% |
+| ko | 1.7671 | **1.6173** | Qwen3 |
+| cs | 2.4908 | **2.2212** | Qwen3 |
+| zh | 1.8884 | **1.6720** | Qwen3 |
+| ru | 1.1324 | **0.9956** | Qwen3 |
+| **it** | 1.9589 | **1.6530** | **Qwen3 +18.5%** |
+| pl | 2.4359 | **1.9729** | Qwen3 |
+| tr | 2.8200 | **2.2052** | Qwen3 +27.9% |
+| mean | 1.7424 | **1.5970** | |
+
+**It loses on 12 of 16 languages to a model a quarter its size**, and the
+PLAN.md gate was explicit: if Italian does not beat Qwen3-0.6B's 1.653, stop.
+It measures 1.9589. That Qwen3 number reproduces the 1.653 recorded from an
+earlier run, so the harness is measuring what it measured before.
+
+**The four wins are the interesting part, and they are not scattered.** English,
+Japanese, and then two smaller ones. Liquid says the family is tuned hardest
+for English and Japanese, and that is exactly and only where it wins. Scattered
+wins would have meant a short measurement; wins that land on the stated tuning
+targets mean the measurement is reading something real — and that what it reads
+is a model built for a different brief than ours.
+
+Declared languages are declared, not demonstrated. LFM2.5 lists 16 in its
+metadata (`ar zh en fr de hi id it ja ko pl pt ru es th vi`) against the 8 of
+the previous LFM2 generation, and Italian and Portuguese are among the added
+ones. Both measure worse than Qwen3-0.6B.
+
+Caveat, stated rather than buried: one ~300-byte passage per language. This is
+a screening, not a benchmark. A 2% gap would not survive it. 18.5% does.
+
+### What was NOT measured
+
+**Tool calling.** The trial was stopped before `tools/eval/tool_calls.py`
+finished, so there is no score — not a bad one, none. Granite is the standing
+proof that a model can lose on Italian and win on tools, so if LFM2 is ever
+reconsidered this is the number to get first, and it is now cheap to get: the
+engine, the template and the Pythonic parser all work.
+
+### Speed, for the record
+
+`LFM2.5-2.6B-Q4_K_M`, M-series, 8 threads, weights staged locally:
+**decode 10.8 tok/s**, against 36.5 for Qwen3-0.6B-Q4_K_M on the same machine.
+Roughly what 4.4x the file predicts. Prefill is 8.6-10.2 tok/s because a hybrid
+model takes the one-token reference path; batching those layers was never worth
+doing once the quality answer came back.
+
+### What the trial left behind, and why it stays
+
+`lfm2` is a supported architecture: hybrid layer maps in the loader, the
+depthwise causal FIR, per-kind state slots, the ChatML-with-BOS template and
+tool calls in both directions. None of it is LFM2-specific plumbing bolted to
+the side — the layer map, the op-slot indirection and `json_object_at()` are
+the parts a second hybrid family would need too, and Qwen3.5's Gated DeltaNet
+and Granite's Mamba-2 (PLAN.md M10) are both hybrids. The trial cost less than
+it looks and the engine kept the general half.
