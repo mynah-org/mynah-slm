@@ -26,12 +26,24 @@ MODELS=(
   "gemma4-e2b-qat|google/gemma-4-E2B-it-qat-q4_0-gguf|gemma-4-E2B_q4_0-it.gguf|1.5 GB|v0.2 PRODUCTION target — Q4_0 because that is what QAT ships"
   "granite-350m-q4|ibm-granite/granite-4.0-350m-GGUF|granite-4.0-350m-Q4_K_M.gguf|226 MB|Granite 4.0 350m, the small/fast rung"
   "granite-350m-q8|ibm-granite/granite-4.0-350m-GGUF|granite-4.0-350m-Q8_0.gguf|361 MB|Granite 4.0 350m — the rung to USE: 27/30 tool calls, and the fastest of the ladder"
-  # LFM2.5 is NOT Apache/MIT: LFM Open License v1.0, commercial use only under
-  # $10M annual revenue. Opt-in candidate (TASKS.md M6b), never a default and
-  # never bundled. See the LICENSE file in the same HF repo before shipping
-  # anything built on it.
-  "lfm2.5-2.6b-q4|LiquidAI/LFM2.5-2.6B-GGUF|LFM2.5-2.6B-Q4_K_M.gguf|1.67 GB|CANDIDATE, non-free license — 22 short-conv + 8 GQA layers, 16 languages"
-  "lfm2.5-2.6b-q8|LiquidAI/LFM2.5-2.6B-GGUF|LFM2.5-2.6B-Q8_0.gguf|2.87 GB|the same at Q8_0, for the quality end of the trial"
+  # The middle of the quantization ladder measured in docs/models.md. These four
+  # were fetched by hand and lived only in models-local/, which use_model.sh
+  # wipes on every stage — so one staging deleted the lot. The measurements
+  # survived in the docs; the files did not. Anything worth measuring twice
+  # belongs in this list.
+  "granite-350m-q2|ibm-granite/granite-4.0-350m-GGUF|granite-4.0-350m-Q2_K.gguf|172 MB|the DESTROYED rung: ppl 26400, word salad. Kept so the result stays reproducible"
+  "granite-350m-q3|ibm-granite/granite-4.0-350m-GGUF|granite-4.0-350m-Q3_K_M.gguf|199 MB|survives, but costs 8% of bits/byte to save 27 MB — a poor trade at this size"
+  "granite-350m-q5|ibm-granite/granite-4.0-350m-GGUF|granite-4.0-350m-Q5_K_M.gguf|252 MB|ladder rung"
+  "granite-350m-q6|ibm-granite/granite-4.0-350m-GGUF|granite-4.0-350m-Q6_K.gguf|279 MB|ladder rung"
+  # LFM2.5: TRIED AND REJECTED, 2026-08-08 (docs/models.md). It loses 12 of 16
+  # languages to Qwen3-0.6B at 4.4x the file, Italian by 18.5%. The engine
+  # supports it and these stay downloadable so the result can be re-checked —
+  # that is not the same as recommending it.
+  # It is also NOT Apache/MIT: LFM Open License v1.0, commercial use only under
+  # $10M annual revenue, so it could never have been a bundled default even had
+  # it won. See the LICENSE file in the same HF repo.
+  "lfm2.5-2.6b-q4|LiquidAI/LFM2.5-2.6B-GGUF|LFM2.5-2.6B-Q4_K_M.gguf|1.67 GB|REJECTED candidate, non-free license — 22 short-conv + 8 GQA layers; wins only on en/ja"
+  "lfm2.5-2.6b-q8|LiquidAI/LFM2.5-2.6B-GGUF|LFM2.5-2.6B-Q8_0.gguf|2.87 GB|the same at Q8_0. Never downloaded: the Q4 answer closed the trial"
 )
 
 DEST_DEFAULT="$(cd "$(dirname "$0")/.." && pwd)/models"
