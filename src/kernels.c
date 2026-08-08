@@ -245,6 +245,46 @@ void mynah_slm_add_scaled(float *y, const float *x, float w, size_t n) {
     for (size_t i = 0; i < n; i++) y[i] += w * x[i];
 }
 
+void mynah_slm_shortconv_fir(float *out, const float *in, uint32_t n_tokens,
+                             const float *w, float *hist,
+                             uint32_t d, uint32_t taps) {
+    if (taps == 0 || d == 0) return;
+    const uint32_t back = taps - 1;         /* how far the window reaches back */
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        float       *o = out + (size_t)t * d;
+        for (uint32_t ch = 0; ch < d; ch++) {
+            const float *wc = w + (size_t)ch * taps;
+            float acc = 0.0f;
+            for (uint32_t j = 0; j < taps; j++) {
+                /* Absolute position of this tap within the batch. Negative
+                 * means it predates the batch and comes from hist, where row
+                 * t+j is exactly the right one (t + j < back holds precisely
+                 * when the index is negative). */
+                const int32_t idx = (int32_t)t - (int32_t)back + (int32_t)j;
+                const float v = (idx < 0) ? hist[(size_t)(t + j) * d + ch]
+                                          : in[(size_t)idx * d + ch];
+                acc += wc[j] * v;
+            }
+            o[ch] = acc;
+        }
+    }
+
+    /* Carry the last `back` INPUT rows forward. The tail may straddle hist and
+     * the batch when the batch is shorter than the window, which is the case a
+     * decode step after a one-token prefill would hit. */
+    if (back == 0) return;
+    if (n_tokens >= back) {
+        memcpy(hist, in + (size_t)(n_tokens - back) * d,
+               (size_t)back * d * sizeof *hist);
+    } else {
+        const uint32_t keep = back - n_tokens;      /* old rows that survive */
+        memmove(hist, hist + (size_t)n_tokens * d,
+                (size_t)keep * d * sizeof *hist);
+        memcpy(hist + (size_t)keep * d, in, (size_t)n_tokens * d * sizeof *hist);
+    }
+}
+
 void mynah_slm_add(float *y, const float *x, size_t n) {
     for (size_t i = 0; i < n; i++) y[i] += x[i];
 }

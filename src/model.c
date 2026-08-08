@@ -94,8 +94,8 @@ static int load_layer_map(mynah_slm_config *c, const ingot_gguf *g,
     if (!kv) return fail(err, errsz, "missing metadata key: %s", key);
 
     c->layer_op = calloc(c->n_layers, sizeof *c->layer_op);
-    c->kv_slot  = calloc(c->n_layers, sizeof *c->kv_slot);
-    if (!c->layer_op || !c->kv_slot)
+    c->op_slot  = calloc(c->n_layers, sizeof *c->op_slot);
+    if (!c->layer_op || !c->op_slot)
         return fail(err, errsz, "out of memory for the %u-layer map", c->n_layers);
 
     uint64_t scalar;
@@ -126,11 +126,12 @@ static int load_layer_map(mynah_slm_config *c, const ingot_gguf *g,
         return fail(err, errsz, "%s is neither an integer nor an array", key);
     }
 
-    /* A conv layer holds no cache, so the caches are numbered separately from
-     * the layers: 8 slots for LFM2's 30 layers. */
+    /* Number each kind separately: 8 KV caches and 22 conv states for LFM2's
+     * 30 layers, rather than 30 of each with two thirds unused. */
+    uint32_t n_conv = 0;
     for (uint32_t i = 0; i < c->n_layers; i++)
-        c->kv_slot[i] = (c->layer_op[i] == MYNAH_SLM_OP_ATTN)
-                      ? c->n_attn_layers++ : MYNAH_SLM_NO_KV;
+        c->op_slot[i] = (c->layer_op[i] == MYNAH_SLM_OP_ATTN)
+                      ? c->n_attn_layers++ : n_conv++;
     return 0;
 }
 
@@ -377,7 +378,7 @@ mynah_slm_model_t *mynah_slm_load(const char *path, char *err, size_t errsz) {
 void mynah_slm_free(mynah_slm_model_t *m) {
     if (!m) return;
     free(m->cfg.layer_op);
-    free(m->cfg.kv_slot);
+    free(m->cfg.op_slot);
     free(m->layers);
     if (m->gguf) ingot_gguf_close(m->gguf);
     free(m);

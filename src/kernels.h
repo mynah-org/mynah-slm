@@ -95,6 +95,34 @@ void mynah_slm_add(float *y, const float *x, size_t n);   /* y += x */
  * take so their arithmetic is unchanged to the bit. */
 void mynah_slm_add_scaled(float *y, const float *x, float w, size_t n);
 
+/* ── short convolution ────────────────────────────────────────────────────── */
+
+/* Depthwise causal FIR — LFM2's operator on 22 of its 30 layers, and the only
+ * thing those layers do that a plain MLP block does not (docs/lfm2-arch.md).
+ *
+ *   out[t][ch] = sum over j of w[ch*taps + j] * x[t - (taps-1) + j][ch]
+ *
+ * Channel ch depends only on channel ch: no mixing, no bias, no activation,
+ * and no data-dependent state transition. That last absence is what makes this
+ * NOT Mamba and why there is no selective scan to write.
+ *
+ * ORIENTATION, because it is silently wrong otherwise: upstream this is
+ * `nn.Conv1d(padding=taps-1)` truncated back to the sequence length, and
+ * nn.Conv1d computes a CORRELATION, not a convolution. So the taps are NOT
+ * reversed, and w[ch*taps + taps-1] multiplies the CURRENT token. Flipping it
+ * gives a model that still produces fluent text.
+ *
+ * ONE PATH FOR PREFILL AND DECODE (rule 2): `n_tokens` tokens are filtered in
+ * one call, and positions before the batch come from `hist`, which holds the
+ * previous taps-1 input rows oldest-first and is updated on the way out. n = 1
+ * is the decode case with no special casing — a 3-tap sliding window and a
+ * full causal convolution are the same loop.
+ *
+ * `in` and `out` are [n_tokens][d] and may not alias. `hist` is [taps-1][d]. */
+void mynah_slm_shortconv_fir(float *out, const float *in, uint32_t n_tokens,
+                             const float *w, float *hist,
+                             uint32_t d, uint32_t taps);
+
 /* ── attention ────────────────────────────────────────────────────────────── */
 
 /* Causal grouped-query attention for ONE query position against a KV history.

@@ -82,19 +82,21 @@ typedef struct {
     size_t   n_eos;
 
     /* ── per-layer operator, for hybrid families ────────────────────────────
-     * `layer_op[i]` is what layer i runs; `kv_slot[i]` is which KV cache it
-     * uses, or MYNAH_SLM_NO_KV when it holds none. Both are n_layers long and
+     * `layer_op[i]` is what layer i runs; `op_slot[i]` is its index AMONG THE
+     * LAYERS OF ITS OWN KIND — the KV cache slot for an attention layer, the
+     * conv-state slot for a short-conv one. Both arrays are n_layers long and
      * owned by the config.
      *
-     * A short-conv layer carries no KV cache at all, so allocating one per
-     * layer would waste 22 of 30 for LFM2. The slot indirection is what lets
-     * the cache be n_attn_layers deep while the forward pass still indexes by
-     * layer number. For a homogeneous family layer_op is all-attention and
-     * kv_slot is the identity, which is the shape every existing caller
-     * already assumes. */
+     * The indirection exists because neither kind of state wants to be
+     * n_layers deep: LFM2 would waste 22 of 30 KV caches and 8 of 30 conv
+     * states. This way each state array is exactly as deep as the layers that
+     * use it, while the forward pass still indexes by layer number.
+     *
+     * For a homogeneous family layer_op is all-attention and op_slot is the
+     * identity, which is the shape every existing caller already assumes. */
     uint8_t  *layer_op;        /* mynah_slm_op per layer */
-    uint32_t *kv_slot;
-    uint32_t  n_attn_layers;   /* how many layers actually hold a cache */
+    uint32_t *op_slot;
+    uint32_t  n_attn_layers;   /* layers that hold a KV cache */
 
     /* Depthwise causal FIR length for the short-conv layers (lfm2's
      * `shortconv.l_cache`). 0 when the family has no conv layers. */
@@ -104,8 +106,6 @@ typedef struct {
     uint32_t q_dim;    /* n_heads    * head_dim */
     uint32_t kv_dim;   /* n_kv_heads * head_dim */
 } mynah_slm_config;
-
-#define MYNAH_SLM_NO_KV 0xFFFFFFFFu
 
 /* One decoder block. NULL is legal for optional tensors (q_norm/k_norm exist
  * in Qwen3, not in every family), so the loader distinguishes "absent" from

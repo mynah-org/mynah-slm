@@ -147,20 +147,16 @@ int mynah_slm_state_init_kv(mynah_slm_state *s, const mynah_slm_model_t *m,
     s->kv_v = kv_v;
     const mynah_slm_config *c = &m->cfg;
 
-    /* This decoder runs attention layers only. A hybrid family (LFM2: 22 of 30
-     * layers are a short convolution — docs/lfm2-arch.md) loads its config and
-     * binds its tensors perfectly well, and would then arrive here and walk
-     * into a NULL wq. Refuse it by name instead: the container being readable
-     * is not the same as the model being runnable, and the difference has to be
-     * a message rather than a segfault. */
-    for (uint32_t i = 0; i < c->n_layers; i++)
-        if (c->layer_op[i] != MYNAH_SLM_OP_ATTN) {
-            snprintf(err, errsz,
-                     "%s layer %u is a short convolution, which this decoder "
-                     "does not implement yet (%u of %u layers)",
-                     c->arch, i, c->n_layers - c->n_attn_layers, c->n_layers);
-            return -1;
-        }
+    /* A hybrid model needs a FIR length to size its state with, and the layer
+     * map and the metadata have to agree about that. Neither is derivable from
+     * the other, so disagreement is a broken file rather than a default to
+     * paper over. */
+    if (c->n_attn_layers < c->n_layers && c->conv_taps < 2) {
+        snprintf(err, errsz,
+                 "%s has %u short-conv layers but no usable %s.shortconv.l_cache",
+                 c->arch, c->n_layers - c->n_attn_layers, c->arch);
+        return -1;
+    }
 
     if (n_ctx == 0 || n_ctx > c->n_ctx) n_ctx = c->n_ctx;
     s->model = m;
@@ -225,12 +221,30 @@ int mynah_slm_state_init_kv(mynah_slm_state *s, const mynah_slm_model_t *m,
     s->kgather = alloc_f32((size_t)n_ctx * c->head_dim);
     s->vgather = alloc_f32((size_t)n_ctx * c->head_dim);
 
+    /* Short-conv scratch and state, only when the model has conv layers. The
+     * history is what survives between tokens; the other three are per-batch
+     * working room, allocated at full batch width like every other scratch so
+     * prefill never allocates either. */
+    const uint32_t n_conv = c->n_layers - c->n_attn_layers;
+    int conv_ok = 1;
+    if (n_conv > 0) {
+        s->conv_hist = alloc_f32((size_t)n_conv * (c->conv_taps - 1) * c->d_model);
+        s->conv_bcx  = alloc_f32((size_t)batch * 3u * c->d_model);
+        s->conv_bx   = alloc_f32((size_t)batch * c->d_model);
+        s->conv_y    = alloc_f32((size_t)batch * c->d_model);
+        conv_ok = s->conv_hist && s->conv_bcx && s->conv_bx && s->conv_y;
+        if (s->conv_hist)
+            memset(s->conv_hist, 0,
+                   (size_t)n_conv * (c->conv_taps - 1) * c->d_model * sizeof *s->conv_hist);
+    }
+
     if (!s->x || !s->h || !s->q || !s->attn ||
         !s->proj || !s->gate || !s->up || !s->scores || !s->scores_mt ||
         !s->logits || !s->embed_row || !s->bx || !s->bh || !s->bq ||
         !s->battn || !s->bproj || !s->bgate || !s->bup || !s->strip ||
         !s->bscores || !s->bk || !s->bv || !s->kgather || !s->vgather ||
-        mynah_slm_kv_init(&s->kv, s->kv_k, s->kv_v, c->n_layers, n_ctx,
+        !conv_ok ||
+        mynah_slm_kv_init(&s->kv, s->kv_k, s->kv_v, c->n_attn_layers, n_ctx,
                           c->n_kv_heads, c->head_dim) != 0) {
         snprintf(err, errsz, "out of memory for a %u-position context", n_ctx);
         mynah_slm_state_free(s);
@@ -269,10 +283,26 @@ void mynah_slm_state_free(mynah_slm_state *s) {
     mynah_slm_aligned_free(s->bv);
     mynah_slm_aligned_free(s->kgather);
     mynah_slm_aligned_free(s->vgather);
+    mynah_slm_aligned_free(s->conv_hist);
+    mynah_slm_aligned_free(s->conv_bcx);
+    mynah_slm_aligned_free(s->conv_bx);
+    mynah_slm_aligned_free(s->conv_y);
     memset(s, 0, sizeof *s);
 }
 
-void mynah_slm_state_reset(mynah_slm_state *s) { s->n_past = 0; }
+void mynah_slm_state_reset(mynah_slm_state *s) {
+    s->n_past = 0;
+    /* The conv history is history too. Leaving it behind would carry two
+     * tokens of the previous conversation into the next one — invisible in the
+     * KV cache, which the n_past reset does clear, and wrong on the first two
+     * tokens of every turn after the first. */
+    if (s->conv_hist) {
+        const mynah_slm_config *c = &s->model->cfg;
+        const uint32_t n_conv = c->n_layers - c->n_attn_layers;
+        memset(s->conv_hist, 0,
+               (size_t)n_conv * (c->conv_taps - 1) * c->d_model * sizeof *s->conv_hist);
+    }
+}
 
 /* Read one row of the embedding matrix into f32.
  *
@@ -306,6 +336,19 @@ int mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
 
     const mynah_slm_model_t *m = s->model;
     const mynah_slm_config  *c = &m->cfg;
+
+    /* Hybrid models take the reference path: one token at a time, which is the
+     * definition this batched twin has to agree with anyway. Batching the
+     * short-conv layers is a speed change and speed changes get measured
+     * against a correct baseline, not merged with one (rule 2, docs/perf.md).
+     * Prefill is therefore slow on LFM2 today, and honestly so. */
+    if (c->n_attn_layers < c->n_layers) {
+        for (uint32_t t = 0; t < n; t++)
+            if (mynah_slm_forward(s, tokens[t],
+                                  (t + 1 == n) ? logits_out : NULL) != 0)
+                return -1;
+        return 0;
+    }
 
     if (s->n_past + n > s->n_ctx) return -1;
     const uint32_t pos0 = s->n_past;
@@ -434,6 +477,50 @@ int mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
     return 0;
 }
 
+/* LFM2's short-conv operator, in[n][d_model] -> out[n][d_model].
+ *
+ * One call covers one token and a whole prefill batch, because the FIR does
+ * (rule 2). The projections here go one token at a time — the same reference
+ * shape the rest of this file calls "prefill is decode in a loop", and the
+ * place a batched product would be measured against later rather than assumed
+ * into existence now.
+ *
+ * `in` and `out` must not alias: out is written token by token while in is
+ * still being read. */
+static int shortconv(mynah_slm_state *s, const mynah_slm_layer *w, uint32_t l,
+                     const float *in, float *out, uint32_t n) {
+    const mynah_slm_model_t *m = s->model;
+    const mynah_slm_config  *c = &m->cfg;
+    const uint32_t d = c->d_model;
+
+    /* in_proj gives (B, C, x) as three contiguous d-wide thirds, in that
+     * order. B and x gate the filter input; C gates its output. */
+    for (uint32_t t = 0; t < n; t++) {
+        float *bcx = s->conv_bcx + (size_t)t * 3u * d;
+        if (mynah_slm_project(m, w->conv_in, in + (size_t)t * d, bcx) != 0)
+            return -1;
+        const float *B = bcx, *X = bcx + 2u * d;
+        float *bx = s->conv_bx + (size_t)t * d;
+        for (uint32_t i = 0; i < d; i++) bx[i] = B[i] * X[i];
+    }
+
+    /* op_slot, not l: 22 conv states for 30 layers. */
+    float *hist = s->conv_hist +
+                  (size_t)c->op_slot[l] * (c->conv_taps - 1) * d;
+    mynah_slm_shortconv_fir(s->conv_y, s->conv_bx, n,
+                            (const float *)ingot_gguf_data(m->gguf, w->conv_w),
+                            hist, d, c->conv_taps);
+
+    for (uint32_t t = 0; t < n; t++) {
+        const float *C = s->conv_bcx + (size_t)t * 3u * d + d;
+        float *y = s->conv_y + (size_t)t * d;
+        for (uint32_t i = 0; i < d; i++) y[i] *= C[i];
+        if (mynah_slm_project(m, w->conv_out, y, out + (size_t)t * d) != 0)
+            return -1;
+    }
+    return 0;
+}
+
 int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
     const mynah_slm_model_t *m = s->model;
     const mynah_slm_config  *c = &m->cfg;
@@ -465,6 +552,13 @@ int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
         mynah_slm_rms_norm(s->h, s->x, (const float *)ingot_gguf_data(m->gguf, w->attn_norm),
                            c->d_model, c->rms_eps);
 
+        /* A conv layer replaces the whole attention block and nothing else:
+         * same pre-norm, same residual, same FFN after it. */
+        if (c->layer_op[l] == MYNAH_SLM_OP_SHORTCONV) {
+            if (shortconv(s, w, l, s->h, s->proj, 1) != 0) return -1;
+            goto residual;
+        }
+
         if (mynah_slm_project(m, w->wq, s->h, s->q)     != 0) return -1;
         if (mynah_slm_project(m, w->wk, s->h, k_slot)   != 0) return -1;
         if (mynah_slm_project(m, w->wv, s->h, v_slot)   != 0) return -1;
@@ -483,21 +577,24 @@ int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
 
         /* Stored AFTER RoPE, because RoPE is what will have been applied to
          * the cached value. Encoding first would store a different tensor. */
-        mynah_slm_kv_put_k(&s->kv, l, pos, k_slot);
-        mynah_slm_kv_put_v(&s->kv, l, pos, v_slot);
+        const uint32_t kvl = c->op_slot[l];
+        mynah_slm_kv_put_k(&s->kv, kvl, pos, k_slot);
+        mynah_slm_kv_put_v(&s->kv, kvl, pos, v_slot);
 
         if (kv_is_f32)
             mynah_slm_attention_mt(s->attn, s->q,
-                                   (const float *)s->kv.k + (size_t)l * per_layer,
-                                   (const float *)s->kv.v + (size_t)l * per_layer,
+                                   (const float *)s->kv.k + (size_t)kvl * per_layer,
+                                   (const float *)s->kv.v + (size_t)kvl * per_layer,
                                    n_kv, c->n_heads, c->n_kv_heads, c->head_dim,
                                    c->attn_scale, s->scores_mt);
         else
-            mynah_slm_attention_kv_mt(s->attn, s->q, &s->kv, l, n_kv,
+            mynah_slm_attention_kv_mt(s->attn, s->q, &s->kv, kvl, n_kv,
                                       c->n_heads, c->n_kv_heads, c->head_dim,
                                       c->attn_scale, s->scores_mt);
 
         if (mynah_slm_project(m, w->wo, s->attn, s->proj) != 0) return -1;
+
+residual:
         if (c->residual_scale == 1.0f) mynah_slm_add(s->x, s->proj, c->d_model);
         else mynah_slm_add_scaled(s->x, s->proj, c->residual_scale, c->d_model);
 

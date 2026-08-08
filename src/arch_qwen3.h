@@ -35,9 +35,24 @@ typedef struct {
      * quality for bytes and has to be measured, never assumed. */
     mynah_slm_kv_type kv_k, kv_v;   /* requested; the cache is built from these */
 
-    /* [n_layers][n_ctx][kv_dim], K and V possibly at different precisions.
-     * A position is contiguous, which is the order attention walks. */
+    /* [n_attn_layers][n_ctx][kv_dim], K and V possibly at different
+     * precisions. A position is contiguous, which is the order attention
+     * walks. Indexed by cfg.op_slot[layer], NOT by layer: on a hybrid model
+     * only 8 of 30 layers have a cache at all. */
     mynah_slm_kv kv;
+
+    /* ── short-conv state, for hybrid families ──────────────────────────────
+     * [n_conv_layers][taps-1][d_model]: the previous inputs each depthwise FIR
+     * still needs, and the whole of what a conv layer carries between tokens.
+     *
+     * It is CONSTANT in the context length — 22 layers x 2 x 2048 floats is
+     * 352 KB for LFM2 whatever the prompt — which is the structural reason the
+     * architecture is interesting on a CPU: only 8 of 30 layers hold anything
+     * that grows per token. NULL when the model has no conv layers. */
+    float   *conv_hist;
+    float   *conv_bcx;    /* [batch_max][3 * d_model] — B, C and x, in that order */
+    float   *conv_bx;     /* [batch_max][d_model]     — the gated FIR input      */
+    float   *conv_y;      /* [batch_max][d_model]     — the FIR output           */
 
     /* scratch, all allocated once */
     float *x;          /* residual stream          [d_model]  */
