@@ -99,6 +99,51 @@ static long parse_region(const char *s, const char *end,
     return found;
 }
 
+/* ── LFM2's Pythonic calls ─────────────────────────────────────────────────
+ *
+ *   <|tool_call_start|>[get_weather(city='Verona'), set_timer(minutes=5)]<|tool_call_end|>
+ *
+ * A list of Python call expressions, not JSON, and the exact inverse of what
+ * template.c renders. Everything here is scanning rather than parsing: the
+ * only structure that matters is where an argument ends, and a comma inside a
+ * quoted string or a nested object is not that place. Getting THAT wrong is
+ * how a parser silently truncates `city='Bad, Homburg'` into a call with a
+ * broken argument and no error anywhere.
+ *
+ * Values are converted back to JSON, so a caller downstream of this never
+ * learns which dialect the model spoke. */
+
+static const char PY_OPEN[]  = "<|tool_call_start|>";
+static const char PY_CLOSE[] = "<|tool_call_end|>";
+
+/* One argument's worth of scanning: stop at a top-level `,` or `)`. */
+static const char *py_scan_value(const char *s, const char *end) {
+    int depth = 0;
+    while (s < end) {
+        const char ch = *s;
+        if (ch == '\'' || ch == '"') {
+            const char q = ch;
+            for (s++; s < end && *s != q; s++)
+                if (*s == '\\' && s + 1 < end) s++;      /* skip the escaped one */
+            if (s < end) s++;
+            continue;
+        }
+        if (ch == '(' || ch == '[' || ch == '{') depth++;
+        else if (ch == ')' || ch == ']' || ch == '}') {
+            if (depth == 0) return s;                    /* the call's own ')' */
+            depth--;
+        } else if (ch == ',' && depth == 0) return s;
+        s++;
+    }
+    return end;
+}
+
+/* Everything between `[` and `]`, as calls. Defined below the cursor it
+ * builds each arguments object with. */
+static long py_parse_list(const char *s, const char *end,
+                          mynah_slm_tool_call *out, size_t max, long found,
+                          size_t *blocks);
+
 long mynah_slm_tool_calls_parse(const char *text, size_t len,
                                 mynah_slm_tool_call *out, size_t max,
                                 size_t *n_blocks) {
@@ -108,6 +153,22 @@ long mynah_slm_tool_calls_parse(const char *text, size_t len,
     long found = 0;
     const char *const end = text + len;
     const char *p = text;
+
+    if (find_sub(text, end, PY_OPEN)) {
+        /* LFM2. Only what sits between the markers is a call; the model's
+         * prose around them is prose. */
+        for (;;) {
+            const char *o = find_sub(p, end, PY_OPEN);
+            if (!o) break;
+            const char *ls = o + sizeof PY_OPEN - 1;
+            const char *cl = find_sub(ls, end, PY_CLOSE);
+            const char *le = cl ? cl : end;
+            found = py_parse_list(ls, le, out, max, found, &blocks);
+            p = cl ? cl + sizeof PY_CLOSE - 1 : end;
+        }
+        if (n_blocks) *n_blocks = blocks;
+        return found;
+    }
 
     if (find_sub(text, end, TOOL_OPEN)) {
         /* Wrapped: only what sits between the markers is a call. Text outside
@@ -126,8 +187,15 @@ long mynah_slm_tool_calls_parse(const char *text, size_t len,
         }
     } else {
         /* Bare: this is the tool channel, whose markers generate.c already
-         * consumed. Everything here is meant to be a call. */
-        found = parse_region(p, end, out, max, found, &blocks);
+         * consumed. Everything here is meant to be a call — but in which
+         * dialect is no longer obvious once the markers are gone, so decide on
+         * the first character that carries meaning. A Pythonic payload is the
+         * bracketed list `[f(a=1)]`; a JSON one is an object. */
+        const char *q = p;
+        while (q < end && (*q == ' ' || *q == '\n' || *q == '\t' || *q == '\r')) q++;
+        found = (q < end && *q == '[')
+              ? py_parse_list(q, end, out, max, found, &blocks)
+              : parse_region(p, end, out, max, found, &blocks);
     }
 
     if (n_blocks) *n_blocks = blocks;
@@ -160,6 +228,128 @@ static void put_escaped(cursor *c, const char *s) {
     if (c->buf && c->used + need + 1 <= c->max)
         json_escape(s, n, c->buf + c->used, c->max - c->used);
     c->used += need;
+}
+
+/* ── the Pythonic side, now that there is a cursor to build with ───────────*/
+
+static void put_char(cursor *c, char ch) {
+    const char one[2] = { ch, '\0' };
+    put(c, one);
+}
+
+/* One Python literal, appended as its JSON equivalent. */
+static void py_value_to_json(cursor *c, const char *s, const char *end) {
+    while (s < end && (*s == ' ' || *s == '\t' || *s == '\n')) s++;
+    while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n')) end--;
+    if (s >= end) { put(c, "null"); return; }
+
+    const size_t n = (size_t)(end - s);
+    /* Capitalised, which is exactly why this cannot be a JSON passthrough. */
+    if (n == 4 && memcmp(s, "True", 4) == 0)  { put(c, "true");  return; }
+    if (n == 5 && memcmp(s, "False", 5) == 0) { put(c, "false"); return; }
+    if (n == 4 && memcmp(s, "None", 4) == 0)  { put(c, "null");  return; }
+
+    if (*s == '\'' || *s == '"') {
+        const char q = *s;
+        put(c, "\"");
+        for (const char *p = s + 1; p + 1 < end; p++) {
+            if (*p == '\\' && p + 2 < end) {
+                const char nx = p[1];
+                /* \' is Python's; JSON has no such escape and needs the bare
+                 * quote. \\ \n \r \t are spelled identically in both. */
+                if (nx == '\'')      put(c, "'");
+                else if (nx == '"')  put(c, "\\\"");
+                else { put_char(c, '\\'); put_char(c, nx); }
+                p++;
+                continue;
+            }
+            if (*p == '"') { put(c, "\\\""); continue; }
+            put_char(c, *p);
+        }
+        put(c, "\"");
+        (void)q;
+        return;
+    }
+
+    /* Numbers, and the objects and lists the template emitted as JSON in the
+     * first place — both are already valid JSON, so they go through as they
+     * are rather than being re-serialized into a second chance to be wrong. */
+    for (const char *p = s; p < end; p++) put_char(c, *p);
+}
+
+static long py_parse_list(const char *s, const char *end,
+                          mynah_slm_tool_call *out, size_t max, long found,
+                          size_t *blocks) {
+    while (s < end && *s != '[') s++;
+    if (s < end) s++;                                     /* past the '[' */
+
+    while (s < end) {
+        while (s < end && (*s == ' ' || *s == ',' || *s == '\n' || *s == '\t')) s++;
+        if (s >= end || *s == ']') break;
+
+        const char *nstart = s;
+        while (s < end && *s != '(' && *s != ']') s++;
+        if (s >= end || *s != '(') break;                 /* not a call at all */
+        const char *nend = s;
+        while (nend > nstart && (nend[-1] == ' ' || nend[-1] == '\n')) nend--;
+        if (nend == nstart) break;
+        (*blocks)++;
+        s++;                                              /* past the '(' */
+
+        char args[4096];
+        cursor ac = { .buf = args, .max = sizeof args, .used = 0 };
+        put(&ac, "{");
+        int first = 1;
+
+        for (;;) {
+            while (s < end && (*s == ' ' || *s == '\n' || *s == '\t')) s++;
+            if (s >= end || *s == ')') break;
+
+            const char *ks = s;
+            while (s < end && *s != '=' && *s != ')' && *s != ',') s++;
+            if (s >= end) break;
+            if (*s != '=') {
+                /* A positional argument. It has no name to key on, and
+                 * inventing one would be worse than dropping it: skip to the
+                 * next argument and let the call stand without it. */
+                s = py_scan_value(ks, end);
+                if (s < end && *s == ',') s++;
+                continue;
+            }
+            const char *ke = s;
+            while (ke > ks && (ke[-1] == ' ')) ke--;
+            s++;                                          /* past the '=' */
+
+            const char *vs = s;
+            const char *ve = py_scan_value(vs, end);
+
+            if (!first) put(&ac, ", ");
+            first = 0;
+            put(&ac, "\"");
+            for (const char *p = ks; p < ke; p++) put_char(&ac, *p);
+            put(&ac, "\": ");
+            py_value_to_json(&ac, vs, ve);
+
+            s = ve;
+            if (s < end && *s == ',') s++;
+        }
+        put(&ac, "}");
+        if (s < end && *s == ')') s++;
+
+        /* Overflowed the argument buffer, or overlong name: count the block as
+         * attempted and do not pretend it parsed. */
+        const size_t nlen = (size_t)(nend - nstart);
+        if (ac.used >= sizeof args || nlen >= sizeof out[0].name) continue;
+
+        if ((size_t)found < max && out) {
+            memcpy(out[found].name, nstart, nlen);
+            out[found].name[nlen] = '\0';
+            out[found].arguments = dup_span(args, ac.used);
+            if (!out[found].arguments) continue;
+        }
+        found++;
+    }
+    return found;
 }
 
 size_t mynah_slm_tool_calls_to_json(const mynah_slm_tool_call *calls, size_t n,

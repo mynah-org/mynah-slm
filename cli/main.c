@@ -446,10 +446,16 @@ static int cmd_run(run_opts *o) {
     gp.cb_think_ctx = NULL;
 
     /* Only split the tool channel when tools were offered. Without them the
-     * markers are not structure, they are the model quoting XML at us. */
+     * markers are not structure, they are the model quoting XML at us.
+     *
+     * Which markers, though, is the family's business: LFM2 delimits a call
+     * with <|tool_call_start|> and <|tool_call_end|>. Hardcoding Qwen3's pair
+     * left its calls unsplit, so they arrived in the visible answer as prose
+     * and never reached the parser. */
     if (tools) {
-        gp.tool_open  = mynah_slm_token_find(tok, "<tool_call>");
-        gp.tool_close = mynah_slm_token_find(tok, "</tool_call>");
+        const mynah_slm_chat_family *cf = mynah_slm_chat_family_for(mynah_slm_arch(m));
+        gp.tool_open  = mynah_slm_token_find(tok, cf->call_open);
+        gp.tool_close = mynah_slm_token_find(tok, cf->call_close);
         gp.cb_tool     = collect_cb;
         gp.cb_tool_ctx = &calls;
     }

@@ -2,6 +2,8 @@
  * SPDX-License-Identifier: MIT */
 #include "template.h"
 
+#include "json.h"
+
 #include <stdio.h>
 #include <string.h>
 
@@ -24,6 +26,8 @@ static const mynah_slm_chat_family CHATML = {
         "</tool_call>",
     .default_system = NULL,
     .think_prefill  = 1,
+    .call_open      = "<tool_call>",
+    .call_close     = "</tool_call>",
 };
 
 static const mynah_slm_chat_family GRANITE = {
@@ -49,10 +53,36 @@ static const mynah_slm_chat_family GRANITE = {
         "You are a helpful assistant. Please ensure responses are professional, "
         "accurate, and safe.",
     .think_prefill = 0,
+    .call_open     = "<tool_call>",
+    .call_close    = "</tool_call>",
+};
+
+/* LFM2 shares ChatML's markers to the byte and disagrees about everything
+ * around them: a BOS at the top, the schemas inside the system turn, Pythonic
+ * calls on the way out, and reasoning opened by the template rather than
+ * suppressed by it. See docs/lfm2-arch.md and reference/lfm2.5-2.6b/. */
+static const mynah_slm_chat_family LFM2 = {
+    .name       = "lfm2",
+    .bos        = "<|startoftext|>",
+    .role_open  = "<|im_start|>",
+    .role_close = "\n",
+    .turn_end   = "<|im_end|>\n",
+    /* Not an XML block and not a paragraph of instructions: the template
+     * appends exactly this to the system prompt, and the model was trained
+     * against that literal shape. */
+    .tools_prefix = "List of tools: [",
+    .tools_suffix = "]",
+    .default_system = NULL,
+    .think_prefill  = 0,
+    .think_open     = "<think>",
+    .tool_style     = MYNAH_SLM_TOOLS_PYTHONIC,
+    .call_open      = "<|tool_call_start|>",
+    .call_close     = "<|tool_call_end|>",
 };
 
 const mynah_slm_chat_family *mynah_slm_chat_family_for(const char *arch) {
     if (arch && strcmp(arch, "granite") == 0) return &GRANITE;
+    if (arch && strcmp(arch, "lfm2")    == 0) return &LFM2;
     return &CHATML;
 }
 
@@ -99,6 +129,75 @@ static void put_tool(cursor *c, const mynah_slm_tool *t) {
     put(c, "}}");
 }
 
+/* One JSON value as a PYTHON literal, for LFM2's call expressions.
+ *
+ * Not a JSON re-emit with different brackets: strings take single quotes with
+ * Python's escapes, and booleans are True/False, capitalised. Objects and
+ * lists are the one place the template does fall back to JSON — `arg_value |
+ * tojson` — so they pass through verbatim, and `true` inside a nested object
+ * legitimately stays lowercase. Copying that inconsistency is the point; it is
+ * what the model was trained against. */
+static void put_py_value(cursor *c, const json_val *v) {
+    switch (v->kind) {
+        case JSON_STRING: {
+            put(c, "'");
+            /* The raw span minus its quotes. JSON escapes that Python shares
+             * (\n, \r, \\) are already in the right form; a single quote is
+             * the one character JSON leaves bare and Python cannot. */
+            for (const char *p = v->start + 1; p + 1 < v->end; p++) {
+                if (*p == '\'') put(c, "\\'");
+                else { const char one[2] = { *p, 0 }; put(c, one); }
+            }
+            put(c, "'");
+            break;
+        }
+        case JSON_BOOL:
+            put(c, v->boolean ? "True" : "False");
+            break;
+        case JSON_NULL:
+            put(c, "None");
+            break;
+        default: {
+            /* Numbers, objects and arrays: the source span, unchanged. */
+            char tmp[512];
+            const size_t n = (size_t)(v->end - v->start);
+            if (n < sizeof tmp) {
+                memcpy(tmp, v->start, n);
+                tmp[n] = '\0';
+                put(c, tmp);
+            }
+            break;
+        }
+    }
+}
+
+/* `name(arg=value, arg2=value2)` from a name and a JSON arguments object. An
+ * unparseable or non-object arguments string yields a bare `name()` rather
+ * than a broken expression: the model can recover from a call with no
+ * arguments, and cannot from a syntax error. */
+static void put_py_call(cursor *c, const mynah_slm_tool_call *tc) {
+    put(c, tc->name);
+    put(c, "(");
+
+    json_val args;
+    if (tc->arguments &&
+        json_parse(tc->arguments, tc->arguments + strlen(tc->arguments), &args) == 0 &&
+        args.kind == JSON_OBJECT) {
+        for (size_t i = 0;; i++) {
+            json_val k, v;
+            if (json_object_at(&args, i, &k, &v) != 0) break;
+            if (i) put(c, ", ");
+            char key[128];
+            const long kn = json_string_copy(&k, key, sizeof key);
+            if (kn < 0) break;
+            put(c, key);
+            put(c, "=");
+            put_py_value(c, &v);
+        }
+    }
+    put(c, ")");
+}
+
 static void put_open(cursor *c, const mynah_slm_chat_family *f, const char *role) {
     put(c, f->role_open);
     put(c, role);
@@ -121,6 +220,9 @@ long mynah_slm_render_chat_tools(const mynah_slm_chat_family *f,
     if (!f) f = &CHATML;
 
     cursor c = { .buf = out, .max = max, .used = 0 };
+    const int pythonic = (f->tool_style == MYNAH_SLM_TOOLS_PYTHONIC);
+
+    if (f->bos) put(&c, f->bos);
 
     /* A leading system message is consumed by the head, whether or not tools
      * are present — the template emits it there and skips it in the loop. */
@@ -129,11 +231,13 @@ long mynah_slm_render_chat_tools(const mynah_slm_chat_family *f,
 
     if (n_tools) {
         put_open(&c, f, "system");
-        if (head_system) { put(&c, msgs[0].content); put(&c, "\n\n"); }
+        /* One newline for LFM2, a blank line for the XML families: each is
+         * what its own template puts between the system text and the tools. */
+        if (head_system) { put(&c, msgs[0].content); put(&c, pythonic ? "\n" : "\n\n"); }
         put(&c, f->tools_prefix);
         for (size_t i = 0; i < n_tools; i++) {
             if (!tools[i].name) return -1;
-            put(&c, "\n");
+            put(&c, pythonic ? (i ? ", " : "") : "\n");
             put_tool(&c, &tools[i]);
         }
         put(&c, f->tools_suffix);
@@ -160,6 +264,21 @@ long mynah_slm_render_chat_tools(const mynah_slm_chat_family *f,
             case MYNAH_SLM_ROLE_ASSISTANT:
                 put_open(&c, f, "assistant");
                 put(&c, content);
+                if (pythonic && m->n_tool_calls) {
+                    /* All the calls live inside ONE bracketed list, which is
+                     * how the template renders parallel calls and how the
+                     * model emits them. One block per call would be a shape it
+                     * never saw. */
+                    if (!m->tool_calls) return -1;
+                    put(&c, "<|tool_call_start|>[");
+                    for (size_t k = 0; k < m->n_tool_calls; k++) {
+                        if (k) put(&c, ", ");
+                        put_py_call(&c, &m->tool_calls[k]);
+                    }
+                    put(&c, "]<|tool_call_end|>");
+                    put(&c, f->turn_end);
+                    break;
+                }
                 for (size_t k = 0; k < m->n_tool_calls; k++) {
                     if (!m->tool_calls) return -1;
                     /* A newline separates a call from whatever precedes it —
@@ -177,8 +296,14 @@ long mynah_slm_render_chat_tools(const mynah_slm_chat_family *f,
                 break;
 
             case MYNAH_SLM_ROLE_TOOL: {
-                /* Tool results are not a role of their own on the wire: they
-                 * are <tool_response> blocks inside ONE user turn, however
+                /* LFM2 does have a `tool` role on the wire: its template gives
+                 * every non-assistant message the same `<|im_start|>role\n...`
+                 * treatment, so a result is its own turn and there is no
+                 * <tool_response> wrapper to speak of. */
+                if (pythonic) { put_turn(&c, f, MYNAH_SLM_ROLE_TOOL, content); break; }
+
+                /* Everywhere else tool results are not a role of their own:
+                 * they are <tool_response> blocks inside ONE user turn, however
                  * many of them there are. Splitting them into a turn each is
                  * the classic way to make parallel tool calls come back wrong.
                  */
@@ -211,6 +336,15 @@ long mynah_slm_render_chat_tools(const mynah_slm_chat_family *f,
      * nothing rather than an invented equivalent. */
     if (f->think_prefill && think == MYNAH_SLM_THINK_OFF)
         put(&c, "<think>\n\n</think>\n\n");
+
+    /* LFM2 is the mirror image: its own template ends with
+     * `<|im_start|>assistant\n<think>`, unconditionally — reasoning is the
+     * default and the opening tag is part of the PROMPT, not something the
+     * model decides to emit. So "off" here means withholding that tag, which
+     * is the only lever the template offers. There is no enable_thinking flag
+     * to set (docs/lfm2-arch.md). */
+    if (f->think_open && think != MYNAH_SLM_THINK_OFF)
+        put(&c, f->think_open);
 
     if (c.buf && c.max) c.buf[c.used < c.max ? c.used : c.max - 1] = '\0';
     return (long)c.used;

@@ -372,8 +372,11 @@ static void handle_chat(server_ctx *c, http_conn *conn,
     gp.think_close = mynah_slm_token_find(c->tok, "</think>");
     gp.cb_think = NULL;            /* discarded: reasoning is not content */
     if (tools) {
-        gp.tool_open  = mynah_slm_token_find(c->tok, "<tool_call>");
-        gp.tool_close = mynah_slm_token_find(c->tok, "</tool_call>");
+        /* By family: LFM2's delimiters are not Qwen3's (src/template.h). */
+        const mynah_slm_chat_family *cf =
+            mynah_slm_chat_family_for(mynah_slm_arch(c->model));
+        gp.tool_open  = mynah_slm_token_find(c->tok, cf->call_open);
+        gp.tool_close = mynah_slm_token_find(c->tok, cf->call_close);
         gp.cb_tool = tool_cb; gp.cb_tool_ctx = &e_tool;
     }
     mynah_slm_generate(&st, c->tok, sam, &gp, &tm);

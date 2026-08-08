@@ -114,6 +114,41 @@ int json_object_get(const json_val *obj, const char *key, json_val *out) {
     }
 }
 
+int json_object_at(const json_val *obj, size_t idx, json_val *key, json_val *out) {
+    if (!obj || obj->kind != JSON_OBJECT) return -1;
+    const char *s = obj->start + 1, *end = obj->end;
+
+    for (size_t i = 0;; i++) {
+        s = skip_ws(s, end);
+        if (s >= end || *s == '}') return -1;
+
+        const char *kstart = s;
+        const char *kstop  = scan_string(s, end);
+        if (!kstop) return -1;
+
+        s = skip_ws(kstop, end);
+        if (s >= end || *s != ':') return -1;
+        s++;
+
+        json_val v;
+        if (json_parse(s, end, &v) != 0) return -1;
+        if (i == idx) {
+            if (key) {
+                key->kind  = JSON_STRING;
+                key->start = kstart;
+                key->end   = kstop;
+                key->num   = 0;
+                key->boolean = 0;
+            }
+            if (out) *out = v;
+            return 0;
+        }
+
+        s = skip_ws(v.end, end);
+        if (s < end && *s == ',') s++;
+    }
+}
+
 int json_array_at(const json_val *arr, size_t idx, json_val *out) {
     if (!arr || arr->kind != JSON_ARRAY) return -1;
     const char *s = arr->start + 1, *end = arr->end;

@@ -37,6 +37,14 @@ int json_parse(const char *s, const char *end, json_val *out);
 /* Iterate an array: call with idx 0,1,... until it returns non-zero. */
 int json_array_at(const json_val *arr, size_t idx, json_val *out);
 
+/* The same for an object's own members, in source order. `key` receives the
+ * member name as a JSON_STRING (quotes included in its span, like any parsed
+ * string); either output may be NULL. Order matters here and is not an
+ * implementation detail: LFM2 renders tool arguments as Python keyword
+ * arguments in the order the object lists them, and the model was trained
+ * against that order. */
+int json_object_at(const json_val *obj, size_t idx, json_val *key, json_val *out);
+
 /* Copy a JSON string value into `buf`, resolving escapes. Returns the length
  * written, or -1 if it does not fit. `v` must be JSON_STRING. */
 long json_string_copy(const json_val *v, char *buf, size_t max);

@@ -47,20 +47,39 @@ typedef struct {
 } mynah_slm_message;
 
 /* ── families ──────────────────────────────────────────────────────────────
- * Two so far, and they differ by less than they look. Qwen3 opens a turn with
- * `<|im_start|>role\n` and closes it with `<|im_end|>`, Granite with
- * `<|start_of_role|>role<|end_of_role|>` and `<|end_of_text|>`. The tool-call
- * and tool-response BODIES are byte-identical between them, which is why this
- * is a table of strings and not a second renderer.
+ * Three so far. Qwen3 opens a turn with `<|im_start|>role\n` and closes it
+ * with `<|im_end|>`, Granite with `<|start_of_role|>role<|end_of_role|>` and
+ * `<|end_of_text|>`, LFM2 with Qwen3's markers exactly.
  *
- * The fields are what the two templates actually disagree on; anything they
- * agree on is in the renderer, once. */
+ * For the first two the tool-call and tool-response BODIES were byte-identical,
+ * which is why this began as a table of strings and not a second renderer.
+ * LFM2 ends that: it emits a PYTHON CALL EXPRESSION rather than a JSON object
+ * (`<|tool_call_start|>[get_weather(city='Verona')]<|tool_call_end|>`) and it
+ * lists the schemas inside the system turn instead of an XML block. That is a
+ * genuinely different body, so `tool_style` branches the renderer — pretending
+ * two shapes are one is exactly what the old comment warned against.
+ *
+ * The fields are what the templates actually disagree on; anything they agree
+ * on is in the renderer, once. */
+typedef enum {
+    /* <tools>{json}</tools> in, <tool_call>{json}</tool_call> out. */
+    MYNAH_SLM_TOOLS_JSON_XML = 0,
+    /* `List of tools: [{json}, ...]` in the system turn, and a bracketed list
+     * of Python call expressions out. LFM2. */
+    MYNAH_SLM_TOOLS_PYTHONIC,
+} mynah_slm_tool_style;
+
 typedef struct {
     const char *name;
+    /* Emitted once, before anything else. LFM2's template starts with
+     * `{{- bos_token -}}`; Qwen3's and Granite's do not. NULL means none —
+     * and it must stay NULL for them, because a BOS the model never saw at
+     * training time is a prompt shape, not a harmless prefix. */
+    const char *bos;
     const char *role_open;       /* before the role name */
     const char *role_close;      /* after it */
     const char *turn_end;        /* closes a turn, newline included */
-    const char *tools_prefix;    /* the preamble before the <tools> list */
+    const char *tools_prefix;    /* the preamble before the tool list */
     const char *tools_suffix;    /* the instruction after it */
     /* Granite emits a canned system turn when the caller supplied neither a
      * system message nor tools. Qwen3 emits nothing. NULL means nothing. */
@@ -68,6 +87,17 @@ typedef struct {
     /* Qwen3 suppresses reasoning by PRE-FILLING an empty think block. Granite
      * has no such mechanism, so `think` simply does not apply to it. */
     int         think_prefill;
+    /* LFM2 goes the other way: its template ALWAYS opens `<think>` after the
+     * assistant marker, so reasoning is the default and the only lever is
+     * whether that tag gets emitted. NULL for families without it. */
+    const char *think_open;
+    mynah_slm_tool_style tool_style;
+    /* The markers that delimit a call in GENERATED text. The tool channel is
+     * split by token id, so these are looked up in the vocabulary rather than
+     * matched as strings, and a family that spells them differently would
+     * otherwise have its calls land in the visible answer as prose. */
+    const char *call_open;
+    const char *call_close;
 } mynah_slm_chat_family;
 
 /* By `general.architecture`. Unknown families get ChatML, which is what most
