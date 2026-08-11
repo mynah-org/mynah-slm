@@ -358,7 +358,10 @@ size_t mynah_slm_tool_calls_to_json(const mynah_slm_tool_call *calls, size_t n,
 
     put(&c, "[");
     for (size_t i = 0; i < n; i++) {
-        char id[96];
+        /* 1 comma + 9 + 20 (%zu) + 12 + 20 (%zu) + 39 + NUL = 102 in the worst
+         * case gcc has to assume, which is why 96 was a truncation warning even
+         * though no caller has ever had 10^19 tool calls. */
+        char id[128];
         snprintf(id, sizeof id, "%s{\"index\":%zu,\"id\":\"call_%zu\","
                                 "\"type\":\"function\",\"function\":{\"name\":",
                  i ? "," : "", i, i);
