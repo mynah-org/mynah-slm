@@ -497,8 +497,10 @@ static void test_kv_packed(void) {
         mynah_slm_kv_put_k(&kv, 0, 1, row);
         mynah_slm_kv_put_v(&kv, 0, 1, row);
 
-        /* The reference: decode the slice, then dot it in plain f32. */
-        float slice[HD];
+        /* The reference: decode the slice, then dot it in plain f32.
+         * gather_k writes n_kv rows of head_dim, so the buffer is 2*HD — one
+         * HD was a stack overflow that only showed up off this machine. */
+        float slice[2 * HD];
         mynah_slm_kv_gather_k(&kv, 0, 1, 2, slice);      /* positions 0..1 */
         const float *k1 = slice + HD;                    /* position 1 */
         double want = 0.0;
