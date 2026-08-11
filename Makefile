@@ -80,6 +80,7 @@ help:
 	@echo "  ubsan        UBSan rebuild + test, then clean"
 	@echo "  asan         ASan+UBSan rebuild + test (LINUX CI ONLY, see below)"
 	@echo "  leaks        macOS native leak check (no rebuild)"
+	@echo "  warnings     the CI -Werror gate, same flags (your CC: see caveat)"
 	@echo "  update-ingot refresh the vendored ingot subtree"
 	@echo "  install      PREFIX=$(PREFIX)"
 	@echo "  dist         relocatable tarball in dist/ (see ARCH_FLAGS first)"
@@ -235,6 +236,22 @@ SAN_ADD := -g -fno-omit-frame-pointer
 debug:
 	$(MAKE) clean && $(MAKE) EXTRA_CFLAGS="$(SAN_ADD) -O0"
 
+# The exact command safety.yml's `warnings` job runs, so a red gate can be
+# reproduced before pushing instead of after. ARCH_FLAGS is emptied and -O2
+# appended for the reason that workflow spells out: -march=native and -O3 make
+# gcc's interprocedural warnings depend on which runner the job landed on
+# rather than on the code. Clean on both sides — these objects are built with
+# different flags than the normal build and must not be left to be relinked.
+#
+# Caveat, and it is precisely why those pushes went red: this runs YOUR
+# compiler. On this Mac that is clang, while every warning that has actually
+# broken this repo so far (-Wformat-truncation, glibc's fortified snprintf, a
+# header glibc needs and libSystem does not) is gcc-on-glibc. Green here is
+# necessary, not sufficient — `make warnings CC=gcc-14` if you have it from
+# Homebrew, but only Linux CI covers the glibc half.
+warnings:
+	$(MAKE) clean && $(MAKE) lib ARCH_FLAGS= EXTRA_CFLAGS="-O2 -Werror" && $(MAKE) clean
+
 # clean at the end too: the sanitized objects must NOT be left behind to
 # pollute the normal build
 ubsan:
@@ -303,4 +320,4 @@ dist: mynah-slm mynah-slm-server libmynah_slm.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all help lib shared test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks clean install dist update-ingot
+.PHONY: all help lib shared test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot

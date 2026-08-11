@@ -101,5 +101,23 @@ jobs:
 
       # -Werror is a gate, not the default build: a new compiler's new warning
       # should stop us here, never somebody trying to build the library.
+      #
+      # Pinned to -O2 and a generic -march, the way ingot's identical gate is
+      # (its safety.yml passes CFLAGS="-O2 -Werror"), so the verdict depends on
+      # the code and nothing else:
+      #
+      #   -march=native on a hosted runner is not reproducible. GitHub's pool
+      #   mixes CPU generations, so inlining and vectorization -- and with them
+      #   gcc's interprocedural warnings (-Wformat-truncation, -Wstringop-*,
+      #   -Warray-bounds) -- change with whichever machine the job landed on.
+      #   The same commit can be red on one run and green on a rerun.
+      #
+      #   -O3 deepens exactly that interprocedural analysis, which is where
+      #   those warnings' known false positives come from.
+      #
+      # CFLAGS= cannot express this (build.yml:58 explains why: it would drop
+      # every flag the Makefile computes). ARCH_FLAGS and EXTRA_CFLAGS are the
+      # hooks meant for it, and the appended -O2 beats the default -O3 because
+      # the last -O on the command line wins. Same command as `make warnings`.
       - name: Build with -Werror
-        run: make lib CC=${{ matrix.cc }} EXTRA_CFLAGS="-Werror"
+        run: make lib CC=${{ matrix.cc }} ARCH_FLAGS= EXTRA_CFLAGS="-O2 -Werror"
