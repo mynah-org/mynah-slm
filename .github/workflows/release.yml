@@ -1,0 +1,160 @@
+# Release: builds the `make dist` tarball on every supported platform and
+# publishes it on the tag's GitHub Release. Same shape as mynah-asr's, with one
+# difference that matters.
+#
+# mynah-asr dispatches its SIMD at RUNTIME, so one baseline x86 binary is both
+# portable and fast. Ours does not: src/kernels.c and src/qmat.c select NEON /
+# AVX2 / scalar with `#if defined(__AVX2__)` at COMPILE time. A single generic
+# x86_64 build would therefore run the scalar fallback on every machine, and a
+# single -march=x86-64-v3 build would SIGILL on anything older than Haswell.
+# So x86 ships twice, and the names say which is which:
+#
+#   linux-x86_64          x86-64-v2, runs anywhere, scalar kernels
+#   linux-x86_64-avx2     x86-64-v3, AVX2+FMA, the one to take on a modern CPU
+#
+# ARCH_FLAGS is the override, never CFLAGS: the Makefile computes the BLAS
+# defines, the include paths and the quoted -DMYNAH_SLM_BUILD into CFLAGS, and
+# a command-line CFLAGS= would drop all of it and fail to compile.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Also publish a draft release with the binaries'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    name: "${{ matrix.os }}-${{ matrix.arch }}${{ matrix.suffix }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            os: linux
+            arch: x86_64
+            suffix: ''
+            arch_flags: '-march=x86-64-v2 -mtune=generic'
+          - runner: ubuntu-latest
+            os: linux
+            arch: x86_64
+            suffix: '-avx2'
+            arch_flags: '-march=x86-64-v3 -mtune=generic'
+          # dotprod (SDOT, what --fast uses) is compile-time on ARM:
+          # armv8.2+dotprod covers Graviton2+, Ampere, Snapdragon, RPi5 — not
+          # the RPi4's Cortex-A72.
+          - runner: ubuntu-24.04-arm
+            os: linux
+            arch: aarch64
+            suffix: ''
+            arch_flags: '-march=armv8.2-a+dotprod'
+          # Apple clang defaults to apple-m1: NEON and dotprod are always there.
+          - runner: macos-latest
+            os: darwin
+            arch: arm64
+            suffix: ''
+            arch_flags: '-mcpu=apple-m1'
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0        # tags: `mynah-slm --version` reports the release name
+
+      - name: Install OpenBLAS (Linux)
+        if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - name: Version string
+        id: v
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The tarball is named after the tag, not after `git describe`, and the
+      # -avx2 suffix has to reach the file name too or the two x86 artifacts
+      # would collide in the release.
+      - name: Build release tarball
+        env:
+          ARCH_FLAGS: ${{ matrix.arch_flags }}
+        run: |
+          make dist MYNAH_SLM_BUILD=${{ steps.v.outputs.name }}
+          BASE=mynah-slm-${{ steps.v.outputs.name }}-${{ matrix.os }}-${{ matrix.arch }}
+          if [ -n "${{ matrix.suffix }}" ]; then
+            mv "dist/$BASE.tar.gz" "dist/$BASE${{ matrix.suffix }}.tar.gz"
+          fi
+          ls -l dist/
+
+      # The suite is the same one CI runs: model-dependent cases exit 77 and
+      # report SKIP, everything else is real. Building a release without it
+      # would ship the one binary nobody tested.
+      - name: Tests against the release flags
+        env:
+          ARCH_FLAGS: ${{ matrix.arch_flags }}
+        run: make test MYNAH_SLM_BUILD=${{ steps.v.outputs.name }}
+
+      - name: Smoke test the packaged binaries
+        run: |
+          BASE=mynah-slm-${{ steps.v.outputs.name }}-${{ matrix.os }}-${{ matrix.arch }}
+          tar xzf "dist/$BASE${{ matrix.suffix }}.tar.gz" -C dist
+          D="dist/$BASE"
+          # the version string must carry the tag, not a stale git describe
+          "$D/bin/mynah-slm" --version | tee /dev/stderr | grep -q "${{ steps.v.outputs.name }}"
+          "$D/bin/mynah-slm-server" --help > /dev/null
+          test -f "$D/lib/libmynah_slm.a"
+          test -f "$D/include/mynah_slm.h"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mynah-slm-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.suffix }}
+          path: dist/mynah-slm-${{ steps.v.outputs.name }}-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.suffix }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.create_release
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Collect tarballs + checksums
+        run: |
+          mkdir -p release
+          find artifacts -type f -name 'mynah-slm-*.tar.gz' -exec cp {} release/ \;
+          cd release && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS
+
+      - name: Version string
+        id: v
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.v.outputs.name }}
+          name: "mynah-slm ${{ steps.v.outputs.name }}"
+          files: release/*
+          generate_release_notes: true
+          # a manual run never publishes on top of a tag: it stays a draft
+          draft: ${{ github.event_name == 'workflow_dispatch' }}

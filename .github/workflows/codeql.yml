@@ -60,3 +60,37 @@ jobs:
             -- -std=c11 -Iinclude -Ithird_party/ingot/include \
                -iquote src -iquote server -D_DEFAULT_SOURCE \
                -DMYNAH_SLM_BLAS_OPENBLAS -DMYNAH_SLM_BUILD='"ci"'
+
+  # tools/ is offline-only and never runs at inference time, but the oracle in
+  # it is what every numeric stage of the C engine is measured against — an
+  # oracle nobody checks is not a reference. Same job as mynah-tts's "Python
+  # tooling", with uv because that is how this repo's tools are managed.
+  python:
+    name: Python tooling
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v9.0.0   # no floating v9 tag: pin the release
+        with:
+          python-version: '3.11'
+
+      # --locked: the lockfile must already agree with pyproject.toml. Letting
+      # CI resolve a fresh one would hide the fact that uv.lock went stale.
+      - name: Sync the offline tooling
+        working-directory: tools
+        run: uv sync --locked
+
+      - name: Byte-compile the offline tools
+        working-directory: tools
+        run: uv run python -m compileall -q oracle eval *.py
+
+      # No checkpoint, no network: these pin the oracle's own kernels — above
+      # all the RoPE variant, where the interleaved and split-half forms both
+      # run, both look reasonable, and only one is Qwen3's.
+      - name: Oracle kernel self-test
+        working-directory: tools
+        run: uv run python -m oracle.test_kernels

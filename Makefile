@@ -82,6 +82,7 @@ help:
 	@echo "  leaks        macOS native leak check (no rebuild)"
 	@echo "  update-ingot refresh the vendored ingot subtree"
 	@echo "  install      PREFIX=$(PREFIX)"
+	@echo "  dist         relocatable tarball in dist/ (see ARCH_FLAGS first)"
 
 # $(INGOT_LIB) is a real prerequisite, not just order-only. Without it a
 # `make update-ingot` (or any local ingot change) rebuilds the archive and
@@ -275,4 +276,31 @@ install: mynah-slm mynah-slm-server libmynah_slm.a
 	install -m 644 libmynah_slm.a $(DESTDIR)$(PREFIX)/lib/
 	install -m 644 include/mynah_slm.h $(DESTDIR)$(PREFIX)/include/
 
-.PHONY: all help lib shared test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks clean install update-ingot
+# A relocatable tarball of the two binaries, the static library, the public
+# header and the model scripts — what .github/workflows/release.yml uploads to
+# a tag, and what anyone can build by hand. Everything lands in dist/, which is
+# gitignored. Usage: make dist  (or `make dist MYNAH_SLM_BUILD=v0.1.0` to name
+# it after the tag rather than after `git describe`).
+#
+# Beware ARCH_FLAGS: the default -march=native is right for a local build and
+# wrong for a binary somebody else runs. The release workflow overrides it, and
+# so should anyone shipping this by hand.
+DIST_OS   := $(shell uname -s | tr '[:upper:]' '[:lower:]')
+DIST_ARCH := $(shell uname -m)
+DIST_NAME := mynah-slm-$(MYNAH_SLM_BUILD)-$(DIST_OS)-$(DIST_ARCH)
+DIST_DIR  := dist/$(DIST_NAME)
+dist: mynah-slm mynah-slm-server libmynah_slm.a
+	@rm -rf $(DIST_DIR)
+	@mkdir -p $(DIST_DIR)/bin $(DIST_DIR)/lib $(DIST_DIR)/include $(DIST_DIR)/scripts
+	install -m 755 mynah-slm mynah-slm-server $(DIST_DIR)/bin/
+	install -m 644 libmynah_slm.a $(DIST_DIR)/lib/
+	install -m 644 include/mynah_slm.h $(DIST_DIR)/include/
+	install -m 644 LICENSE README.md $(DIST_DIR)/
+	install -m 755 scripts/download_model.sh scripts/use_model.sh $(DIST_DIR)/scripts/
+	@strip $(DIST_DIR)/bin/mynah-slm $(DIST_DIR)/bin/mynah-slm-server 2>/dev/null || true
+	cd dist && tar czf $(DIST_NAME).tar.gz $(DIST_NAME)
+	@rm -rf $(DIST_DIR)
+	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
+	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
+
+.PHONY: all help lib shared test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks clean install dist update-ingot
