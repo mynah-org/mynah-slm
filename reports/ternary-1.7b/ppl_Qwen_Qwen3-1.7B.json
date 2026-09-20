@@ -1,0 +1,31 @@
+{
+  "label": "Qwen_Qwen3-1.7B",
+  "model": "/Users/gabrielemastrapasqua/source/personal/mynah-slm/models-local/Qwen_Qwen3-1.7B",
+  "gguf": null,
+  "revision": null,
+  "seq_len": 2048,
+  "windows": 146,
+  "tokens_scored": 298862,
+  "total_tokens": 299078,
+  "nll_per_token": 2.8134643313497523,
+  "perplexity": 16.667560267116727,
+  "dtype": "torch.float16",
+  "logit_chunk": 256,
+  "seed": 0,
+  "dataset": "Salesforce/wikitext",
+  "config": "wikitext-2-raw-v1",
+  "split": "test",
+  "join": "\"\n\n\".join(rows)",
+  "protocol": "non-overlapping windows, score positions 1..L-1",
+  "environment": {
+    "python": "3.13.2",
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "device": "mps",
+    "torch": "2.13.0",
+    "transformers": "5.14.1",
+    "datasets": "5.0.1",
+    "numpy": "2.5.1",
+    "safetensors": "0.8.0"
+  }
+}

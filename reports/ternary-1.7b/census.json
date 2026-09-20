@@ -1,5 +1,5 @@
 {
-  "model": "models-local/Qwen_Qwen3-1.7B",
+  "model": "/Users/gabrielemastrapasqua/source/personal/mynah-slm/models-local/yang31210999_Qwen3-1.7B-PTQTP-1.58b",
   "revision": null,
   "config": {
     "model_type": "qwen3",
@@ -11,16 +11,16 @@
     "head_dim": 128,
     "vocab_size": 151936,
     "tie_word_embeddings": true,
-    "torch_dtype": "bfloat16"
+    "torch_dtype": "float16"
   },
   "tie_check": {
     "declared": true,
-    "both_stored": true,
-    "byte_identical": true,
-    "note": "the checkpoint stores the tied weight TWICE; the duplicate is 593.5 MiB of the file and is dropped by any converter that honours tie_word_embeddings"
+    "both_stored": false,
+    "byte_identical": null,
+    "note": "no lm_head tensor: the checkpoint stores the tied weight once"
   },
   "params_distinct": 1720574976,
-  "params_stored": 2031739904,
+  "params_stored": 1720574976,
   "families": [
     {
       "family": "down_proj",

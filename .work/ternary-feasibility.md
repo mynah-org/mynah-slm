@@ -1618,3 +1618,78 @@ over the complete model**. The label on the checkpoint says `1.58b`.
 misleading number in this entire literature, and it is not PTQTP's alone: the
 same effect made `Q4_K_M` 5.24 bits/weight on this model, which this repo had
 already documented before the study began.
+
+---
+
+# PHASE F — model scale: the "0.6B is fragile" hypothesis is FALSIFIED  `[MEASURED]`
+
+Same harness, same protocol, same 146 windows / 298,862 tokens as Gate A.
+
+| model | BF16 ours | BF16 `[PAPER]` | PTQTP artifact ours | PTQTP `[PAPER]` | **ratio ours** | ratio `[PAPER]` |
+|---|---|---|---|---|---|---|
+| **Qwen3-0.6B** | 20.9541 | 20.9 | 35.2560 | 38.02 | **1.683** | 1.819 |
+| **Qwen3-1.7B** | 16.6676 | 16.70 | 48.2450 | 32.46 | **2.894** | 1.944 |
+
+**Both baselines reproduce the paper**: +0.26% at 0.6B, **−0.19%** at 1.7B. The
+harness is sound at both sizes, so the artifact numbers are readable.
+
+## The hypothesis is dead
+
+`[MEASURED]` **Qwen3-1.7B degrades 72% MORE than Qwen3-0.6B** under the same
+method, the same authors' pipeline and the same harness — 2.894 against 1.683.
+
+The claim audit (C4) had already shown the paper's own table contradicts the
+monotone reading. Our measurement contradicts it harder, and in the same
+direction:
+
+- `[PAPER]` 0.6B 1.819 → 1.7B 1.944 (1.7B worse by 7%)
+- `[MEASURED]` 0.6B 1.683 → 1.7B 2.894 (**1.7B worse by 72%**)
+
+**"Qwen3-0.6B is an unusually fragile target for extreme PTQ" is FALSIFIED.**
+Every conclusion in this study that leaned on 0.6B being the worst case — and
+several did — must be re-read. On the evidence, 0.6B is the *better* of the two
+small Qwen3 models under ternarization, not the worse.
+
+## The artifacts disagree with the paper in both directions
+
+`[ARTIFACT]` vs `[PAPER]`, same model, same authors:
+
+| model | artifact | paper | artifact is |
+|---|---|---|---|
+| 0.6B | 35.256 | 38.02 | **7% better** |
+| 1.7B | 48.245 | 32.46 | **49% worse** |
+
+`[UNKNOWN]` Why. The released checkpoints are evidently not the Table 1 runs,
+which C8 had already established for 0.6B on structural grounds (the
+undocumented channel rescale, the q/k coverage). Phase F shows the discrepancy
+is not a constant offset and does not even keep its sign, so **no correction
+factor maps one onto the other.** They are two different populations of result
+and must be reported as such.
+
+## q/k protection is systematic, not a 0.6B quirk
+
+`[ARTIFACT]` The 1.7B artifact has the identical structure — distinct values in
+the first 128 columns of two rows, so ≤18 means ternary:
+
+| block | q_proj | k_proj | v_proj | o_proj | gate | up | down |
+|---|---|---|---|---|---|---|---|
+| 0 | 252 | 254 | 17 | 17 | 17 | 17 | 17 |
+| 7 | 251 | 251 | 17 | 17 | 17 | 17 | 17 |
+| 14 | 255 | 250 | 17 | 17 | 17 | 16 | 14 |
+| 21 | 252 | 255 | 17 | 17 | 17 | 17 | 11 |
+| 27 | 227 | 231 | 17 | 17 | 17 | 17 | 17 |
+
+**`q_proj` and `k_proj` are unquantized at 1.7B too, in every block sampled.**
+So the coverage choice is a deliberate, systematic property of the authors'
+pipeline across model sizes — and it remains absent from the paper, which claims
+all linear layers are quantized. The motive stays `[UNKNOWN]`; what changes is
+that it is no longer attributable to anything specific to 0.6B.
+
+## What this does and does not license
+
+`[UNKNOWN]` **Whether 4B reverses the trend.** `[PAPER]` says it does (1.338),
+and the paper's numbers have now been shown to disagree with its own artifacts
+by up to 49%. The 4B measurement is therefore *more* important after Phase F,
+not less: it is the only way to tell whether there is a real non-monotonic
+pattern (0.6B < 1.7B > 4B) or whether the paper's larger-model numbers are as
+unreliable as its 1.7B one.
