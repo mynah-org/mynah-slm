@@ -438,3 +438,273 @@ Append-only. FACT · HYPOTHESIS · TEST · RESULT · DECISION · CLAIM SCOPE.
 - **Using `reference/qwen3-0.6b/safetensors_header.json` for the census.** It is
   the stored view and double-counts the tied embedding: every percentage taken
   from it is wrong by 26%.
+
+---
+
+# Addendum, 2026-09-20 — what the PocketTTS study transfers, and what does not
+
+`mynah-tts` ran the same question against PocketTTS and closed it
+(`../mynah-tts/docs/ternary-feasibility.md`, `PLAN.md` E11, commit `1de7cad`).
+Its verdict was **no-go on the backbone, a conditional small yes on the codec,
+and int8 is the actual win**. Read for evidence, not for its conclusion: a TTS
+model with a non-autoregressive codec beside an AR backbone has different
+economics from a dense decoder-only LM, and the whole point of this section is
+to find out where they differ.
+
+## Transfers — these are CPU and algebra facts, not PocketTTS facts
+
+**T1. No target ISA has a sub-byte multiply-accumulate.** NEON `SDOT`/`SMMLA`,
+AVX-512 VNNI `VPDPBUSD` and AMX are all int8-lane. Our own `src/qmat.c` already
+shows the shape: the Q4 path widens nibbles to int8 *before* the vector dot.
+A ternary weight would do exactly the same. **Ternary's MACs per instruction are
+identical to int8's, so its entire CPU case is weight traffic** — there is no
+arithmetic prize at the end of this, only a bandwidth one. This reframes the
+whole study and it is not in dispute.
+
+**T2. PT²'s AGA and TWLA's E2M-ATQ stage 2 are the same estimator.** Both freeze
+`T` and solve the identical per-row 2×2 system under the calibration metric
+`S = XᵀX`; the papers differ in notation and in how they reach `T`, not in the
+relocation. `mynah-tts` implemented **both** and measured them agreeing to
+**within 0.3% on every layer group**. That answers the brief's question 7 with
+someone else's compute: **implement AGA only**, and keep the warm-start
+difference (E2M's μ-initialisation and residual-mean correction) as a flag on the
+same code path, so what is measured is the warm start and nothing else.
+
+**T3. GPTQ-style error compensation dominates everything else.** On PocketTTS:
+activation-aware grid fitting bought 1.1-8.9×; GPTQ-style compensation bought
+**1.3-108×, median ≈13×**. Their sentence: *"ternary without error compensation
+is not competitive with anything."* Consequence here: **naive W1.58 is a control,
+not a candidate**, and GPTQ compensation is promoted from an implementation
+detail of Method B to a first-class experimental condition that every method is
+run with and without.
+
+**T4. KOTMS is not worth the runtime it costs.** It beat AGA on all eight layers
+measured (1.2-3.7×) and still lost to GPTQ on every one (2-6×) — and it is the
+only method that leaves a permanent inference cost, because `R = R₁ ⊗ R₂` must be
+applied to the activation on every call forever, while GPTQ is a build-time
+transform that costs inference nothing. In a model where activation preparation
+already dominates at small sizes (`engineering-method.md` §8), a persistent
+activation rotation is the worst possible place to spend. **Demoted to optional;
+if run at all, its quality benefit is reported separately from its inference
+cost.**
+
+**T5. Sub-byte unpacking has already lost twice in this family.** `mynah-tts`
+E10's rejected list: batched int4 GEMM measured **0.80-0.97×** on three x86
+boxes, and int8 ConvTranspose was slower than f32 sgemm. Whatever the traffic
+model says, the unpacking is not free.
+
+**T6. The nominal bit-width never appears in the honest total.** PocketTTS's
+"1.58-bit" codec came out at **2.05 bits/weight** once the plane, the per-row
+scale and the per-row shift were counted. Our equivalent is 1.6875 packed
+(`TQ1_0` carries its own block scale) and **2.963 bits/weight over the complete
+model** — see F4.
+
+## Does NOT transfer — and this is the genuine difference
+
+**D1. PocketTTS failed on a MAC/byte mismatch that Qwen3 structurally cannot
+have.** There, the Mimi decoder held **75.4% of the MACs but 11.0% of the ternary
+bytes**, while the backbone held 22.0% of MACs and **79.4% of the bytes** — and
+the backbone was the part that failed quality. Ternary's only lever is bytes, the
+bytes were all in the region that failed, and the region that passed was
+cache-resident and already int8. That is why it was a no-go there.
+
+**In a dense decoder at batch 1, every weight is read exactly once per token and
+feeds exactly one MAC.** `%MAC` and `%weights` are therefore the same number for
+every region — confirmed in the shape census below, where the two columns track
+each other exactly. **There is no cache-resident region doing the arithmetic off
+few bytes, and no byte-heavy region sitting outside the hot path.**
+
+So the brief's question 3 gets a clean answer, and it is *not* the PocketTTS
+answer: **yes, unlike Pocket, ternary here attacks the region that actually owns
+the memory traffic.** Everything the method touches is in the AR loop.
+
+**D2. The failure mode to watch for is different.** PocketTTS died of AR/EOS
+instability that compounded with utterance length — 3/7 long utterances failed to
+terminate at temperature 0. Qwen3's published failure is capability loss
+(+82% perplexity, MMLU 47.1 → 33.6), not non-termination. Both are AR feedback;
+do not assume ours shows up as the same symptom. **The analogue of Pocket's
+"duration ratio" gate is our tool-call eval**, which is a behaviour gate and not
+a perplexity delta, and it is the one that decides.
+
+**D3. The premise "weight bandwidth dominates decode" is established for Pocket
+and NOT established here.** `../mynah-tts/.work/backbone-bandwidth.md` measured
+the PocketTTS backbone at 151 MB per AR step, **32-38 GB/s, and eight cores
+buying only 1.15×** — a textbook memory wall on the same class of machine.
+
+Qwen3-0.6B at Q4_K_M moves **372.7 MiB per token at a measured 36.5 tok/s =
+13.6 GB/s**, which is **less than half the bandwidth that same Mac was shown to
+sustain**. Either our decode is bound by something other than weight bytes, or
+the comparison is unsound. **This is now the pivotal unknown (U6) and it is
+measurable without writing a kernel** — Phase 7b below.
+
+---
+
+## Phase 7a — decode traffic and GEMV shapes  `[MEASURED]`
+
+`python3 tools/qwen_ternary_feasibility.py traffic`. Arithmetic from the census;
+KV cache in bf16 per the repo's quantization policy.
+
+### Weight bytes per decoded token
+
+Because every weight is read once, **weight bytes per token is the model file.**
+
+| scheme | MiB/token | q/k/v/o + gate/up/down | tied lm_head | vs Q4_K_M | AI (FLOP/B) |
+|---|---|---|---|---|---|
+| BF16 | 1137.0 | 73.9% | 26.1% | 0.33× | 1.00 |
+| INT8 / Q8_0 | 604.1 | 73.9% | 26.1% | 0.62× | 1.88 |
+| **Q4_K_M — shipped** | **372.7** | **67.3%** | **32.7%** | **1.00×** | **3.05** |
+| Q3_K_M | 302.4 | 59.7% | 40.2% | 1.23× | 3.76 |
+| **PTQTP 2×1.58** | 299.2 | 59.2% | 40.7% | **1.25×** | 3.80 |
+| IQ2_XXS | 230.2 | 47.0% | 52.9% | 1.62× | 4.94 |
+| **W1.58 single plane** | 210.6 | 42.1% | 57.8% | **1.77×** | 5.40 |
+| IQ1_S | 204.0 | 40.2% | 59.7% | 1.83× | 5.57 |
+| *linears at zero bits (bound)* | *122.0* | *0%* | *99.8%* | *3.06×* | *9.32* |
+
+**The projections' share of traffic falls as you ternarize them.** They are 67.3%
+of the bytes at Q4 and 42.1% at W1.58, because the tied `lm_head` — which no
+method in the brief quantizes — does not move. That is Amdahl's law on bytes, and
+it caps the whole exercise at **3.06×** even with free linear weights.
+
+### The KV cache eats most of what is left
+
+`2 × n_kv_heads(8) × head_dim(128) × n_layers(28) × 2 B` = **114,688 bytes
+(112 KiB) per context position**, read in full every decode step, and **no
+weight-side scheme touches it.**
+
+End-to-end decode traffic speedup against the shipped Q4_K_M:
+
+| scheme | L=128 | L=512 | L=1024 | L=2048 | L=4096 |
+|---|---|---|---|---|---|
+| INT8 / Q8_0 | 0.63× | 0.65× | 0.68× | 0.72× | 0.78× |
+| Q3_K_M | 1.22× | 1.20× | 1.17× | 1.13× | 1.09× |
+| **PTQTP 2×1.58** | **1.23×** | 1.21× | 1.18× | 1.14× | **1.10×** |
+| IQ2_XXS | 1.58× | 1.50× | 1.42× | 1.31× | 1.21× |
+| **W1.58 single plane** | **1.72×** | 1.61× | 1.50× | 1.37× | **1.25×** |
+| **IQ1_S** | **1.77×** | 1.65× | 1.53× | 1.39× | **1.26×** |
+| *linears at zero bits* | *2.84×* | *2.41×* | *2.07×* | *1.72×* | *1.44×* |
+
+**PTQTP — the method the brief makes mandatory — buys between 10% and 23% of
+decode traffic against the file we ship today**, and it costs +82% perplexity on
+this model according to its own authors. `IQ1_S`, which ingot already decodes,
+beats every ternary scheme at every context length.
+
+### Dominant GEMV shapes at batch 1 (M=1)
+
+| N × K | instances | params | % MACs | % bytes @Q4 | % bytes @W1.58 | family |
+|---|---|---|---|---|---|---|
+| **3072 × 1024** | 56 | 176,160,768 | **29.56** | 26.91 | 16.83 | gate_proj, up_proj |
+| **151936 × 1024** | 1 | 155,582,464 | **26.11** | **32.66** | **57.81** | tied lm_head |
+| 1024 × 3072 | 28 | 88,080,384 | 14.78 | 13.45 | 8.42 | down_proj |
+| 1024 × 1024 | 56 | 58,720,256 | 9.85 | 8.97 | 5.61 | k_proj, v_proj |
+| 1024 × 2048 | 28 | 58,720,256 | 9.85 | 8.97 | 5.61 | o_proj |
+| 2048 × 1024 | 28 | 58,720,256 | 9.85 | 8.97 | 5.61 | q_proj |
+
+Two observations a kernel project would need:
+
+- **There are only five distinct linear shapes, all with K ∈ {1024, 2048, 3072}
+  and all a multiple of 256.** That is unusually friendly: a ternary GEMV kernel
+  would need five specialisations plus the head, not a general GEMM. `% MACs` and
+  `% bytes` track each other, which is D1 restated as a table.
+- **The tied `lm_head` becomes the single dominant tensor the moment the linears
+  shrink**: 32.7% of bytes at Q4, **57.8% at W1.58**. Any ternary backend that
+  did not also solve the 151936 × 1024 head would spend most of its traffic
+  budget on the one matrix it cannot touch.
+
+## Phase 7b — is decode actually traffic-bound here?  `[PLANNED]`
+
+The cheapest experiment that decides whether any of the above converts into time.
+Method copied from `../mynah-tts/.work/backbone-bandwidth.md`, because the
+comparison is only meaningful if the measurement is the same one:
+
+- `mynah-slm` on `Qwen3-0.6B-Q4_K_M`, **staged local**, five runs per thread
+  count at 1 / 2 / 4 / 8 threads, median decode tok/s, identical prompt, seed,
+  `--think off`, fixed generated-token count, quiet machine, one process at a
+  time.
+- Derive achieved GB/s = decode tok/s × 372.7 MiB, and compare against the
+  32-38 GB/s the sibling measurement demonstrated on this same machine.
+
+Reading, decided **before** the run so the result cannot be rationalised after:
+
+| observation | conclusion |
+|---|---|
+| tok/s flat from 2 threads up, ≥30 GB/s | traffic-bound. A 1.77× traffic cut is worth up to 1.77×, and the ternary case is live |
+| tok/s scales to 8 threads, ≪30 GB/s | **not** traffic-bound. Cutting weight bytes cannot pay, and the bottleneck must be found before any format work |
+| in between | the honest answer is a roofline with both terms, and the study reports the fraction attributable to traffic rather than a speedup |
+
+Note that AI **rises** from 3.05 to 5.40 FLOP/byte going from Q4 to W1.58: if the
+machine balance sits in that window, ternarizing moves the step from
+traffic-bound to compute-bound and the saved bytes stop turning into time
+somewhere inside the transition. A traffic model alone cannot see that.
+
+## The brief's sharpened questions, as far as Phase 0/7a can answer them
+
+| # | question | answer |
+|---|---|---|
+| 1 | % of decode weight bytes in q/k/v/o + gate/up/down | **67.3% at Q4_K_M**, falling to 59.2% (PTQTP) and 42.1% (W1.58) as they shrink `[MEASURED]` |
+| 2 | are the largest matrices also the dominant traffic? | **yes, necessarily** — at batch 1 bytes ∝ params. Largest single tensor is the tied head (32.7% of Q4 bytes) `[MEASURED]` |
+| 3 | unlike Pocket, does ternary attack the real bottleneck? | **it attacks the right *region*** (no MAC/byte mismatch exists here) — but whether that region is the *bottleneck* is unproven: 13.6 GB/s against a demonstrated 32-38 `[MEASURED / OPEN]` |
+| 4 | bytes/token for BF16 / INT8 / Q4 / W1.58 / PTQTP | 1137.0 / 604.1 / 372.7 / 210.6 / 299.2 MiB `[MEASURED]` |
+| 5 | prefill vs decode | decode AI 3.05 (Q4); prefill over B tokens amortises weights, AI ≈ 3.05·B, so at B=32 it is ~97 FLOP/byte — **prefill is compute-bound and the weight format is nearly irrelevant to it.** The case is decode-only `[MEASURED]` |
+| 6 | test GPTQ compensation explicitly | **adopted** — promoted to a first-class condition on the strength of T3 |
+| 7 | are PT²-AGA and TWLA E2M equivalent? | **yes, on the part that matters** — same per-row 2×2 system under `S = XᵀX`; sibling measured ≤0.3% difference. Implement AGA only `[PUBLISHED + SIBLING-MEASURED]` |
+| 8 | KOTMS skepticism | **justified** — loses to GPTQ 2-6× and is the only method with a permanent runtime activation rotation. Optional, cost reported separately |
+| 9 | reproduce PTQTP's Qwen3-small result first | unchanged, it is the Phase 2 gate: land near **38.02** on Qwen3-0.6B before inventing anything |
+| 10 | quality × bytes, not quantization error | table below; the bytes column is measured, the quality column is **published-only** until Phase 3 |
+
+### Quality × bytes, with what is known today
+
+`[MEASURED]` bytes, `[PUBLISHED]` quality (PTQTP's own Qwen3-0.6B row), `[NOT
+MEASURED]` everything else. This is the table the final report must fill in
+completely.
+
+| configuration | effective model bits | MiB/token decode | WikiText2 ppl | relative quality loss |
+|---|---|---|---|---|
+| BF16 | 16.00 | 1137.0 | 20.90 `[PUBLISHED]` | baseline |
+| INT8 / Q8_0 | 8.50 | 604.1 | `[NOT MEASURED]` | expected ≈ baseline |
+| Q4_K_M (shipped) | 5.24 | 372.7 | `[NOT MEASURED]` | ships today; 25/30 tool calls |
+| PTQTP 2×1.58 + Q6_K head | 4.21 | 299.2 | **38.02 `[PUBLISHED]`** | **+82%; MMLU 47.1 → 33.6** |
+| IQ2_XXS + Q6_K head | 3.24 | 230.2 | `[NOT MEASURED]` | **the control that decides U2** |
+| W1.58 + Q6_K head | 2.96 | 210.6 | `[NOT MEASURED]` | expected worse than PTQTP |
+| IQ1_S + Q6_K head | 2.87 | 204.0 | `[NOT MEASURED]` | **the control that decides U2** |
+
+## Changes to the plan, from this addendum
+
+1. **Method B collapses.** PT²-AGA and TWLA-E2M are one estimator (T2). Implement
+   AGA; E2M's warm start becomes a flag. Saves roughly half of Phase 2.
+2. **GPTQ compensation becomes a first-class axis** (T3), run against every
+   method rather than inside one. Naive W1.58 is demoted to a control.
+3. **KOTMS is optional and reported with its runtime cost attached** (T4).
+4. **Phase 7b is promoted ahead of Phases 3-5.** D3 says the premise of the whole
+   exercise — that weight bandwidth dominates batch-1 decode — is unproven on
+   this model, and it costs one afternoon of benchmarking to settle. If decode is
+   not traffic-bound, no quality result can rescue the kernel case, and the
+   remaining phases become a much smaller quality study rather than a backend
+   investigation.
+5. **The tied `lm_head` gets its own experiment.** At W1.58 it is 57.8% of decode
+   traffic. Any GO verdict is conditional on a scheme for the 151936 × 1024 head,
+   and no paper in the brief supplies one.
+
+## Evidence log — 2026-09-20, addendum
+
+- **FACT (T1)** No target ISA has a sub-byte MAC; ternary's MACs/instruction
+  equal int8's. Ternary's only lever on CPU is weight traffic.
+- **FACT (T2)** PT²-AGA ≡ TWLA-E2M stage 2, sibling-measured ≤0.3% apart on every
+  layer group. **DECISION** implement one.
+- **FACT (T3)** GPTQ compensation 1.3-108× (median ≈13×) vs AGA's 1.1-8.9× on
+  PocketTTS. **DECISION** first-class condition; naive is a control.
+- **FACT (T4)** KOTMS loses to GPTQ 2-6× and carries a permanent runtime
+  activation rotation. **DECISION** optional, cost reported separately.
+- **TEST** Batch-1 decode traffic and GEMV shape census from the measured census.
+- **RESULT (D1)** `%MAC == %weights` for every region, so the MAC/byte mismatch
+  that sank PocketTTS cannot occur here. **Ternary attacks the right region.**
+- **RESULT** Ceiling with linears at *zero* bits is **3.06×** weight traffic, and
+  **1.44×** end-to-end at L=4096. PTQTP delivers **1.10-1.23×** end-to-end.
+- **RESULT** `IQ1_S`, already decodable by ingot, beats every ternary scheme at
+  every context length.
+- **RESULT** The tied head is 32.7% of Q4 traffic and **57.8%** at W1.58.
+- **CONTRADICTION, priority evidence (D3)** Our measured decode is 13.6 GB/s
+  where the sibling demonstrated 32-38 GB/s on the same machine. **The premise
+  that batch-1 decode is weight-bandwidth-bound is not established for this
+  model.** **DECISION** Phase 7b promoted ahead of Phases 3-5.
+- **CLAIM SCOPE** Traffic and shapes only. No quality of ours is measured, and no
+  decode time has yet been attributed to any term.

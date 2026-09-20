@@ -435,6 +435,186 @@ def cmd_budget(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Phase 7a — weight traffic per token, and the GEMV shape census
+#
+# The whole analysis rests on one property of batch-1 autoregressive decode in a
+# dense decoder: EVERY weight is read exactly once per token, and EVERY weight
+# feeds exactly one MAC. So for this model, and unlike the PocketTTS study that
+# motivated these questions, "% of MACs" and "% of weight bytes" cannot diverge
+# per region — there is no cache-resident region doing most of the arithmetic
+# off few bytes. Weight bytes per token IS the model file.
+#
+# What does NOT scale with the weight format is the KV cache, which is read in
+# full every step and grows with context. That is the term that decides how much
+# of the win a weight-side scheme can actually deliver.
+# ---------------------------------------------------------------------------
+
+# Schemes as (label, linear bits/weight, embedding format). Kept in the order we
+# want the report to read.
+TRAFFIC_SCHEMES = [
+    ("BF16", 16.0, "bf16"),
+    ("INT8 / Q8_0", 8.5, "q8_0"),
+    ("Q4_K_M (shipped, exact recipe)", 4.5, "q6_k"),
+    ("Q3_K_M", 3.4375, "q6_k"),
+    ("PTQTP 2x1.58", 3.375, "q6_k"),
+    ("IQ2_XXS", 2.0625, "q6_k"),
+    ("W1.58 single plane", 1.6875, "q6_k"),
+    ("IQ1_S", 1.5625, "q6_k"),
+    ("W1.58, free embedding (bound)", 0.0, "q6_k"),
+]
+
+
+def cmd_traffic(args) -> int:
+    model_dir = Path(args.model)
+    tensors, cfg = census(model_dir)
+    tie = tie_check(model_dir, tensors, cfg)
+    dedup = tie.get("byte_identical") is True
+    kept = [t for t in tensors if not (dedup and t.name == "lm_head.weight")]
+
+    n_layers = cfg["num_hidden_layers"]
+    n_kv = cfg["num_key_value_heads"]
+    n_heads = cfg["num_attention_heads"]
+    head_dim = cfg["head_dim"]
+    hidden = cfg["hidden_size"]
+
+    lin = sum(t.params for t in kept if t.family in FAMILIES)
+    emb = sum(t.params for t in kept if t.family in ("embedding", "lm_head"))
+    norm_bytes = sum(t.params for t in kept if t.family == "norm") * 4
+
+    by_fam = {}
+    for t in kept:
+        if t.family in FAMILIES:
+            by_fam[t.family] = by_fam.get(t.family, 0) + t.params
+
+    # llama.cpp's Q4_K_M bumps attn_v and ffn_down to Q6_K on 14 of the 28
+    # layers. The baseline every ratio below is divided by has to be the file we
+    # actually ship, not an idealised flat Q4_K — that is a 4% difference and it
+    # sits in the denominator of every row.
+    bumped = sum(t.params for t in kept
+                 if t.family in ("v_proj", "down_proj")
+                 and t.block in (0, 1, 2, 5, 8, 11, 14, 17, 20, 23, 24, 25, 26, 27))
+
+    def weight_bytes(lin_bits: float, emb_fmt: str, recipe: bool = False) -> float:
+        if recipe:  # the exact shipped Q4_K_M
+            lb = ((lin - bumped) * 4.5 + bumped * 6.5625) / 8
+        else:
+            lb = lin * lin_bits / 8
+        return lb + emb * FORMATS[emb_fmt][0] / 8 + norm_bytes
+
+    baseline = weight_bytes(4.5, "q6_k", recipe=True)
+
+    # KV cache read in full every decode step: K and V, per layer, per position.
+    kv_per_pos = 2 * n_kv * head_dim * n_layers * args.kv_bytes
+
+    # MACs per decoded token: one per linear weight, one per lm_head weight,
+    # plus the attention score and AV products, which scale with context.
+    mac_weights = lin + emb
+    mac_attn_per_pos = 2 * n_heads * head_dim * n_layers
+
+    rows = []
+    for label, lin_bits, emb_fmt in TRAFFIC_SCHEMES:
+        recipe = label.startswith("Q4_K_M")
+        wb = weight_bytes(lin_bits, emb_fmt, recipe)
+        lb = wb - emb * FORMATS[emb_fmt][0] / 8 - norm_bytes
+        eb = emb * FORMATS[emb_fmt][0] / 8
+        row = dict(
+            scheme=label,
+            linear_bpw=lin_bits,
+            embedding=emb_fmt,
+            weight_MiB_per_token=wb / 2**20,
+            linear_share_pct=100 * lb / wb,
+            embedding_share_pct=100 * eb / wb,
+            vs_q4km=baseline / wb,
+            arithmetic_intensity=2 * mac_weights / wb,
+        )
+        for L in args.context:
+            tot = wb + L * kv_per_pos
+            row[f"total_MiB_at_L{L}"] = tot / 2**20
+            row[f"vs_q4km_at_L{L}"] = (baseline + L * kv_per_pos) / tot
+        rows.append(row)
+
+    write_csv(args, "traffic_decode.csv", rows)
+
+    # --- GEMV shape census -------------------------------------------------
+    shapes: dict[tuple, dict] = {}
+    for t in kept:
+        if t.family not in FAMILIES and t.family != "embedding":
+            continue
+        key = (t.rows, t.cols)
+        e = shapes.setdefault(key, dict(N=t.rows, K=t.cols, instances=0, params=0,
+                                        families=set()))
+        e["instances"] += 1
+        e["params"] += t.params
+        e["families"].add("lm_head (tied)" if t.family == "embedding" else t.family)
+
+    q4 = baseline
+    tern = weight_bytes(1.6875, "q6_k")
+    shape_rows = []
+    for (n, k), e in sorted(shapes.items(), key=lambda kv: -kv[1]["params"]):
+        is_head = "lm_head (tied)" in e["families"]
+        b_q4 = e["params"] * (6.5625 if is_head else 4.5) / 8
+        if not is_head:  # carry the Q6_K bumps into the shape's Q4_K_M share
+            share = e["params"] / lin
+            b_q4 += share * bumped * (6.5625 - 4.5) / 8
+        b_tern = e["params"] * (6.5625 if is_head else 1.6875) / 8
+        shape_rows.append(dict(
+            shape=f"{n} x {k}",
+            N=n, K=k,
+            instances=e["instances"],
+            families="/".join(sorted(e["families"])),
+            params=e["params"],
+            pct_of_macs=100 * e["params"] / mac_weights,
+            pct_of_bytes_q4=100 * b_q4 / q4,
+            pct_of_bytes_ternary=100 * b_tern / tern,
+        ))
+    write_csv(args, "traffic_shapes.csv", shape_rows)
+    write_json(args, "traffic.json", dict(
+        model=str(model_dir), revision=args.revision,
+        kv_bytes_per_position=kv_per_pos,
+        macs_per_token_weights=mac_weights,
+        macs_per_token_attention_per_position=mac_attn_per_pos,
+        decode=rows, shapes=shape_rows))
+
+    # --- print -------------------------------------------------------------
+    print(f"# Phase 7a — batch-1 decode traffic, {model_dir}")
+    print(f"# every weight is read once per token, so weight bytes/token == the model file")
+    print()
+    print(f"{'scheme':<32}{'MiB/tok':>9}{'linear%':>9}{'embed%':>8}{'vs Q4':>7}{'AI':>7}")
+    for r in rows:
+        print(f"{r['scheme']:<32}{r['weight_MiB_per_token']:>9.1f}"
+              f"{r['linear_share_pct']:>9.1f}{r['embedding_share_pct']:>8.1f}"
+              f"{r['vs_q4km']:>7.2f}{r['arithmetic_intensity']:>7.2f}")
+    print()
+    print("AI = FLOP per byte of weight traffic at batch 1. A CPU's machine balance")
+    print("is typically 3-10 FLOP/byte; above it the step stops being traffic-bound")
+    print("and the saved bytes stop turning into time.")
+    print()
+
+    print(f"KV cache: {kv_per_pos:,} bytes per context position per token "
+          f"({kv_per_pos/2**10:.0f} KiB), read in full every step")
+    print()
+    hdr = "".join(f"{('L=' + str(L)):>12}" for L in args.context)
+    print(f"{'total MiB/token':<32}{hdr}")
+    for r in rows:
+        cells = "".join(f"{r[f'total_MiB_at_L{L}']:>12.1f}" for L in args.context)
+        print(f"{r['scheme']:<32}{cells}")
+    print()
+    print(f"{'end-to-end speedup vs Q4_K_M':<32}{hdr}")
+    for r in rows:
+        cells = "".join(f"{r[f'vs_q4km_at_L{L}']:>12.2f}" for L in args.context)
+        print(f"{r['scheme']:<32}{cells}")
+
+    print()
+    print("# Dominant GEMV shapes at batch 1 (M=1). MAC share == weight share.")
+    print(f"{'N x K':<16}{'inst':>6}{'params':>14}{'%MAC':>8}{'%B Q4':>8}{'%B tern':>9}  family")
+    for r in shape_rows:
+        print(f"{r['shape']:<16}{r['instances']:>6}{r['params']:>14,}"
+              f"{r['pct_of_macs']:>8.2f}{r['pct_of_bytes_q4']:>8.2f}"
+              f"{r['pct_of_bytes_ternary']:>9.2f}  {r['families']}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Phases not written yet — they refuse rather than print a placeholder.
 # ---------------------------------------------------------------------------
 
@@ -502,8 +682,11 @@ def build_parser() -> argparse.ArgumentParser:
         fn=not_yet("Phase 4 (coverage)", "Phase 3 must rank the tensors first."))
     sub.add_parser("mixed", help="Phase 5 — mixed-precision search").set_defaults(
         fn=not_yet("Phase 5 (mixed)", "Phase 4 must produce the curves first."))
-    sub.add_parser("shapes", help="Phase 7 — matrix shapes and traffic/token").set_defaults(
-        fn=not_yet("Phase 7 (shapes)", "Gated on a GO verdict from Phase 5/6."))
+    t = sub.add_parser("traffic", help="Phase 7a — decode/prefill weight traffic and GEMV shapes")
+    t.add_argument("--context", type=int, nargs="*", default=[128, 512, 1024, 2048, 4096],
+                   help="context lengths for the KV-cache traffic column")
+    t.add_argument("--kv-bytes", type=int, default=2, help="bytes per KV element (bf16 = 2)")
+    t.set_defaults(fn=cmd_traffic)
     return p
 
 
