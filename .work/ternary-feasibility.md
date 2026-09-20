@@ -146,8 +146,14 @@ by the method's authors on their own implementation:
 | Qwen3-4B | 13.64 → 18.25  (+34%) | 69.7% → 63.7% |
 | Qwen3-32B | 8.64 → 10.06  (+16%) | — |
 
-**The degradation is monotone in model size and 0.6B is the worst case in the
-paper.** That is the opposite of a favourable setting.
+> **CORRECTION 2026-09-20 (R1-A claim audit).** This paragraph read *"the
+> degradation is monotone in model size and 0.6B is the worst case in the
+> paper."* **Both halves are false on the table directly above them.** The
+> ratios are 0.6B **1.819**, 1.7B **1.944**, 4B 1.338, 8B 1.215, 32B 1.164:
+> not monotone, and **1.7B is the worst case, not 0.6B**. The narrative was
+> written over arithmetic that contradicts it. What the table supports is only
+> that the two smallest models degrade far more than the three largest, and
+> even that is `[PAPER]`, not ours. Phase F measures it on our harness.
 
 Independent corroboration on Qwen3-4B (arXiv 2609.01962, TWLA-derived: KOTMS
 rotation + E2M-ATQ + GPTQ error compensation, W-only, A16): WikiText2

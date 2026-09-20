@@ -666,22 +666,46 @@ def _load_wikitext2_test() -> str:
     return "\n\n".join(ds["text"])
 
 
+def _environment(dev: str) -> dict:
+    """Everything needed to reproduce a number, recorded with it."""
+    import platform
+
+    env = dict(python=sys.version.split()[0], platform=platform.platform(),
+               machine=platform.machine(), device=dev)
+    for mod in ("torch", "transformers", "datasets", "numpy", "safetensors"):
+        try:
+            env[mod] = __import__(mod).__version__
+        except Exception:
+            env[mod] = None
+    return env
+
+
 def cmd_ppl(args) -> int:
     model_dir = Path(args.model)
-    if not (model_dir / "config.json").is_file():
-        raise Refusal(f"no config.json under {model_dir}")
     try:
         import torch
+        import torch.nn.functional as F
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as e:
         raise Refusal(f"torch/transformers missing ({e}); use `uv run --extra check`")
 
+    load_kwargs = {}
+    if args.gguf:
+        if not (model_dir / args.gguf).is_file():
+            raise Refusal(f"no {args.gguf} under {model_dir}")
+        load_kwargs["gguf_file"] = args.gguf
+        label = args.gguf
+    else:
+        if not (model_dir / "config.json").is_file():
+            raise Refusal(f"no config.json under {model_dir}")
+        label = model_dir.name
+
     dev = args.device or ("mps" if torch.backends.mps.is_available() else "cpu")
     tok_dir = Path(args.tokenizer) if args.tokenizer else model_dir
     tok = AutoTokenizer.from_pretrained(tok_dir)
+    dtype = torch.float32 if dev == "cpu" else torch.float16
     model = AutoModelForCausalLM.from_pretrained(
-        model_dir, dtype=torch.float32 if dev == "cpu" else torch.float16
-    ).to(dev).eval()
+        model_dir, dtype=dtype, **load_kwargs).to(dev).eval()
 
     text = _load_wikitext2_test()
     ids = tok(text, return_tensors="pt").input_ids
@@ -692,26 +716,40 @@ def cmd_ppl(args) -> int:
     if n_windows == 0:
         raise Refusal(f"tokenized corpus is shorter than one window of {L}")
 
+    # The loss is computed in POSITION CHUNKS rather than materialising
+    # [1, L, vocab] logits in one go. With a 151936-entry vocabulary that tensor
+    # is 622 MB in fp16 before cross-entropy upcasts it, which on a 16 GB machine
+    # is the difference between running and swapping. Mathematically identical:
+    # the mean is recomputed from the summed NLL over the same token set.
+    CH = args.logit_chunk
     nll, n_tok = 0.0, 0
     with torch.no_grad():
         for w in range(n_windows):
-            chunk = ids[:, w * L : (w + 1) * L].to(dev)
-            out = model(chunk, labels=chunk)
-            # HF averages over L-1 predicted tokens
-            nll += float(out.loss) * (L - 1)
-            n_tok += L - 1
-            if args.verbose and (w + 1) % 10 == 0:
+            chunk = ids[:, w * L:(w + 1) * L].to(dev)
+            hidden = model.model(chunk).last_hidden_state[0]      # [L, hidden]
+            tgt = chunk[0, 1:]                                    # predict 1..L-1
+            for a in range(0, L - 1, CH):
+                b = min(a + CH, L - 1)
+                logits = model.lm_head(hidden[a:b]).float()
+                nll += float(F.cross_entropy(logits, tgt[a:b], reduction="sum"))
+                n_tok += b - a
+            if args.verbose and (w + 1) % 20 == 0:
                 print(f"  window {w+1}/{n_windows}  running ppl "
-                      f"{math.exp(nll / n_tok):.3f}", file=sys.stderr)
+                      f"{math.exp(nll / n_tok):.4f}", file=sys.stderr)
 
     ppl = math.exp(nll / n_tok)
-    res = dict(model=str(model_dir), revision=args.revision, device=dev,
-               seq_len=L, windows=n_windows, tokens=n_tok,
-               nll_per_token=nll / n_tok, perplexity=ppl,
-               dataset="wikitext-2-raw-v1/test", protocol="non-overlapping windows")
-    write_json(args, f"ppl_{model_dir.name}.json", res)
-    print(f"{model_dir}")
-    print(f"  wikitext2 ppl = {ppl:.3f}   ({n_windows} windows x {L} tok, {dev})")
+    res = dict(label=label, model=str(model_dir), gguf=args.gguf,
+               revision=args.revision, seq_len=L, windows=n_windows,
+               tokens_scored=n_tok, total_tokens=int(ids.numel()),
+               nll_per_token=nll / n_tok, perplexity=ppl, dtype=str(dtype),
+               logit_chunk=CH, seed=args.seed,
+               dataset="Salesforce/wikitext", config="wikitext-2-raw-v1",
+               split="test", join='"\n\n".join(rows)',
+               protocol="non-overlapping windows, score positions 1..L-1",
+               environment=_environment(dev))
+    write_json(args, f"ppl_{label.replace('/', '_')}.json", res)
+    print(f"{label}")
+    print(f"  wikitext2 ppl = {ppl:.4f}   ({n_windows} x {L} tok = {n_tok:,} scored, {dev})")
     return 0
 
 
@@ -1112,6 +1150,11 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--device", default=None, help="mps | cpu (default: mps if available)")
     pp.add_argument("--tokenizer", default=None, help="tokenizer dir, if not --model")
     pp.add_argument("--max-windows", type=int, default=None)
+    pp.add_argument("--gguf", default=None,
+                    help="score a GGUF inside --model instead of its safetensors; "
+                         "transformers dequantizes it, so every format lands in ONE harness")
+    pp.add_argument("--logit-chunk", type=int, default=256,
+                    help="positions per lm_head/cross-entropy chunk")
     pp.add_argument("--verbose", action="store_true")
     pp.set_defaults(fn=cmd_ppl)
 

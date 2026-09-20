@@ -84,6 +84,9 @@ instrumentation, M3 CLI polish, M5b quantization & footprint, M6 release.
       UNMEASURED.** **GATE B (CPU backend): UNDECIDED** — awaiting Gate A and
       target-ISA evidence; this Mac cannot close it
       → [`.work/ternary-feasibility.md`](.work/ternary-feasibility.md)
+- [~] **R1-A** — claim audit: every load-bearing conclusion in R1, with its
+      evidence class and what would falsify it. Five claims changed status
+      → [`.work/r1-claim-audit.md`](.work/r1-claim-audit.md)
 - [x] **R1-P** — reading PTQTP properly: what "2 x 1.58-bit" physically is, and
       what the authors' released Qwen3-0.6B artifact actually contains
       → [`.work/ptqtp-paper-reading.md`](.work/ptqtp-paper-reading.md)
