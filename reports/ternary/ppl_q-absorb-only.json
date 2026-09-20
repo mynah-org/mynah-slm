@@ -1,0 +1,12 @@
+{
+  "model": "/Users/gabrielemastrapasqua/source/personal/mynah-slm/models-local/q-absorb-only",
+  "revision": null,
+  "device": "mps",
+  "seq_len": 2048,
+  "windows": 146,
+  "tokens": 298862,
+  "nll_per_token": 3.041614439389477,
+  "perplexity": 20.93902074175018,
+  "dataset": "wikitext-2-raw-v1/test",
+  "protocol": "non-overlapping windows"
+}

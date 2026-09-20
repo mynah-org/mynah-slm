@@ -1228,3 +1228,36 @@ sequences of 2048 tokens from **WikiText-2 train** — never the test split the
 perplexity is measured on. Running: α ∈ {0.5, 1.0} with `q`/`k` protected, plus
 an **absorb-only control that must return 20.954** and which is the end-to-end
 proof that nothing else changed.
+
+### A2 results — the absorption we could implement makes it WORSE  `[MEASURED]`
+
+| condition | ppl | vs the same thing without absorption |
+|---|---|---|
+| **control: absorption only, nothing quantized** | **20.939** | baseline is 20.954 → **−0.07%** |
+| Method C + `q`/`k` protected, no absorption | 43.331 | — |
+| **Method C + `q`/`k` protected + activation absorption α=+0.5** | **62.316** | **+44% worse** |
+
+**The control is the important row.** 20.939 against a 20.954 baseline, with 311
+tensors untouched and 56 norm groups rescaled: absorption is function-preserving
+end to end, and the 0.07% is fp16 storage rounding of the rescaled values. So the
+62.316 is a real effect of the scale, not a bug in the plumbing — the plumbing was
+proven first, separately, on logits (3.1e-06) and now on perplexity.
+
+**And the effect is negative.** AWQ's scale direction — `s_j = (mean|x_j|)^α`,
+amplifying the weight columns of high-activation channels so their *relative*
+quantization error shrinks — costs 19 perplexity points here.
+
+The likely reason, stated as a hypothesis before testing it: **AWQ's direction is
+tuned for an asymmetric integer grid whose step is set by `max|W|` within a
+group.** Amplifying a few salient columns there is affordable. A trit-plane pair
+has **9 reachable values per group of 128**, and widening the group's dynamic
+range is exactly what a 9-level grid cannot absorb — it spends its levels on the
+amplified columns and coarsens everything else. For ternary the useful direction
+may be the opposite: *flatten* the range rather than protect the salient channels.
+
+That is testable with one sign flip (`--absorb-alpha -0.5`), and it is queued.
+
+**Either way, one thing is already settled**: the 8-point gain in the authors'
+artifact is **not** reproduced by the AWQ-shaped rule, in either the weight-only
+form (which moved nothing, §A2) or this activation form (which moved 19 points in
+the wrong direction). Whatever their undocumented step is, it is not this.

@@ -1,0 +1,27 @@
+{
+  "source": "/Users/gabrielemastrapasqua/source/personal/mynah-slm/models-local/qwen3-0.6b-bf16",
+  "out": "/Users/gabrielemastrapasqua/source/personal/mynah-slm/models-local/q-absorb-only",
+  "method": "ptqtp",
+  "group": 128,
+  "iters": 50,
+  "eps": 0.0001,
+  "device": "mps",
+  "absorb_alpha": 0.5,
+  "norm_groups_absorbed": 56,
+  "absorb_kind": "activation",
+  "protected_families": [
+    "down_proj",
+    "gate_proj",
+    "k_proj",
+    "o_proj",
+    "q_proj",
+    "up_proj",
+    "v_proj"
+  ],
+  "tensors_quantized": 0,
+  "tensors_untouched": 311,
+  "rel_err_min": null,
+  "rel_err_max": null,
+  "rel_err_mean": null,
+  "per_tensor": []
+}
