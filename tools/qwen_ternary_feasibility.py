@@ -1207,6 +1207,104 @@ def cmd_sensitivity(args) -> int:
     return 0
 
 
+
+# ---------------------------------------------------------------------------
+# Phase K — mixed precision as a first-class candidate.
+#
+# Driven by Phase C: the sensitivity axis here is the FAMILY, not the layer
+# (blocks span 1.001-1.040, families span 1.032-1.371). So the search space is
+# "which families stay at Q4, which go ternary", which is small enough to
+# enumerate rather than search.
+#
+# Every layout is MEASURED, never extrapolated: Phase C established that the
+# individual family ratios under-predict the joint cost by 39%.
+# ---------------------------------------------------------------------------
+
+MIXED_LAYOUTS = [
+    ("all-ternary", ()),
+    ("protect down", ("down_proj",)),
+    ("protect down+up", ("down_proj", "up_proj")),
+    ("protect q+k (artifact layout)", ("q_proj", "k_proj")),
+    ("protect down+q+k", ("down_proj", "q_proj", "k_proj")),
+    ("protect down+up+q+k", ("down_proj", "up_proj", "q_proj", "k_proj")),
+    ("MLP only", ("q_proj", "k_proj", "v_proj", "o_proj")),
+    ("attention only", ("gate_proj", "up_proj", "down_proj")),
+]
+
+
+def cmd_mixed(args) -> int:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    src = Path(args.model)
+    method = METHODS.get(args.method or "ptqtp")
+    if method is None:
+        raise Refusal(f"unknown --method {args.method!r}")
+    dev = args.device or ("mps" if torch.backends.mps.is_available() else "cpu")
+
+    # byte model, from the real census of the SAME checkpoint
+    tensors, cfg = census(src)
+    tie = tie_check(src, tensors, cfg)
+    kept = [t for t in tensors
+            if not (tie.get("byte_identical") is True and t.name == "lm_head.weight")]
+    total = sum(t.params for t in kept)
+    emb = sum(t.params for t in kept if t.family in ("embedding", "lm_head"))
+    other = sum(t.params for t in kept if t.family == "norm") * 4
+    per_fam = {}
+    for t in kept:
+        if t.family in FAMILIES:
+            per_fam[t.family] = per_fam.get(t.family, 0) + t.params
+
+    tok = AutoTokenizer.from_pretrained(Path(args.tokenizer) if args.tokenizer else src)
+    ids = tok(_load_wikitext2_test(), return_tensors="pt").input_ids
+    L = args.seq_len
+    n_windows = min(args.windows, ids.numel() // L)
+    model = AutoModelForCausalLM.from_pretrained(
+        src, dtype=torch.float16 if dev != "cpu" else torch.float32).to(dev).eval()
+    named = dict(model.named_parameters())
+    base_ppl, n_tok = _ppl_inline(model, ids, L, n_windows, dev)
+    print(f"# baseline {base_ppl:.4f} over {n_windows} windows ({n_tok:,} tokens)")
+    print(f"# ternary at {args.ternary_bpw} bpw, protected families at "
+          f"{args.protect_bpw} bpw, embedding q6_k\n")
+
+    rows = []
+    print(f"{'layout':<32}{'cover%':>8}{'bpw':>7}{'MiB':>8}{'ppl':>10}{'ratio':>7}")
+    for label, protect in MIXED_LAYOUTS:
+        names = [n for n in named
+                 if classify(n.replace("model.model.", "model."))[1] in FAMILIES
+                 and classify(n.replace("model.model.", "model."))[1] not in protect]
+        tern_params = sum(per_fam[f] for f in FAMILIES if f not in protect)
+        prot_params = sum(per_fam[f] for f in FAMILIES if f in protect)
+        b = (tern_params * args.ternary_bpw + prot_params * args.protect_bpw
+             + emb * FORMATS["q6_k"][0]) / 8 + other
+        saved = {n: named[n].detach().clone() for n in names}
+        with torch.no_grad():
+            for n in names:
+                W = named[n].detach().to(torch.float32)
+                named[n].copy_(method(W, group=args.group, iters=args.iters,
+                                      eps=args.eps).to(named[n].dtype))
+        ppl, _ = _ppl_inline(model, ids, L, n_windows, dev)
+        with torch.no_grad():
+            for n, v in saved.items():
+                named[n].copy_(v)
+        del saved
+        rows.append(dict(layout=label, protected=list(protect),
+                         coverage_pct=round(100 * tern_params / total, 2),
+                         whole_model_bpw=round(b * 8 / total, 3),
+                         MiB=round(b / 2**20, 1), ppl=round(ppl, 4),
+                         ratio=round(ppl / base_ppl, 4)))
+        print(f"{label:<32}{100*tern_params/total:>8.1f}{b*8/total:>7.3f}"
+              f"{b/2**20:>8.1f}{ppl:>10.4f}{ppl/base_ppl:>7.3f}")
+
+    write_csv(args, "mixed_precision.csv", rows)
+    write_json(args, "mixed_precision.json",
+               dict(model=str(src), windows=n_windows, tokens=n_tok,
+                    baseline_ppl=base_ppl, ternary_bpw=args.ternary_bpw,
+                    protect_bpw=args.protect_bpw, rows=rows,
+                    environment=_environment(dev)))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Phases not written yet — they refuse rather than print a placeholder.
 # ---------------------------------------------------------------------------
@@ -1314,8 +1412,17 @@ def build_parser() -> argparse.ArgumentParser:
     sn.set_defaults(fn=cmd_sensitivity)
     sub.add_parser("coverage", help="Phase 4 — degradation curves").set_defaults(
         fn=not_yet("Phase 4 (coverage)", "Phase 3 must rank the tensors first."))
-    sub.add_parser("mixed", help="Phase 5 — mixed-precision search").set_defaults(
-        fn=not_yet("Phase 5 (mixed)", "Phase 4 must produce the curves first."))
+    mx = sub.add_parser("mixed", help="Phase K — measured mixed-precision layouts")
+    mx.add_argument("--windows", type=int, default=30)
+    mx.add_argument("--group", type=int, default=128)
+    mx.add_argument("--iters", type=int, default=50)
+    mx.add_argument("--eps", type=float, default=1e-4)
+    mx.add_argument("--ternary-bpw", type=float, default=4.25,
+                    help="storage rate of the ternary part; 4.25 is PTQTP as "
+                         "implemented, 3.375 the unbuilt packed form (Phase H)")
+    mx.add_argument("--protect-bpw", type=float, default=4.5,
+                    help="storage rate of the protected families (Q4_K)")
+    mx.set_defaults(fn=cmd_mixed)
     t = sub.add_parser("traffic", help="Phase 7a — decode/prefill weight traffic and GEMV shapes")
     t.add_argument("--context", type=int, nargs="*", default=[128, 512, 1024, 2048, 4096],
                    help="context lengths for the KV-cache traffic column")
