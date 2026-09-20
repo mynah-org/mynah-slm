@@ -1088,3 +1088,88 @@ Worth stating why that matters: had the baseline come out at, say, 13 or 30, no
 quantized measurement afterwards could have been interpreted at all.
 
 Recorded: `reports/ternary/ppl_qwen3-0.6b-bf16.json`.
+
+## A1 — the four conditions  `[MEASURED]`
+
+Identical harness, identical protocol, identical 146 windows. Every checkpoint is
+a dense fake-quantized FP16 safetensors, so the *only* variable is the weight
+values. `reports/ternary/ppl_*.json`.
+
+| # | condition | coverage | WikiText-2 ppl | vs BF16 |
+|---|---|---|---|---|
+| 0 | **BF16 baseline** (ours) | — | **20.954** | — |
+| | *PTQTP Table 1, Qwen3-0.6B FP16* | | *20.9* | *+0.26% vs ours* |
+| 1 | **authors' released artifact** | 59.1% | **35.256** | **+68%** |
+| | *PTQTP Table 1, Qwen3-0.6B PTQTP* | *59.1%* | *38.02* | *+82%* |
+| 2 | **Method C, `q`/`k` protected** (artifact's coverage) | 59.1% | **43.331** | **+107%** |
+| 3 | **Method C, all seven families** (§4.1's claim) | 73.9% | **59.539** | **+184%** |
+| 4 | **naive single-plane W1.58**, all families | 73.9% | **684,110** | **destroyed** |
+
+Reconstruction error over the 196 quantized tensors, for reference: Method C
+mean **0.1784** (min 0.1738, max 0.1903); naive mean **0.4446**.
+
+### What each row settles
+
+**Row 4 answers the brief's question 1 outright.** *"Can Qwen3-0.6B tolerate
+single-plane post-training W1.58 at useful coverage?"* — **No.** Not at 100%
+coverage, not by a factor of thirty thousand. This is naive fitting without GPTQ
+compensation, so it is the control the brief asked for and not the best a
+single-plane method can do; but it establishes that the two trit planes are
+load-bearing, not a refinement.
+
+**Row 3 vs row 2 prices the coverage decision at 16 perplexity points.**
+Ternarizing `q_proj` and `k_proj` takes the model from 43.3 to 59.5. Whatever the
+authors' reason for protecting them, it is worth a third of the model's remaining
+quality, and §4.1's "all linear layers were quantized" would have cost us that
+had the artifact not been inspected.
+
+**Row 2 vs row 1 prices the undocumented step at 8 perplexity points.** Same
+coverage, same algorithm, same tolerance and iteration cap; the only difference
+is the per-channel scale absorption the paper does not describe.
+**PTQTP-as-published scores 43.3; PTQTP-as-implemented scores 35.3.** That is the
+value of the missing paragraph, and it is large.
+
+**Row 1 beats the paper's own published number** (35.256 against 38.02), which is
+a useful sanity check in both directions: our harness is not being kind to the
+artifact, and the artifact is a real PTQTP conversion rather than a broken upload.
+
+### Gate A verdict, on the evidence so far
+
+**Qwen3-0.6B does not tolerate post-training ternarization well.** The best result
+anyone has produced on this checkpoint — the authors' own, with a technique they
+did not publish — is **+68% perplexity**, and the paper's companion MMLU number
+for the same model is **47.1 → 33.64**, which is close to the floor for a
+four-choice benchmark. Our faithful reimplementation is +107%.
+
+Put beside Phase 0/7a: **PTQTP as implemented is 369.4 MiB against the 372.7 MiB
+`Q4_K_M` file we ship today — 1.01×.** So on this model the method costs +68%
+perplexity and buys **1% of size**.
+
+**This is not yet a verdict on ternary in general, and explicitly not on Gate B.**
+Two things are still missing and both are cheap:
+
+1. **The `IQ2_XXS` / `IQ1_S` controls (U2).** This is the measurement that decides
+   whether the finding is about *ternary* or about *0.6B models*. If `IQ2_XXS` at
+   230.2 MiB also collapses, then nothing survives below ~3 bits at this size and
+   ternary was never the variable. If it holds up, ternary is dominated on both
+   axes at once and that is the end of it for v0.1/v0.2.
+2. **Channel-scale absorption added to Method C.** Row 1 proves it is worth 8
+   points, it is function-preserving, and it costs nothing at inference. Our
+   Method C is incomplete without it, and a single-plane method *with* it has not
+   been tried by anyone.
+
+## Evidence log — Gate A
+
+- **TEST** Four conditions, one harness, 146 non-overlapping 2048-token windows.
+- **RESULT** BF16 **20.954** vs published 20.9 — protocol validated (+0.26%).
+- **RESULT** Naive single-plane W1.58 at full coverage: **684,110**. Question 1
+  of the brief is answered: **no**.
+- **RESULT** Method C all-linears **59.539**; `q`/`k` protected **43.331**.
+  Coverage is worth **16 points**.
+- **RESULT** Authors' artifact **35.256**, better than their own published 38.02.
+  The undocumented channel rescale is worth **8 points**.
+- **DECISION** Gate A leans **negative for Qwen3-0.6B**: +68% perplexity at best,
+  for 1.01× the size of the shipped file. **Not final** — the `IQ` controls and
+  scale-absorbed Method C are outstanding.
+- **CLAIM SCOPE** One checkpoint, WikiText-2 only, no tool-call or multilingual
+  eval yet, weights-only, A16. Says nothing about 4B, and nothing about Gate B.

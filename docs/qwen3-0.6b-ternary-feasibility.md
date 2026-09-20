@@ -7,8 +7,12 @@ cited) or `[NOT MEASURED]`. Nothing is estimated and presented as a result.
 > **Two gates, kept separate.**
 >
 > **GATE A — MODEL: does Qwen3-0.6B retain useful quality under ternary PTQ?**
-> **UNMEASURED.** Phases 1-6 have not been run. This is the blocking question and
-> it is what the Mac *can* answer.
+> **MEASURED, and it leans negative.** The best result anyone has produced on this
+> checkpoint — the authors' own artifact — is **+68% perplexity** (35.256 against
+> our 20.954 baseline), for a file **1.01x the size of the Q4_K_M we already
+> ship**. Naive single-plane W1.58 at full coverage is **684,110**, i.e. destroyed.
+> Not yet final: the `IQ2_XXS`/`IQ1_S` controls are outstanding and they decide
+> whether this is a fact about ternary or about 0.6B models.
 >
 > **GATE B — CPU BACKEND: can a target ISA execute it efficiently?**
 > **UNDECIDED, awaiting Gate A and target-ISA evidence.** An earlier revision of
@@ -352,13 +356,47 @@ So the chain `ternary -> 1.77x fewer weight bytes -> 1.77x faster decode` breaks
 at the second arrow, and Phase 7a already showed the first arrow was worth only
 1.10-1.23x end-to-end for PTQTP.
 
-## 9. The twelve questions
+## 9. Gate A — measured quality  `[MEASURED]`
+
+One harness, one protocol, 146 non-overlapping 2048-token windows of
+WikiText-2-raw test. Every checkpoint is a dense fake-quantized FP16
+safetensors, so the only variable is the weight values.
+
+**The protocol is validated first**: our BF16 baseline is **20.954** against the
+**20.9** PTQTP Table 1 publishes for this model — +0.26%. Without that, no
+quantized number below could be read against theirs.
+
+| condition | coverage | ppl | vs BF16 |
+|---|---|---|---|
+| **BF16 baseline** | — | **20.954** | — |
+| **authors' released artifact** | 59.1% | **35.256** | **+68%** |
+| *PTQTP Table 1, published* | *59.1%* | *38.02* | *+82%* |
+| **Method C, `q`/`k` protected** | 59.1% | **43.331** | **+107%** |
+| **Method C, all seven families** | 73.9% | **59.539** | **+184%** |
+| **naive single-plane W1.58** | 73.9% | **684,110** | destroyed |
+
+- **Naive single-plane ternary is unusable at full coverage** — by a factor of
+  thirty thousand. The second trit plane is load-bearing, not a refinement. That
+  answers question 1 of the brief.
+- **Protecting `q_proj`/`k_proj` is worth 16 perplexity points** (59.5 → 43.3).
+  §4.1's "all linear layers were quantized" would have cost us that, had the
+  released artifact not been inspected tensor by tensor.
+- **The undocumented channel-scale absorption is worth 8 points** (43.3 → 35.3).
+  Same coverage, same algorithm; the only difference is the step the paper omits.
+  PTQTP-as-published is not PTQTP-as-implemented.
+- The artifact beats the paper's own published figure, which is a sanity check in
+  both directions.
+
+**Put beside §3 and §6: the method costs +68% perplexity and buys 1% of file
+size against the `Q4_K_M` we ship today.**
+
+## 10. The twelve questions
 
 | # | question | status |
 |---|---|---|
 | 1 | Can Qwen3-0.6B tolerate single-plane W1.58 at useful coverage? | `[NOT MEASURED]` — Phase 3a |
 | 2 | How much does PT²/TWLA improve over naive? | `[NOT MEASURED]` — Phase 2/4 |
-| 3 | How much better is PTQTP 2×1.58? | `[PUBLISHED]` ppl 20.9 → 38.02 and MMLU 47.1 → 33.64 on this model; ours `[NOT MEASURED]` — Gate A |
+| 3 | How much better is PTQTP 2×1.58? | **`[MEASURED]`** — enormously better than naive (684k → 43.3), still **+107%** ppl for our faithful reimplementation and **+68%** for the authors' artifact |
 | 4 | Which families/blocks are most sensitive? | `[NOT MEASURED]` — Phase 3 |
 | 5 | Is MLP more attractive than attention? | MLP is 60% of ternarizable weight `[MEASURED]`; sensitivity `[NOT MEASURED]` |
 | 6 | What fraction can be ternarized safely? | `[NOT MEASURED]` — Phase 4 |
@@ -369,7 +407,7 @@ at the second arrow, and Phase 7a already showed the first arrow was worth only
 | 11 | Which shapes and ISA paths first? | Shapes `[MEASURED]` — five distinct linear shapes plus the head, all K in {1024, 2048, 3072}. ISA selection moot under the current verdict |
 | 12 | Worth repeating at 4B/7B? | **This is the live question** — see below |
 
-## 10. Where this leaves the study
+## 11. Where this leaves the study
 
 **The backend question is closed for v0.1/v0.2, and it closed on the premise
 rather than on the quality.** Five independent lines agree, three measured here
