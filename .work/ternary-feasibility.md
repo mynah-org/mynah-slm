@@ -1469,3 +1469,82 @@ all; it is the best sub-4-bit point measured, by a wide margin.
 1.68 may or may not correspond to a usable model; the Tied paper documents a case
 where reconstruction error and perplexity both worsened while task fidelity did
 not. The tool-call eval is the missing measurement and it is cheap.
+
+---
+
+# PHASE C — family and layer sensitivity  `[MEASURED]`
+
+Method C (PTQTP, G=128, 50 iters) applied to **one family at a time, all 28
+blocks**, everything else left BF16. In-memory, model loaded once, nothing
+written. 30 windows / 61,410 tokens, baseline **21.4892** — **a different window
+count from Gate A and not comparable to it**; the column that matters is the
+ratio.
+
+| family | params | mean rel err | ppl | ratio |
+|---|---|---|---|---|
+| `k_proj` | 29,360,128 | 0.1792 | 22.1760 | **1.032** |
+| `o_proj` | 58,720,256 | 0.1756 | 22.4887 | 1.047 |
+| `q_proj` | 58,720,256 | 0.1778 | 23.0008 | 1.070 |
+| `gate_proj` | 88,080,384 | 0.1767 | 23.0905 | 1.075 |
+| `v_proj` | 29,360,128 | 0.1793 | 23.1975 | 1.079 |
+| `up_proj` | 88,080,384 | 0.1772 | 23.9434 | 1.114 |
+| **`down_proj`** | 88,080,384 | 0.1832 | **29.4656** | **1.371** |
+
+## Three findings, and the first one indicts a metric we have been quoting
+
+**1. Weight reconstruction error does not predict sensitivity.** Every family
+reconstructs within **0.1756–0.1832** — a 4% spread — while the perplexity cost
+spans **1.032 to 1.371**, a 12× larger spread, and the *best*-reconstructing
+family (`o_proj`, 0.1756) is not the least damaging. Any ranking, gate or
+mixed-precision search built on reconstruction error would have been sorting
+noise. This is the same dissociation the Tied paper reports (C11), reproduced
+here on our own model with our own solver.
+
+**2. `down_proj` is the sensitive family, alone.** 1.371 against 1.03–1.11 for
+everything else. It is the only tensor whose input is the SwiGLU hidden state.
+
+**3. Layer sensitivity is flat.** All seven projections of a single block,
+ternarized together:
+
+| block | 0 | 1 | 13 | 14 | 15 | 26 | 27 |
+|---|---|---|---|---|---|---|---|
+| ratio | 1.027 | 1.020 | 1.015 | 1.008 | **1.001** | **1.040** | 1.021 |
+
+**The damage is distributed, not concentrated.** No block is worth protecting;
+the spread across blocks (1.001–1.040) is smaller than the spread across
+families (1.032–1.371). Mixed precision has a family axis here and does **not**
+have a layer axis. That is worth knowing before building a per-layer search.
+
+## Sensitivity does not compose additively
+
+`[DERIVED]` The product of the seven individual ratios is **2.048**. The measured
+all-families result is **2.841** (Gate A). Protecting q/k: product predicts
+1.856, measured **2.068**. Errors compound **super-multiplicatively**, so
+single-family screening *underestimates* the joint cost — by 39% here. A
+mixed-precision layout must be measured, never extrapolated from this table.
+
+---
+
+# PHASE D — q/k: the observation stands, the motive is refuted  `[MEASURED]`
+
+The instruction was not to write "the authors protected q/k because q/k are
+sensitive" without evidence. With evidence now in hand, the statement is not
+merely unsupported — **it is contradicted**:
+
+| | | |
+|---|---|---|
+| `[ARTIFACT]` | `q_proj`/`k_proj` are unquantized in all 28 blocks | residual 2.9e-04 against `orig × scale` |
+| `[MEASURED]` | **`k_proj` is the LEAST sensitive family** of seven | 1.032 |
+| `[MEASURED]` | `q_proj` is middle of the pack | 1.070, 4th of 7 |
+| `[MEASURED]` | the most sensitive family, `down_proj` (1.371), **is** quantized in the artifact | |
+| `[MEASURED]` | including q/k in Method C costs 16 perplexity points | 43.33 → 59.54 |
+| `[UNKNOWN]` | why the artifact treats q/k differently | the paper says the opposite and no code is released |
+
+So the artifact protects the least sensitive family and quantizes the most
+sensitive one. **Whatever the reason is, single-family sensitivity is not it.**
+
+The apparent contradiction with the 16-point cost is resolved by the
+non-additivity above: q and k are cheap alone and expensive in combination with
+the other five. That is a statement about interaction, not about their
+individual fragility, and it is the kind of thing that would have been asserted
+backwards without the measurement.
