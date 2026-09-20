@@ -134,10 +134,11 @@ print the table if that check exceeds 1%.
 | IQ2_XXS | 230.2 | 1.62× smaller | ternary wins by 9% |
 | IQ1_S | 204.0 | 1.83× smaller | ternary **loses by 3%** |
 
-**On bytes, ternary buys nothing on this model** that an existing ggml codebook
-format does not already buy with no research and no new kernel. Any remaining
-case rests on arithmetic — a multiplication-free GEMV — which is a kernel
-question and out of scope here.
+> **On bytes alone, ternary buys nothing here that an existing ggml codebook
+> format does not already buy. That framing turned out to be misleading, and §9
+> corrects it: `IQ2_XXS` and `IQ1_S` are smaller AND unusable on this model
+> (101× and 362× baseline perplexity). A size comparison against a format that
+> does not work is not a comparison.**
 
 ## 4. What the literature reports for this exact model  `[PUBLISHED]`
 
@@ -253,8 +254,9 @@ it. End-to-end decode traffic against the shipped `Q4_K_M`:
 | *linears at zero bits* | *2.84x* | *2.41x* | *2.07x* | *1.72x* | *1.44x* |
 
 **PTQTP — the mandatory method — buys 10-23% of decode traffic against the file
-we ship, for a published +82% perplexity on this model.** `IQ1_S`, which ingot
-already decodes, beats every ternary scheme at every context length.
+we ship, for a published +82% perplexity on this model.** `IQ1_S` is smaller
+still at every context length — but §9 measures it at **362× baseline
+perplexity**, so it is not a competitor, it is a non-option.
 
 ### Dominant GEMV shapes at batch 1 (M=1)
 
@@ -389,6 +391,49 @@ quantized number below could be read against theirs.
 
 **Put beside §3 and §6: the method costs +68% perplexity and buys 1% of file
 size against the `Q4_K_M` we ship today.**
+
+## 9b. The conventional sub-4-bit controls  `[MEASURED]`
+
+This is the control that decides whether the failure is about *ternary* or about
+*0.6B models*. `llama.cpp` `2115b73`, Metal, `-c 2048 --chunks 60`, importance
+matrix from WikiText-2 **train** used for every IQ quantization.
+
+`llama-perplexity` scores only the second half of each window, so its F16
+baseline is 17.15 where our HF baseline is 20.95. **The comparable quantity is
+the ratio within a harness**, and both are given.
+
+| format | bytes | ppl | ratio to baseline |
+|---|---|---|---|
+| **F16** | 1,509,347,584 | 17.151 | 1.000 |
+| **Q4_K_M** | 484,220,512 | 17.618 | **1.027** |
+| **IQ3_XXS** | 345,867,872 | 31.886 | **1.859** |
+| **IQ2_XXS** | 280,496,736 | 1732.32 | **101.0** |
+| **IQ1_S** | 259,066,464 | 6211.39 | **362.2** |
+
+*(Byte caveat: our `convert_hf_to_gguf.py` kept `output.weight` separate despite
+`tie_word_embeddings`, so every file above carries the embedding twice — the
+shipped `Q4_K_M` is 397 MB where ours is 484 MB. Quality is unaffected; use the
+deduplicated figures from §3 for size.)*
+
+### Two conclusions, and they point opposite ways
+
+**1. Nothing conventional survives below ~3 bits on this model.** `IQ2_XXS` is
+101× baseline and `IQ1_S` is 362× — word salad, the same failure class as the
+`Q2_K` result already recorded on granite-350m. **The collapse is a property of
+a 0.6B model at low bit depth, not of ternarization.**
+
+**2. Ternary is therefore the best sub-4-bit representation measured here.** At a
+comparable bit budget, PTQTP lands at **1.68×** baseline where `IQ2_XXS` — a
+mature, imatrix-calibrated codebook quant — is at **101×**, and naive
+single-plane ternary is at 32,648×. The two trit planes are doing real work.
+
+**And it still does not clear the bar that matters.** The comparison that decides
+shipping is against `Q4_K_M`: **+2.7% perplexity for 397 MB**, against PTQTP's
+**+68% for a file of the same size**.
+
+> **Sub-4-bit is not viable on Qwen3-0.6B by any method measured, and PTQTP is
+> the best sub-4-bit method measured.** Both are true; neither is interesting
+> alone.
 
 ## 10. The twelve questions
 

@@ -1261,3 +1261,121 @@ That is testable with one sign flip (`--absorb-alpha -0.5`), and it is queued.
 artifact is **not** reproduced by the AWQ-shaped rule, in either the weight-only
 form (which moved nothing, §A2) or this activation form (which moved 19 points in
 the wrong direction). Whatever their undocumented step is, it is not this.
+
+## A3 — the conventional sub-4-bit controls  `[MEASURED]` — this answers U2
+
+The question U2 asked: **is the failure about ternary, or about 0.6B models?**
+The control that decides it is whether ordinary codebook quants at the same bit
+budget survive where ternary does not.
+
+`llama.cpp` (`2115b73`), Metal, `-c 2048 --chunks 60`, importance matrix built
+from WikiText-2 **train** (200 chunks) and used for every IQ quantization. All
+five rows use the identical harness and the identical 60 chunks, so they are
+mutually comparable.
+
+**They are NOT comparable to the HF numbers above**: `llama-perplexity` scores
+only the second half of each window, which is why its F16 baseline is 17.15
+where our BF16 baseline is 20.95. Ratios within a harness are the comparable
+quantity, and both columns are given.
+
+| format | bytes | ppl | ratio to that harness's baseline |
+|---|---|---|---|
+| **F16** | 1,509,347,584 | **17.151** | 1.000 |
+| **Q4_K_M** | 484,220,512 | **17.618** | **1.027** |
+| **IQ3_XXS** | 345,867,872 | **31.886** | **1.859** |
+| **IQ2_XXS** | 280,496,736 | **1732.32** | **101.0** |
+| **IQ1_S** | 259,066,464 | **6211.39** | **362.2** |
+
+Caveat on the byte column, because it would otherwise flatter the comparison in
+the wrong direction: our `convert_hf_to_gguf.py` kept `output.weight` as a
+separate tensor despite `tie_word_embeddings: true`, so **every file above
+carries the 155.6M-parameter embedding twice.** The shipped `Q4_K_M` build is
+397 MB where ours is 484 MB, for exactly that reason. Quality is unaffected;
+size comparisons must use the deduplicated figures from Phase 0.
+
+### U2 is answered: the failure is about the model, not about ternary
+
+**Nothing conventional survives below ~3 bits on Qwen3-0.6B.** `IQ2_XXS` at
+2.06 bpw is 101× the baseline and `IQ1_S` at 1.56 bpw is 362× — word salad, the
+same class of failure as the `Q2_K` result this repo already recorded on
+granite-350m (ppl 26400). `IQ3_XXS` at 3.06 bpw survives but costs +86%.
+
+So the earlier framing in Phase 0 — *"IQ1_S is smaller than every ternary scheme
+and needs no research"* — **was wrong in the way that matters.** `IQ1_S` is
+smaller and it is also unusable. It was never the cheap alternative; it is not an
+alternative at all.
+
+### Which makes ternary look considerably better than Phase 0 implied
+
+Put the two harnesses side by side as ratios to their own baselines:
+
+| scheme | effective bits on linears | ppl ratio | harness |
+|---|---|---|---|
+| Q4_K_M | 4.5 (5.24 whole-model) | **1.027** | llama.cpp |
+| **PTQTP, authors' artifact** | **4.25 on 59.1% coverage** | **1.683** | HF |
+| IQ3_XXS | 3.06 | 1.859 | llama.cpp |
+| Method C (ours, no absorption) | 4.25 on 59.1% | 2.068 | HF |
+| IQ2_XXS | 2.06 | **101.0** | llama.cpp |
+| IQ1_S | 1.56 | **362.2** | llama.cpp |
+| naive W1.58 | 1.69 | **32,648** | HF |
+
+**The two trit planes are doing real work.** At a comparable bit budget, PTQTP
+lands at 1.68× baseline where `IQ2_XXS` — a mature, imatrix-calibrated codebook
+quant at 2.06 bpw — is at 101×, and naive single-plane ternary at 1.69 bpw is at
+32,648×. Ternary is not a worse idea than the conventional sub-3-bit options; on
+this model it is **decisively better than all of them**.
+
+### And it still does not clear the bar that matters
+
+The comparison that decides shipping is not against `IQ2_XXS`. It is against
+`Q4_K_M`, which costs **+2.7%** perplexity for 397 MB — and PTQTP costs **+68%**
+for a file of the same size (369.4 MiB, Addendum 3). The honest one-line summary
+of Gate A:
+
+> **Sub-4-bit is not viable on Qwen3-0.6B by any method measured, and PTQTP is
+> the best sub-4-bit method measured.** Both halves are true and neither is
+> interesting on its own.
+
+## Evidence log — A3
+
+- **TEST** Five formats, one llama.cpp harness, 60 identical chunks, imatrix from
+  wikitext train.
+- **RESULT** F16 17.151 · Q4_K_M 17.618 (**1.027×**) · IQ3_XXS 31.886 (1.859×) ·
+  IQ2_XXS 1732.3 (**101×**) · IQ1_S 6211.4 (**362×**).
+- **DECISION, U2 ANSWERED** The collapse is a property of **0.6B at low bit
+  depth**, not of ternarization. Phase 0's "IQ1_S beats every ternary scheme on
+  size and needs no research" is **retracted**: it is smaller and unusable.
+- **RESULT** Ternary is the *best* sub-4-bit representation measured on this
+  model — 1.68× against IQ2_XXS's 101× at a comparable budget.
+- **CLAIM SCOPE** WikiText-2 only, 60 chunks, one checkpoint. No tool-call or
+  multilingual eval. Two harnesses, compared as ratios and never as absolutes.
+
+### A2 continued — the sign hypothesis is falsified  `[MEASURED]`
+
+The hypothesis recorded above was that ternary wants the *opposite* of AWQ's
+direction: flatten the per-channel range rather than protect the salient
+channels. One sign flip tests it.
+
+| α | what it does | ppl |
+|---|---|---|
+| **−0.5** | flatten: shrink high-activation channels' weight columns | **781.96** |
+| **0** | no absorption | **43.33** |
+| **+0.5** | AWQ: amplify high-activation channels' weight columns | **62.32** |
+
+**Wrong. Flattening is 12× worse than AWQ's direction and 18× worse than doing
+nothing.** The hypothesis is dead: AWQ's sign is the *right* sign, it is just
+harmful at this magnitude. The curve's minimum is at or very near α=0, and it is
+strongly asymmetric — the penalty for going the flattening way is an order of
+magnitude larger.
+
+The reading that survives: **Qwen3-0.6B's channels are already close to
+well-conditioned for a group-wise trit fit**, and any per-channel scale we can
+derive — from weights or from activations, in either direction — costs more than
+it buys. That is a complete negative result across **four** conditions
+(weight-only α∈[0,1]: flat; activation α=+0.5: +19 points; activation α=−0.5:
++739 points), and it closes the question we opened:
+
+> **The authors' undocumented 8-point step is not channel-scale absorption of the
+> AWQ family.** We can invert their scale exactly and reproduce the transform,
+> but not derive it, and every derivable rule in that family makes things worse.
+> What it is remains open, and settling it needs their code.
