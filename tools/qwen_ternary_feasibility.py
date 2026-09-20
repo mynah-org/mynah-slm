@@ -1086,6 +1086,119 @@ def cmd_quantize(args) -> int:
     return 0
 
 
+
+# ---------------------------------------------------------------------------
+# Phase C — family and layer sensitivity.
+#
+# Done in memory: the model is loaded ONCE, the original weights of the tensors
+# a condition touches are kept on CPU and restored between conditions, and
+# nothing is written to disk. A disk-based sweep would have cost 1.4 GB and a
+# fresh model load per condition, which is why this phase kept being deferred.
+#
+# Perplexity here uses fewer windows than Gate A on purpose: this phase RANKS
+# conditions, it does not produce headline numbers. The window count is recorded
+# in every row and must never be compared against a Gate A figure.
+# ---------------------------------------------------------------------------
+
+
+def _ppl_inline(model, ids, L, n_windows, dev, chunk=256):
+    import torch
+    import torch.nn.functional as F
+
+    nll, n_tok = 0.0, 0
+    with torch.no_grad():
+        for w in range(n_windows):
+            c = ids[:, w * L:(w + 1) * L].to(dev)
+            hidden = model.model(c).last_hidden_state[0]
+            tgt = c[0, 1:]
+            for a in range(0, L - 1, chunk):
+                b = min(a + chunk, L - 1)
+                lg = model.lm_head(hidden[a:b]).float()
+                nll += float(F.cross_entropy(lg, tgt[a:b], reduction="sum"))
+                n_tok += b - a
+    return math.exp(nll / n_tok), n_tok
+
+
+def cmd_sensitivity(args) -> int:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    src = Path(args.model)
+    if not (src / "config.json").is_file():
+        raise Refusal(f"no config.json under {src}")
+    method = METHODS.get(args.method or "ptqtp")
+    if method is None:
+        raise Refusal(f"unknown --method {args.method!r}")
+
+    dev = args.device or ("mps" if torch.backends.mps.is_available() else "cpu")
+    cfg = json.loads((src / "config.json").read_text())
+    n_layers = cfg["num_hidden_layers"]
+
+    tok = AutoTokenizer.from_pretrained(Path(args.tokenizer) if args.tokenizer else src)
+    ids = tok(_load_wikitext2_test(), return_tensors="pt").input_ids
+    L = args.seq_len
+    n_windows = min(args.windows, ids.numel() // L)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        src, dtype=torch.float16 if dev != "cpu" else torch.float32).to(dev).eval()
+    named = dict(model.named_parameters())
+
+    base_ppl, n_tok = _ppl_inline(model, ids, L, n_windows, dev)
+    print(f"# baseline over {n_windows} windows ({n_tok:,} tokens): ppl {base_ppl:.4f}")
+    print(f"# NOT comparable to Gate A's 146-window numbers\n")
+
+    # which tensors each condition touches
+    def tensors_for(fams, layers):
+        out = []
+        for name, prm in named.items():
+            blk, fam = classify(name.replace("model.model.", "model."))
+            if fam in fams and (layers is None or blk in layers):
+                out.append(name)
+        return out
+
+    if args.mode == "family":
+        conditions = [(f, [f], None) for f in FAMILIES]
+    else:
+        mid = n_layers // 2
+        picks = sorted({0, 1, mid - 1, mid, mid + 1, n_layers - 2, n_layers - 1})
+        conditions = [(f"layer{L_}", list(FAMILIES), [L_]) for L_ in picks]
+
+    rows = []
+    print(f"{'condition':<14}{'tensors':>8}{'params':>14}{'rel err':>9}{'ppl':>11}{'ratio':>8}")
+    for label, fams, layers in conditions:
+        names = tensors_for(fams, layers)
+        if not names:
+            continue
+        saved = {n: named[n].detach().clone() for n in names}
+        errs, params = [], 0
+        with torch.no_grad():
+            for n in names:
+                W = named[n].detach().to(torch.float32)
+                Wh = method(W, group=args.group, iters=args.iters, eps=args.eps)
+                errs.append(float(torch.norm(Wh - W) / torch.norm(W)))
+                params += W.numel()
+                named[n].copy_(Wh.to(named[n].dtype))
+        ppl, _ = _ppl_inline(model, ids, L, n_windows, dev)
+        with torch.no_grad():
+            for n, v in saved.items():
+                named[n].copy_(v)
+        del saved
+        rel = sum(errs) / len(errs)
+        rows.append(dict(condition=label, tensors=len(names), params=params,
+                         mean_rel_err=round(rel, 4), ppl=round(ppl, 4),
+                         ratio_to_baseline=round(ppl / base_ppl, 4)))
+        print(f"{label:<14}{len(names):>8}{params:>14,}{rel:>9.4f}{ppl:>11.4f}"
+              f"{ppl / base_ppl:>8.3f}")
+
+    name = f"{args.mode}_sensitivity.csv"
+    write_csv(args, name, rows)
+    write_json(args, f"{args.mode}_sensitivity.json",
+               dict(model=str(src), revision=args.revision, method=args.method or "ptqtp",
+                    group=args.group, windows=n_windows, tokens=n_tok,
+                    baseline_ppl=base_ppl, rows=rows, environment=_environment(dev)))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Phases not written yet — they refuse rather than print a placeholder.
 # ---------------------------------------------------------------------------
@@ -1142,20 +1255,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--method", choices=["naive", "pt2", "twla", "ptqtp"], default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output-dir", default="reports/ternary")
+    # Global on purpose: these are needed by several subcommands, and putting
+    # them on the subparsers made `--tokenizer X ppl` a usage error twice.
+    p.add_argument("--tokenizer", default=None, help="tokenizer dir, if not --model")
+    p.add_argument("--device", default=None, help="mps | cpu (default: mps if available)")
+    p.add_argument("--verbose", action="store_true")
 
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("census", help="Phase 0 — tensor/module census").set_defaults(fn=cmd_census)
     sub.add_parser("budget", help="Phase 0 — storage under every representation").set_defaults(fn=cmd_budget)
     pp = sub.add_parser("ppl", help="Gate A — WikiText-2 perplexity of a HF checkpoint")
-    pp.add_argument("--device", default=None, help="mps | cpu (default: mps if available)")
-    pp.add_argument("--tokenizer", default=None, help="tokenizer dir, if not --model")
     pp.add_argument("--max-windows", type=int, default=None)
     pp.add_argument("--gguf", default=None,
                     help="score a GGUF inside --model instead of its safetensors; "
                          "transformers dequantizes it, so every format lands in ONE harness")
     pp.add_argument("--logit-chunk", type=int, default=256,
                     help="positions per lm_head/cross-entropy chunk")
-    pp.add_argument("--verbose", action="store_true")
     pp.set_defaults(fn=cmd_ppl)
 
     qz = sub.add_parser("quantize", help="Method A/C — write a fake-quantized checkpoint")
@@ -1175,14 +1290,19 @@ def build_parser() -> argparse.ArgumentParser:
                          "(AWQ-shaped) instead of from the weights")
     qz.add_argument("--absorb-samples", type=int, default=32,
                     help="calibration sequences for --absorb-act, from WikiText-2 TRAIN")
-    qz.add_argument("--device", default=None)
-    qz.add_argument("--verbose", action="store_true")
     qz.set_defaults(fn=cmd_quantize)
 
     sub.add_parser("calib", help="Phase 1 — calibration corpus").set_defaults(
         fn=not_yet("Phase 1 (calib)", "Nothing has been tokenized or cached."))
-    sub.add_parser("sensitivity", help="Phase 3 — per-tensor sensitivity").set_defaults(
-        fn=not_yet("Phase 3 (sensitivity)", "No weights have been ternarized."))
+    sn = sub.add_parser("sensitivity", help="Phase C — family / layer sensitivity")
+    sn.add_argument("--mode", choices=["family", "layer"], default="family")
+    sn.add_argument("--windows", type=int, default=30,
+                    help="perplexity windows; fewer than Gate A on purpose -- this "
+                         "phase ranks conditions, it does not set headline numbers")
+    sn.add_argument("--group", type=int, default=128)
+    sn.add_argument("--iters", type=int, default=50)
+    sn.add_argument("--eps", type=float, default=1e-4)
+    sn.set_defaults(fn=cmd_sensitivity)
     sub.add_parser("coverage", help="Phase 4 — degradation curves").set_defaults(
         fn=not_yet("Phase 4 (coverage)", "Phase 3 must rank the tensors first."))
     sub.add_parser("mixed", help="Phase 5 — mixed-precision search").set_defaults(
