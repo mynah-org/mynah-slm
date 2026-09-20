@@ -1,6 +1,27 @@
 # R1 — post-training ternarization of Qwen3-0.6B: is it worth a CPU backend?
 
-Status: **IN PROGRESS** (opened 2026-09-20). Phase 0 done, Phases 1-7 planned.
+Status: **IN PROGRESS** (opened 2026-09-20).
+
+**Two gates, and they are independent. Do not let one answer the other.**
+
+| gate | question | status |
+|---|---|---|
+| **A — MODEL** | does Qwen3-0.6B retain useful quality under PTQTP / ternary PTQ? | **UNMEASURED** — Phases 1-6 not run. This is the blocking question |
+| **B — CPU BACKEND** | can a target ISA execute the representation efficiently? | **UNDECIDED** — awaiting Gate A *and* target-ISA evidence |
+
+**Correction, 2026-09-20.** Addendum 2 and Phase 7b below issued a
+`VERDICT: REJECT` on Gate B from Mac Q4/Q8 runtime measurements. **That verdict
+is withdrawn.** The measurements stand and are retained — thread scaling, Q4 vs
+Q8, the activation path, the LM-head cost and the decode byte census are all
+real and all useful — but they describe *the current Q4 implementation on one
+M1*. They cannot close a backend question for Neoverse V2 I8MM/SMMLA, AVX-512
+VNNI, AVX-512 BW or AMX, and no ternary kernel has been benchmarked on any
+machine. Gate B stays open until Gate A is measured and at least one
+representative target-server microbenchmark or analytical kernel study exists.
+
+Order of work is now fixed: **read PTQTP → inspect/reproduce the authors'
+Qwen3-0.6B artifact → run the quality and sensitivity phases.** No further
+effort goes into arguing the backend from the present Mac Q4 runtime.
 
 Item: `PLAN.md` §0 R1. Tool: `tools/qwen_ternary_feasibility.py`.
 Report: `docs/qwen3-0.6b-ternary-feasibility.md`.
@@ -900,11 +921,12 @@ Five independent lines now agree, three of them measured here and two inherited:
 
 ## Consequences for the plan
 
-1. **The kernel question is closed for v0.1/v0.2 regardless of the quality
-   result.** Even a ternary scheme with zero quality loss would be optimising a
-   term that is not the bottleneck, for at most 1.25-1.72× of traffic, on 58% of
-   the bytes and 58% of the time. No C is written under R1; that was the rule
-   from the start and it now has a reason rather than a boundary.
+1. **~~The kernel question is closed for v0.1/v0.2~~ — WITHDRAWN.** What holds:
+   on *this* machine, with *our current Q4 kernels*, a traffic saving has little
+   to convert into, so a ternary kernel would have to win on arithmetic or on a
+   different ISA rather than on bytes. That is a constraint on the design, not a
+   verdict. No C is written under R1 regardless — that was the rule from the
+   start.
 2. **Phases 1-5 are re-scoped from "is a backend justified" to "what is the
    quality floor of this model".** That is still worth having — it feeds the
    `IQ2`/`IQ3` decision the quantization policy already wants, and it answers U2
@@ -932,11 +954,103 @@ Five independent lines now agree, three of them measured here and two inherited:
 - **RESULT** `--fast` **+48%** at one thread, changing no weight bytes.
 - **REFUSED** The 8-thread `--fast` point: 60.5% spread. Not reported as a
   measurement.
-- **DECISION** **VERDICT for the backend question: REJECT for v0.1/v0.2.** The
-  premise that batch-1 decode is weight-bandwidth-bound is false here, on five
-  independent lines of evidence.
+- **DECISION — WITHDRAWN 2026-09-20.** This line read *"VERDICT for the backend
+  question: REJECT for v0.1/v0.2"*. It over-reached: the evidence shows what the
+  **current Q4 implementation on this M1** is bound by, which is not the same
+  question as whether a ternary representation can be executed efficiently on a
+  target server ISA. **Gate B is UNDECIDED.** What the evidence does support,
+  and what is kept: *batch-1 decode of Qwen3-0.6B at Q4_K_M on this Mac is
+  ALU-bound, not weight-bandwidth-bound.* That is a fact about our current
+  kernels, and it raises the bar a ternary kernel would have to clear here — it
+  does not decide the backend.
 - **DECISION** R1 continues as a *quality* study (U2 and the `IQ` controls), not
   as a backend investigation. Two new board items fall out of it: the tied LM
   head, and the activation path.
 - **CLAIM SCOPE** One M1, one 0.6B checkpoint, one engine, Q4_K_M weights. Says
   nothing about 4B/8B, about servers, or about any other engine's kernels.
+
+---
+
+# Addendum 3, 2026-09-20 — PTQTP's real accounting, and what its artifact contains
+
+Full detail in [`ptqtp-paper-reading.md`](ptqtp-paper-reading.md). What changes
+here:
+
+## The bit accounting was wrong, and in our favour
+
+Phase 0 and Phase 7a used **3.375 bits/weight** for PTQTP — two `TQ1_0`-packed
+base-3 planes. **The authors do not pack.** Appendix A.3 stores *"each ternary
+element … with 2 bits (since 3 ≤ 2²)"*, i.e. **4.000 bits/weight**, plus 0.250
+for grouped fp16 scales = **4.250**. Bit-packing is listed under *Limitations and
+Future Works*.
+
+And the released Qwen3-0.6B artifact **protects `q_proj` and `k_proj` in all 28
+blocks** — verified by counting distinct values per 128-group across every
+projection — so real coverage is **80.0% of the linears, 59.1% of the model**,
+not §4.1's "all linear layers".
+
+Re-run with both axes (`tools/qwen_ternary_feasibility.py traffic`):
+
+| PTQTP variant | coverage | MiB/token | vs shipped Q4_K_M |
+|---|---|---|---|
+| **as implemented, the artifact's own coverage** | **59.1%** | **369.4** | **1.01×** |
+| as implemented, all linears | 73.9% | 345.1 | 1.08× |
+| packed-optimal, the artifact's coverage | 59.1% | 332.6 | 1.12× |
+| packed-optimal, all linears (our old figure) | 73.9% | 299.2 | 1.25× |
+
+**PTQTP as the authors actually built it is the same size as the `Q4_K_M` file we
+ship today — 1.01×.** The 1.25× in Addendum 1 was a best case that requires a
+packing nobody implemented *and* a coverage the artifact does not have. Both
+rows stay in the tool, labelled, because the optimistic one is the right bound
+for "could a future implementation do better" and the pessimistic one is the
+right number for "what did the paper do".
+
+## Three further facts that bear on the gates
+
+1. **The paper's own GPU kernel loses to 4-bit GPTQ** (Table 5, RTX 4090,
+   `gate_proj`, batch 1, 7B): FP16 0.122 ms, **GPTQ-4bit 0.085**, PTQTP 0.120.
+   At seq 2048 PTQTP is 1.82× slower than FP16. Max speedup claimed anywhere in
+   the paper is **1.16×** (Table 6, attention). This is evidence *for Gate B's
+   difficulty*, on a GPU; it does not decide Gate B on a CPU ISA, and it is not
+   used to.
+2. **PTQTP needs no calibration data** (§4.1: *"No task-specific calibration,
+   tuning, or fine-tuning was applied in any experiment"*). Method C is a
+   closed-form weight-only fit. **Phase 1 is therefore not a prerequisite for
+   Method C** — only for the activation-aware methods. Method C moves ahead of
+   Phase 1 in the plan.
+3. **The released artifact may be broken.** `gate_proj` and `up_proj` reconstruct
+   with relative error up to **3.42** and norm ratio up to **4.34×** against the
+   original, while `v_proj`/`o_proj`/`down_proj` look like sane fits (0.17-0.57).
+   Its `q_proj` and layernorms match neither `Qwen3-0.6B` nor `Qwen3-0.6B-Base`.
+   **Running it and measuring perplexity is the test**, and it is Gate A
+   infrastructure we need regardless.
+
+## Plan changes
+
+- **Gate A starts now**, with `tools/qwen_ternary_feasibility.py ppl` — WikiText-2,
+  non-overlapping 2048-token windows, the protocol the GPTQ lineage uses, so our
+  numbers are comparable to the papers'. First gate: our BF16 baseline must
+  reproduce the published **20.9** before any quantized number is interpretable.
+- **Method C is implemented from Algorithm 1**, not adapted from the artifact,
+  and cross-checked against the artifact only where the artifact looks sane.
+- Phase 1 (calibration) is demoted behind Method C.
+
+## Evidence log — addendum 3
+
+- **FACT** PTQTP's own representation is **4.250 bits/weight** (App. A.3 + Eq. 9),
+  not 3.375 and not 1.58. Its Appendix A.3 worked example claims 7.96×
+  compression where its own formula and its own Table 4 give **4×** / 3.65×.
+- **FACT** The released `Qwen3-0.6B-PTQTP-1.58b` is **dense FP16, 1136.9 MiB**,
+  310 tensors, no packing and no scale tensors.
+- **FACT** Coverage is **5 of 7 projection families**; `q_proj` and `k_proj` are
+  dense in **0/28** blocks ternarized. `embed_tokens` and `model.norm` are
+  bit-identical to the original.
+- **FACT** A quantized group decomposes exactly: `gate_proj` L13 row 0 group 0 is
+  `{0, ±0.04310, ±0.09045, ±0.13354, ±0.22400}` = `α₁=0.13354, α₂=0.09045`.
+- **RESULT** **PTQTP as implemented, at the artifact's coverage, is 1.01× the
+  size of the file we already ship.**
+- **CONTRADICTION** `gate_proj`/`up_proj` reconstruct worse than zeros in 5 of 9
+  sampled blocks. Unexplained; provenance of the artifact could not be
+  established against either public Qwen3-0.6B checkpoint.
+- **CLAIM SCOPE** Storage, coverage and reconstruction only. No perplexity of
+  ours has been measured yet; Gate A is unanswered.

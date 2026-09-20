@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import re
 import struct
 import sys
@@ -451,16 +452,33 @@ def cmd_budget(args) -> int:
 
 # Schemes as (label, linear bits/weight, embedding format). Kept in the order we
 # want the report to read.
+# (label, bits/weight on the quantized linears, embedding format, protected
+# families). A protected family is stored in the embedding's format, because a
+# tensor a method refuses to ternarize still has to be stored somehow.
+#
+# PTQTP appears four times on purpose; the differences are the subject of
+# .work/ptqtp-paper-reading.md:
+#   * "as implemented" — 2 bits per trit, UNPACKED, from the paper's own
+#     Appendix A.3, plus 0.25 bpw of grouped fp16 scales = 4.250 bpw.
+#   * "packed-optimal" — two TQ1_0-style base-3 planes at 1.6875 each = 3.375
+#     bpw. Nobody has implemented this; it is the best the format allows.
+#   * "paper coverage" — q_proj and k_proj protected in all 28 blocks, which is
+#     what the authors' released Qwen3-0.6B artifact actually does, against
+#     Section 4.1's claim that "all linear layers were quantized".
+QK = ("q_proj", "k_proj")
 TRAFFIC_SCHEMES = [
-    ("BF16", 16.0, "bf16"),
-    ("INT8 / Q8_0", 8.5, "q8_0"),
-    ("Q4_K_M (shipped, exact recipe)", 4.5, "q6_k"),
-    ("Q3_K_M", 3.4375, "q6_k"),
-    ("PTQTP 2x1.58", 3.375, "q6_k"),
-    ("IQ2_XXS", 2.0625, "q6_k"),
-    ("W1.58 single plane", 1.6875, "q6_k"),
-    ("IQ1_S", 1.5625, "q6_k"),
-    ("W1.58, free embedding (bound)", 0.0, "q6_k"),
+    ("BF16", 16.0, "bf16", ()),
+    ("INT8 / Q8_0", 8.5, "q8_0", ()),
+    ("Q4_K_M (shipped, exact recipe)", 4.5, "q6_k", ()),
+    ("Q3_K_M", 3.4375, "q6_k", ()),
+    ("PTQTP as implemented, paper coverage", 4.25, "q6_k", QK),
+    ("PTQTP as implemented, all linears", 4.25, "q6_k", ()),
+    ("PTQTP packed-optimal, paper coverage", 3.375, "q6_k", QK),
+    ("PTQTP packed-optimal, all linears", 3.375, "q6_k", ()),
+    ("IQ2_XXS", 2.0625, "q6_k", ()),
+    ("W1.58 single plane", 1.6875, "q6_k", ()),
+    ("IQ1_S", 1.5625, "q6_k", ()),
+    ("W1.58, free embedding (bound)", 0.0, "q6_k", ()),
 ]
 
 
@@ -477,6 +495,7 @@ def cmd_traffic(args) -> int:
     head_dim = cfg["head_dim"]
     hidden = cfg["hidden_size"]
 
+    total = sum(t.params for t in kept)
     lin = sum(t.params for t in kept if t.family in FAMILIES)
     emb = sum(t.params for t in kept if t.family in ("embedding", "lm_head"))
     norm_bytes = sum(t.params for t in kept if t.family == "norm") * 4
@@ -494,11 +513,13 @@ def cmd_traffic(args) -> int:
                  if t.family in ("v_proj", "down_proj")
                  and t.block in (0, 1, 2, 5, 8, 11, 14, 17, 20, 23, 24, 25, 26, 27))
 
-    def weight_bytes(lin_bits: float, emb_fmt: str, recipe: bool = False) -> float:
+    def weight_bytes(lin_bits: float, emb_fmt: str, recipe: bool = False,
+                     protect: tuple = ()) -> float:
+        prot = sum(t.params for t in kept if t.family in protect)
         if recipe:  # the exact shipped Q4_K_M
             lb = ((lin - bumped) * 4.5 + bumped * 6.5625) / 8
         else:
-            lb = lin * lin_bits / 8
+            lb = (lin - prot) * lin_bits / 8 + prot * FORMATS[emb_fmt][0] / 8
         return lb + emb * FORMATS[emb_fmt][0] / 8 + norm_bytes
 
     baseline = weight_bytes(4.5, "q6_k", recipe=True)
@@ -512,10 +533,12 @@ def cmd_traffic(args) -> int:
     mac_attn_per_pos = 2 * n_heads * head_dim * n_layers
 
     rows = []
-    for label, lin_bits, emb_fmt in TRAFFIC_SCHEMES:
+    for label, lin_bits, emb_fmt, protect in TRAFFIC_SCHEMES:
         recipe = label.startswith("Q4_K_M")
-        wb = weight_bytes(lin_bits, emb_fmt, recipe)
+        wb = weight_bytes(lin_bits, emb_fmt, recipe, protect)
         lb = wb - emb * FORMATS[emb_fmt][0] / 8 - norm_bytes
+        prot = sum(t.params for t in kept if t.family in protect)
+        cov = 100 * (lin - prot) / total
         eb = emb * FORMATS[emb_fmt][0] / 8
         row = dict(
             scheme=label,
@@ -525,6 +548,7 @@ def cmd_traffic(args) -> int:
             linear_share_pct=100 * lb / wb,
             embedding_share_pct=100 * eb / wb,
             vs_q4km=baseline / wb,
+            coverage_pct_of_model=cov,
             arithmetic_intensity=2 * mac_weights / wb,
         )
         for L in args.context:
@@ -579,10 +603,11 @@ def cmd_traffic(args) -> int:
     print(f"# Phase 7a — batch-1 decode traffic, {model_dir}")
     print(f"# every weight is read once per token, so weight bytes/token == the model file")
     print()
-    print(f"{'scheme':<32}{'MiB/tok':>9}{'linear%':>9}{'embed%':>8}{'vs Q4':>7}{'AI':>7}")
+    print(f"{'scheme':<40}{'cover%':>8}{'MiB/tok':>9}{'lin%':>7}{'emb%':>7}{'vs Q4':>7}{'AI':>7}")
     for r in rows:
-        print(f"{r['scheme']:<32}{r['weight_MiB_per_token']:>9.1f}"
-              f"{r['linear_share_pct']:>9.1f}{r['embedding_share_pct']:>8.1f}"
+        print(f"{r['scheme']:<40}{r['coverage_pct_of_model']:>8.1f}"
+              f"{r['weight_MiB_per_token']:>9.1f}"
+              f"{r['linear_share_pct']:>7.1f}{r['embedding_share_pct']:>7.1f}"
               f"{r['vs_q4km']:>7.2f}{r['arithmetic_intensity']:>7.2f}")
     print()
     print("AI = FLOP per byte of weight traffic at batch 1. A CPU's machine balance")
@@ -611,6 +636,82 @@ def cmd_traffic(args) -> int:
         print(f"{r['shape']:<16}{r['instances']:>6}{r['params']:>14,}"
               f"{r['pct_of_macs']:>8.2f}{r['pct_of_bytes_q4']:>8.2f}"
               f"{r['pct_of_bytes_ternary']:>9.2f}  {r['families']}")
+    return 0
+
+
+
+# ---------------------------------------------------------------------------
+# Gate A infrastructure — WikiText-2 perplexity on a HuggingFace checkpoint.
+#
+# The protocol is the one the GPTQ lineage uses and that PT2-LLM, TWLA and the
+# Qwen3-4B study all inherit, so our numbers are comparable to the papers':
+# join the raw test split with "\n\n", tokenize once, cut into NON-OVERLAPPING
+# windows of --seq-len, and average the token NLL over all full windows.
+#
+# Needs torch + transformers, which live in the `check` extra and are never
+# required to run the engine:  cd tools && uv run --extra check python ...
+# ---------------------------------------------------------------------------
+
+
+def _load_wikitext2_test() -> str:
+    """The raw test split, as one string. Cached under --output-dir."""
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise Refusal(
+            "the `datasets` package is missing. Run this through "
+            "`cd tools && uv run --extra check --with datasets python ...`"
+        )
+    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
+    return "\n\n".join(ds["text"])
+
+
+def cmd_ppl(args) -> int:
+    model_dir = Path(args.model)
+    if not (model_dir / "config.json").is_file():
+        raise Refusal(f"no config.json under {model_dir}")
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError as e:
+        raise Refusal(f"torch/transformers missing ({e}); use `uv run --extra check`")
+
+    dev = args.device or ("mps" if torch.backends.mps.is_available() else "cpu")
+    tok_dir = Path(args.tokenizer) if args.tokenizer else model_dir
+    tok = AutoTokenizer.from_pretrained(tok_dir)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir, dtype=torch.float32 if dev == "cpu" else torch.float16
+    ).to(dev).eval()
+
+    text = _load_wikitext2_test()
+    ids = tok(text, return_tensors="pt").input_ids
+    L = args.seq_len
+    n_windows = ids.numel() // L
+    if args.max_windows:
+        n_windows = min(n_windows, args.max_windows)
+    if n_windows == 0:
+        raise Refusal(f"tokenized corpus is shorter than one window of {L}")
+
+    nll, n_tok = 0.0, 0
+    with torch.no_grad():
+        for w in range(n_windows):
+            chunk = ids[:, w * L : (w + 1) * L].to(dev)
+            out = model(chunk, labels=chunk)
+            # HF averages over L-1 predicted tokens
+            nll += float(out.loss) * (L - 1)
+            n_tok += L - 1
+            if args.verbose and (w + 1) % 10 == 0:
+                print(f"  window {w+1}/{n_windows}  running ppl "
+                      f"{math.exp(nll / n_tok):.3f}", file=sys.stderr)
+
+    ppl = math.exp(nll / n_tok)
+    res = dict(model=str(model_dir), revision=args.revision, device=dev,
+               seq_len=L, windows=n_windows, tokens=n_tok,
+               nll_per_token=nll / n_tok, perplexity=ppl,
+               dataset="wikitext-2-raw-v1/test", protocol="non-overlapping windows")
+    write_json(args, f"ppl_{model_dir.name}.json", res)
+    print(f"{model_dir}")
+    print(f"  wikitext2 ppl = {ppl:.3f}   ({n_windows} windows x {L} tok, {dev})")
     return 0
 
 
@@ -674,6 +775,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("census", help="Phase 0 — tensor/module census").set_defaults(fn=cmd_census)
     sub.add_parser("budget", help="Phase 0 — storage under every representation").set_defaults(fn=cmd_budget)
+    pp = sub.add_parser("ppl", help="Gate A — WikiText-2 perplexity of a HF checkpoint")
+    pp.add_argument("--device", default=None, help="mps | cpu (default: mps if available)")
+    pp.add_argument("--tokenizer", default=None, help="tokenizer dir, if not --model")
+    pp.add_argument("--max-windows", type=int, default=None)
+    pp.add_argument("--verbose", action="store_true")
+    pp.set_defaults(fn=cmd_ppl)
+
     sub.add_parser("calib", help="Phase 1 — calibration corpus").set_defaults(
         fn=not_yet("Phase 1 (calib)", "Nothing has been tokenized or cached."))
     sub.add_parser("sensitivity", help="Phase 3 — per-tensor sensitivity").set_defaults(

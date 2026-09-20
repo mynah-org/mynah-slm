@@ -4,13 +4,20 @@
 Everything below is labelled `[MEASURED]`, `[PUBLISHED]` (someone else's number,
 cited) or `[NOT MEASURED]`. Nothing is estimated and presented as a result.
 
-> **Verdict on the backend question: REJECT for v0.1/v0.2.** Not because
-> ternarization fails — that is still unmeasured here — but because its premise
-> does not hold on this engine. Batch-1 decode of Qwen3-0.6B is **ALU-bound, not
-> weight-bandwidth-bound**: it scales 2.95x on four cores at 14.8 GB/s where this
-> machine is known to sustain 32-38, and `--fast` buys **+48%** by quantizing
-> activations without changing one weight byte. Cutting weight bytes is not what
-> makes this decode faster. The study continues as a *quality* investigation.
+> **Two gates, kept separate.**
+>
+> **GATE A — MODEL: does Qwen3-0.6B retain useful quality under ternary PTQ?**
+> **UNMEASURED.** Phases 1-6 have not been run. This is the blocking question and
+> it is what the Mac *can* answer.
+>
+> **GATE B — CPU BACKEND: can a target ISA execute it efficiently?**
+> **UNDECIDED, awaiting Gate A and target-ISA evidence.** An earlier revision of
+> this page issued a REJECT here on the strength of Mac Q4/Q8 runtime data. That
+> was wrong: this machine cannot speak for Neoverse V2 I8MM/SMMLA, AVX-512
+> VNNI/BW or AMX, and no ternary kernel has been benchmarked anywhere. The
+> profiling in §8 is retained because it is real and useful — it says what the
+> *current Q4 implementation on this Mac* is bound by — but it does not decide a
+> backend for a representation that does not exist yet.
 
 Work item and plan: [`.work/ternary-feasibility.md`](../.work/ternary-feasibility.md).
 Tool: `tools/qwen_ternary_feasibility.py`. Raw outputs: `reports/ternary/`.

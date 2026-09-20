@@ -27,7 +27,9 @@ WORK = REPO / ".work"
 # `[text](.work/foo.md)` and `[text](foo.md)` from inside .work/
 LINK_RE = re.compile(r"\]\(([^)]+\.md)(?:#[^)]*)?\)")
 # A board line: "- [x] **R1** — ..." or "- [ ] M0-M6 → ..."
-ITEM_RE = re.compile(r"^\s*-\s*\[[ x~-]\]\s*(?:\*\*)?([A-Z]\d+[a-z]?(?:-\d+)?)(?:\*\*)?\b")
+# Item ids: M0, M2c, E4-9, R1, R1-P. The suffix may be a letter, a number
+# or a word, so "R1-P" must not be read as a second "R1".
+ITEM_RE = re.compile(r"^\s*-\s*\[[ x~-]\]\s*(?:\*\*)?([A-Z]\d+[a-z]?(?:-[A-Za-z0-9]+)?)(?:\*\*)?\b")
 STATUS_RE = re.compile(
     r"^Status:\s*\*\*(OPEN|IN PROGRESS|DONE|REJECTED|REFERENCE|ARCHIVE)\b", re.M
 )

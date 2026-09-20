@@ -80,10 +80,13 @@ instrumentation, M3 CLI polish, M5b quantization & footprint, M6 release.
 ### R — research items
 
 - [~] **R1** — can a pretrained Qwen3-0.6B be post-training ternarized and still
-      be worth running? **Backend question answered: REJECT for v0.1/v0.2** —
-      decode is ALU-bound, not weight-bandwidth-bound, so the traffic saving has
-      nothing to convert into. Continues as a quality study (the `IQ2`/`IQ1`
-      controls) → [`.work/ternary-feasibility.md`](.work/ternary-feasibility.md)
+      be worth running? Two independent gates. **GATE A (model quality):
+      UNMEASURED.** **GATE B (CPU backend): UNDECIDED** — awaiting Gate A and
+      target-ISA evidence; this Mac cannot close it
+      → [`.work/ternary-feasibility.md`](.work/ternary-feasibility.md)
+- [x] **R1-P** — reading PTQTP properly: what "2 x 1.58-bit" physically is, and
+      what the authors' released Qwen3-0.6B artifact actually contains
+      → [`.work/ptqtp-paper-reading.md`](.work/ptqtp-paper-reading.md)
 - [ ] **R2** — the tied `lm_head`, `151936 x 1024`, is **42% of a decode step**
       and 32.7% of decode bytes. Fell out of R1; needs its own note before it is
       picked up
