@@ -397,3 +397,42 @@ That reorders the plan in our favour.
 
 Fold the corrected bit accounting into `ternary-feasibility.md` (Phase 0 budget
 and Phase 7a traffic get a second PTQTP row, "as implemented"), then run Gate A.
+
+---
+
+## Cross-validation: our Algorithm 1 against the released artifact
+
+Method C was implemented from the paper (`tools/qwen_ternary_feasibility.py`,
+`ptqtp_fit`) rather than adapted from the artifact. First 64 rows of three real
+Qwen3-0.6B tensors, G=128, on CPU:
+
+| tensor | iters=1 | iters=5 | iters=50 | distinct/group | naive W1.58 |
+|---|---|---|---|---|---|
+| `gate_proj` L13 | 0.5151 | 0.2279 | **0.1834** (ratio 0.965) | 9 | 0.4559 |
+| `v_proj` L0 | 0.5028 | 0.2190 | **0.1779** (ratio 0.968) | 9 | 0.4444 |
+| `down_proj` L27 | 0.5548 | 0.2792 | **0.2106** (ratio 0.953) | 9 | 0.4993 |
+
+Everything the paper claims about the algorithm reproduces: the error decreases
+monotonically (Alg. 1's guarantee), it converges to **exactly 9 distinct values
+per 128-group**, the norm ratio settles just below 1 as a least-squares fit
+should, and it beats naive single-plane ternary by **2.4-2.5×**.
+
+**Now compare against the released artifact, tensor for tensor:**
+
+| tensor | ours, rel err | artifact, rel err | artifact norm ratio |
+|---|---|---|---|
+| `v_proj` L0 | 0.178 | **0.18** ✓ | 0.93 |
+| `down_proj` L27 | 0.211 | 0.25-0.29 ≈ | 0.82-0.91 |
+| **`gate_proj` L13** | **0.183** | **3.42** ✗ | **4.34** |
+
+**Our implementation agrees with the artifact on the tensors that look sane and
+disagrees by a factor of ~19 exactly where the artifact's norm ratio is 4.34.**
+That is the cleanest available evidence that:
+
+1. the method as published works and our implementation of it is faithful;
+2. the released `Qwen3-0.6B-PTQTP-1.58b` upload is **defective on `gate_proj`
+   and `up_proj`**, not representative of the paper's own experiments.
+
+Consequence: **the reproduction gate runs against our implementation**, and the
+artifact is used only as a spot check on `v_proj`/`o_proj`/`down_proj`. Whatever
+perplexity the artifact returns is a fact about the upload, not about PTQTP.

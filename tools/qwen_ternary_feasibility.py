@@ -715,6 +715,175 @@ def cmd_ppl(args) -> int:
     return 0
 
 
+
+# ---------------------------------------------------------------------------
+# Method C — PTQTP, implemented from Algorithm 1 of arXiv 2509.16989.
+#
+# Implemented from the paper, NOT adapted from the authors' released artifact,
+# because that artifact's gate_proj/up_proj do not reconstruct (see
+# .work/ptqtp-paper-reading.md). Every step below cites the paper:
+#
+#   Alg.1 L1  reshape W (n x d) into groups of G columns
+#   Alg.1 L2  T(k) <- sign(W), zeros replaced by 1 (App. B); alpha <- [1, 1]
+#   Alg.1 L5-7 / Eq.6   per group: A = S^T S + lambda I2, b = S^T w,
+#                       alpha = A^-1 b            (ridge, closed form 2x2)
+#   Eq.2-3    lambda adapted from the condition number, capped at lambda_max = 1
+#   Alg.1 L9 / Eq.5     per element: exhaustive search over the 9 pairs in
+#                       {-1,0,1}^2 minimising the squared error
+#   Alg.1 L11 stop when max ||alpha_t - alpha_{t-1}||_F < eps
+#
+# Section 4.1: no calibration data is used anywhere. This is a weight-only
+# closed-form fit, which is why it can run before Phase 1 exists.
+#
+# The output is a dense fake-quantized checkpoint, the same shape of artifact
+# the authors publish, so it can be fed straight to `ppl`.
+# ---------------------------------------------------------------------------
+
+
+def ptqtp_fit(W, group: int, iters: int, eps: float, lam0: float = 1e-8):
+    """W: (rows, cols) float32 torch tensor. Returns the reconstruction."""
+    import torch
+
+    rows, cols = W.shape
+    G = group if group and cols % group == 0 else cols
+    Wg = W.reshape(-1, G)                              # Alg.1 L1
+    n = Wg.shape[0]
+
+    T = torch.sign(Wg)
+    T[T == 0] = 1.0                                    # Alg.1 L2 + App. B
+    T1, T2 = T.clone(), T.clone()
+    alpha = torch.ones(n, 2, device=W.device, dtype=W.dtype)
+    lam = torch.full((n,), lam0, device=W.device, dtype=W.dtype)
+
+    # the 9 ternary pairs of Eq. 5
+    pairs = torch.tensor([(a, b) for a in (-1.0, 0.0, 1.0) for b in (-1.0, 0.0, 1.0)],
+                         device=W.device, dtype=W.dtype)          # (9, 2)
+
+    for _ in range(iters):
+        prev = alpha.clone()
+
+        # --- Eq. 6: per-group 2x2 ridge solve -------------------------------
+        s11 = (T1 * T1).sum(1)
+        s22 = (T2 * T2).sum(1)
+        s12 = (T1 * T2).sum(1)
+        b1 = (T1 * Wg).sum(1)
+        b2 = (T2 * Wg).sum(1)
+        a11, a22 = s11 + lam, s22 + lam
+        det = a11 * a22 - s12 * s12
+
+        # Eq. 2-3: adapt lambda on the condition number, capped at lambda_max=1
+        fro = torch.sqrt(a11**2 + a22**2 + 2 * s12**2)
+        inv_fro = fro / det.abs().clamp_min(1e-30)
+        kappa = fro * inv_fro
+        bad = kappa >= 1e12
+        if bad.any():
+            lam = torch.where(bad, (lam * torch.sqrt(kappa / 1e12)).clamp(max=1.0), lam)
+            a11, a22 = s11 + lam, s22 + lam
+            det = a11 * a22 - s12 * s12
+
+        det = torch.where(det.abs() < 1e-30, torch.full_like(det, 1e-30), det)
+        alpha = torch.stack([(a22 * b1 - s12 * b2) / det,
+                             (a11 * b2 - s12 * b1) / det], dim=1)
+
+        # --- Eq. 5: exhaustive search over the 9 pairs, per element ----------
+        cand = alpha @ pairs.T                          # (n, 9) reachable values
+        err = (Wg.unsqueeze(2) - cand.unsqueeze(1)).abs()   # (n, G, 9)
+        best = err.argmin(2)                            # (n, G)
+        T1 = pairs[:, 0][best]
+        T2 = pairs[:, 1][best]
+
+        if torch.max(torch.norm(alpha - prev, dim=1)) < eps:   # Alg.1 L11
+            break
+
+    What = alpha[:, 0:1] * T1 + alpha[:, 1:2] * T2
+    return What.reshape(rows, cols)
+
+
+def naive_ternary_fit(W, group: int, **_):
+    """Baseline A: a single plane, W ~ alpha*T, threshold at the classic 0.7*mean|W|."""
+    import torch
+
+    rows, cols = W.shape
+    G = group if group and cols % group == 0 else cols
+    Wg = W.reshape(-1, G)
+    thr = 0.7 * Wg.abs().mean(1, keepdim=True)
+    T = torch.where(Wg > thr, 1.0, torch.where(Wg < -thr, -1.0, 0.0))
+    denom = (T * T).sum(1, keepdim=True).clamp_min(1.0)
+    alpha = (T * Wg).sum(1, keepdim=True) / denom
+    return (alpha * T).reshape(rows, cols)
+
+
+METHODS = {"ptqtp": ptqtp_fit, "naive": naive_ternary_fit}
+
+
+def cmd_quantize(args) -> int:
+    import json as _json
+    import shutil
+
+    try:
+        import torch
+        from safetensors.torch import load_file, save_file
+    except ImportError as e:
+        raise Refusal(f"torch/safetensors missing ({e}); use `uv run --extra check`")
+
+    src = Path(args.model)
+    dst = Path(args.out)
+    if not (src / "config.json").is_file():
+        raise Refusal(f"no config.json under {src}")
+    method = METHODS.get(args.method or "ptqtp")
+    if method is None:
+        raise Refusal(f"unknown --method {args.method!r}; one of {sorted(METHODS)}")
+
+    protect = set(args.protect or ())
+    bad = protect - set(FAMILIES)
+    if bad:
+        raise Refusal(f"--protect names non-families: {sorted(bad)}")
+
+    dev = args.device or ("mps" if torch.backends.mps.is_available() else "cpu")
+    sd = load_file(str(src / "model.safetensors"))
+    dst.mkdir(parents=True, exist_ok=True)
+
+    done, skipped, report = 0, 0, []
+    for name in sorted(sd):
+        _, fam = classify(name)
+        if fam not in FAMILIES or fam in protect:
+            skipped += 1
+            continue
+        W = sd[name].to(device=dev, dtype=torch.float32)
+        What = method(W, group=args.group, iters=args.iters, eps=args.eps)
+        rel = float(torch.norm(What - W) / torch.norm(W))
+        ratio = float(torch.norm(What) / torch.norm(W))
+        sd[name] = What.to(dtype=sd[name].dtype, device="cpu")
+        report.append(dict(tensor=name, family=fam, rel_err=rel, norm_ratio=ratio))
+        done += 1
+        if args.verbose:
+            print(f"  {name:<45} rel={rel:.4f} ratio={ratio:.3f}", file=sys.stderr)
+
+    save_file(sd, str(dst / "model.safetensors"), metadata={"format": "pt"})
+    for f in ("config.json", "generation_config.json", "tokenizer.json",
+              "tokenizer_config.json", "vocab.json", "merges.txt",
+              "added_tokens.json", "special_tokens_map.json", "chat_template.jinja"):
+        if (src / f).is_file():
+            shutil.copy2(src / f, dst / f)
+
+    rels = [r["rel_err"] for r in report]
+    summary = dict(source=str(src), out=str(dst), method=args.method or "ptqtp",
+                   group=args.group, iters=args.iters, eps=args.eps, device=dev,
+                   protected_families=sorted(protect),
+                   tensors_quantized=done, tensors_untouched=skipped,
+                   rel_err_min=min(rels) if rels else None,
+                   rel_err_max=max(rels) if rels else None,
+                   rel_err_mean=sum(rels) / len(rels) if rels else None,
+                   per_tensor=report)
+    write_json(args, f"quantize_{dst.name}.json", summary)
+    print(f"{args.method or 'ptqtp'}: {done} tensors quantized, {skipped} untouched "
+          f"-> {dst}")
+    if rels:
+        print(f"  reconstruction rel err: min {min(rels):.4f}  "
+              f"mean {sum(rels)/len(rels):.4f}  max {max(rels):.4f}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Phases not written yet — they refuse rather than print a placeholder.
 # ---------------------------------------------------------------------------
@@ -781,6 +950,18 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--max-windows", type=int, default=None)
     pp.add_argument("--verbose", action="store_true")
     pp.set_defaults(fn=cmd_ppl)
+
+    qz = sub.add_parser("quantize", help="Method A/C — write a fake-quantized checkpoint")
+    qz.add_argument("--out", required=True, help="output directory")
+    qz.add_argument("--group", type=int, default=128, help="group size G (paper: 128)")
+    qz.add_argument("--iters", type=int, default=50, help="T_max (paper: 50)")
+    qz.add_argument("--eps", type=float, default=1e-4, help="convergence tolerance")
+    qz.add_argument("--protect", nargs="*", default=None, choices=FAMILIES,
+                    help="families to leave untouched; the authors' artifact "
+                         "protects q_proj and k_proj")
+    qz.add_argument("--device", default=None)
+    qz.add_argument("--verbose", action="store_true")
+    qz.set_defaults(fn=cmd_quantize)
 
     sub.add_parser("calib", help="Phase 1 — calibration corpus").set_defaults(
         fn=not_yet("Phase 1 (calib)", "Nothing has been tokenized or cached."))

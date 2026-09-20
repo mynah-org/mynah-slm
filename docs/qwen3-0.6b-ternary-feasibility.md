@@ -196,17 +196,38 @@ region doing the arithmetic off few bytes.
 
 ### Weight bytes per decoded token
 
-| scheme | MiB/token | q/k/v/o + gate/up/down | tied lm_head | vs Q4_K_M | AI (FLOP/B) |
-|---|---|---|---|---|---|
-| BF16 | 1137.0 | 73.9% | 26.1% | 0.33x | 1.00 |
-| INT8 / Q8_0 | 604.1 | 73.9% | 26.1% | 0.62x | 1.88 |
-| **Q4_K_M — shipped** | **372.7** | **67.3%** | **32.7%** | **1.00x** | **3.05** |
-| Q3_K_M | 302.4 | 59.7% | 40.2% | 1.23x | 3.76 |
-| **PTQTP 2x1.58** | 299.2 | 59.2% | 40.7% | **1.25x** | 3.80 |
-| IQ2_XXS | 230.2 | 47.0% | 52.9% | 1.62x | 4.94 |
-| **W1.58 single plane** | 210.6 | 42.1% | 57.8% | **1.77x** | 5.40 |
-| IQ1_S | 204.0 | 40.2% | 59.7% | 1.83x | 5.57 |
-| *linears at zero bits (bound)* | *122.0* | *0%* | *99.8%* | *3.06x* | *9.32* |
+`coverage` is the share of the **whole model** a scheme actually quantizes.
+PTQTP appears four times because two independent things about it were wrong in
+an earlier revision of this page, and both are now measured — see
+[`.work/ptqtp-paper-reading.md`](../.work/ptqtp-paper-reading.md):
+
+- it stores each trit in **2 bits, unpacked** (its own Appendix A.3), so the
+  representation is **4.250 bits/weight**, not the 3.375 a base-3 packing would
+  give. Bit-packing is listed in the paper under *Limitations and Future Works*;
+- its released Qwen3-0.6B artifact **protects `q_proj` and `k_proj` in all 28
+  blocks**, so coverage is 59.1% of the model, not the 73.9% that §4.1's "all
+  linear layers were quantized" implies.
+
+| scheme | coverage | MiB/token | linears | tied lm_head | vs Q4_K_M | AI (FLOP/B) |
+|---|---|---|---|---|---|---|
+| BF16 | 73.9% | 1137.0 | 73.9% | 26.1% | 0.33x | 1.00 |
+| INT8 / Q8_0 | 73.9% | 604.1 | 73.9% | 26.1% | 0.62x | 1.88 |
+| **Q4_K_M — shipped** | 73.9% | **372.7** | **67.3%** | **32.7%** | **1.00x** | **3.05** |
+| **PTQTP as implemented, artifact coverage** | **59.1%** | **369.4** | 67.0% | 33.0% | **1.01x** | 3.08 |
+| PTQTP as implemented, all linears | 73.9% | 345.1 | 64.7% | 35.3% | 1.08x | 3.29 |
+| PTQTP packed-optimal, artifact coverage | 59.1% | 332.6 | 63.3% | 36.6% | 1.12x | 3.42 |
+| Q3_K_M | 73.9% | 302.4 | 59.7% | 40.2% | 1.23x | 3.76 |
+| PTQTP packed-optimal, all linears | 73.9% | 299.2 | 59.2% | 40.7% | 1.25x | 3.80 |
+| IQ2_XXS | 73.9% | 230.2 | 47.0% | 52.9% | 1.62x | 4.94 |
+| **W1.58 single plane** | 73.9% | 210.6 | 42.1% | 57.8% | **1.77x** | 5.40 |
+| IQ1_S | 73.9% | 204.0 | 40.2% | 59.7% | 1.83x | 5.57 |
+| *linears at zero bits (bound)* | — | *122.0* | *0%* | *99.8%* | *3.06x* | *9.32* |
+
+**PTQTP as the authors actually built it is the same size as the file we ship
+today — 1.01x.** The 1.25x figure needs a packing nobody has implemented *and* a
+coverage the released artifact does not have. Both bounds are kept, labelled,
+because the optimistic one is the right ceiling for a future implementation and
+the pessimistic one is the right description of the published work.
 
 **The projections' share of traffic falls as you ternarize them** — 67.3% at Q4,
 42.1% at W1.58 — because the tied `lm_head` does not move. Amdahl's law on bytes
@@ -337,12 +358,12 @@ at the second arrow, and Phase 7a already showed the first arrow was worth only
 |---|---|---|
 | 1 | Can Qwen3-0.6B tolerate single-plane W1.58 at useful coverage? | `[NOT MEASURED]` — Phase 3a |
 | 2 | How much does PT²/TWLA improve over naive? | `[NOT MEASURED]` — Phase 2/4 |
-| 3 | How much better is PTQTP 2×1.58? | `[PUBLISHED]` +82% ppl on this model; ours `[NOT MEASURED]` |
+| 3 | How much better is PTQTP 2×1.58? | `[PUBLISHED]` ppl 20.9 → 38.02 and MMLU 47.1 → 33.64 on this model; ours `[NOT MEASURED]` — Gate A |
 | 4 | Which families/blocks are most sensitive? | `[NOT MEASURED]` — Phase 3 |
 | 5 | Is MLP more attractive than attention? | MLP is 60% of ternarizable weight `[MEASURED]`; sensitivity `[NOT MEASURED]` |
 | 6 | What fraction can be ternarized safely? | `[NOT MEASURED]` — Phase 4 |
 | 7 | Best mixed-precision configuration? | `[NOT MEASURED]` — Phase 5 |
-| 8 | Real complete-model effective bit budget? | **`[MEASURED]`** — §3; 2.963-6.674 bpw depending on scheme, never 1.58 |
+| 8 | Real complete-model effective bit budget? | **`[MEASURED]`** — 2.87-6.86 bpw depending on scheme, **never 1.58**. PTQTP as published: **4.250 bits/weight on 59.1% of the model**, i.e. 1.01x the shipped file |
 | 9 | How does it compare with ordinary Q4? | **`[MEASURED]` on storage** — §3; on quality `[NOT MEASURED]` |
 | 10 | Worth a dedicated CPU ternary backend? | **No, for v0.1/v0.2** `[MEASURED]` — storage says no, and decode is ALU-bound so the traffic saving has nothing to convert into |
 | 11 | Which shapes and ISA paths first? | Shapes `[MEASURED]` — five distinct linear shapes plus the head, all K in {1024, 2048, 3072}. ISA selection moot under the current verdict |
