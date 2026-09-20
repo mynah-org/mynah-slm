@@ -1,0 +1,16 @@
+scheme,linear_bpw,embedding,total_MiB,whole_model_bpw,note
+BF16 (as published),16.0,bf16,1137.0,16.002,1 tensor written twice on disk; deduped here
+Q8_0 everywhere,8.5,q8_0,604.1,8.503,docs/models.md measures 8.50 bpw whole-file
+"Q4_K_M, exact recipe (what we ship)",4.5,q6_k,372.7,5.245,"MEASURED on the real file: 372.7 MiB, 5.24 bpw"
+Q4_K flat (no Q6_K bumps),4.5,q6_k,358.2,5.041,the same recipe without llama.cpp's per-layer bumps
+Q3_K_M,3.4375,q6_k,302.4,4.256,granite-350m says this survives but is a poor trade
+IQ2_XXS linears,2.0625,q6_k,230.2,3.24,ingot decodes it today; generic kernel
+IQ1_S linears,1.5625,q6_k,204.0,2.871,the conventional floor; quality unmeasured here
+w158_rowwise + bf16 embedding,1.6875,bf16,385.6,5.427,TQ1_0 (exact fit)
+w158_rowwise + q6_k embedding,1.6875,q6_k,210.6,2.963,TQ1_0 (exact fit)
+w158_g128 + bf16 embedding,1.9375,bf16,398.7,5.611,TQ1_0 + a side scale tensor
+w158_g128 + q6_k embedding,1.9375,q6_k,223.7,3.148,TQ1_0 + a side scale tensor
+ptqtp_rowwise + bf16 embedding,3.375,bf16,474.2,6.674,two TQ1_0 tensors — no single ggml type holds this
+ptqtp_rowwise + q6_k embedding,3.375,q6_k,299.2,4.21,two TQ1_0 tensors — no single ggml type holds this
+ptqtp_g128 + bf16 embedding,3.625,bf16,487.3,6.858,two TQ1_0 tensors + side scales — no single ggml type
+ptqtp_g128 + q6_k embedding,3.625,q6_k,312.3,4.395,two TQ1_0 tensors + side scales — no single ggml type

@@ -1,9 +1,10 @@
-# Local planning notes and agent instructions (not part of the public repo)
-PLAN.md
+# Planning: PLAN.md is the board and .work/ holds the detail. BOTH ARE TRACKED,
+# same convention as mynah-tts, so the three repos are read the same way.
+# The only planning document that stays out of git is CLAUDE.md, which is a
+# SYMLINK to the tracked AGENTS.md — one file, two names, no divergence.
+CLAUDE.md
 TASKS.md
 TODO.md
-CLAUDE.md
-AGENTS.md
 PERF-LOG.md
 plan_*.md
 analisi_*.md

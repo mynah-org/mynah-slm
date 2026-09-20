@@ -135,6 +135,7 @@ test: $(TESTS) mynah-slm
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi; \
 	done
 	@./mynah-slm --version >/dev/null || exit 1
+	@python3 tools/check_plan.py || exit 1
 	@if [ -e "$(MODEL)" ]; then ./mynah-slm inspect "$(MODEL)" >/dev/null || exit 1; \
 	 else echo "SKIP inspect: $(MODEL) not found (scripts/download_model.sh --list)"; fi
 	@$(MAKE) --no-print-directory test-parity

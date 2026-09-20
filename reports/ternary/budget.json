@@ -1,0 +1,130 @@
+{
+  "model": "models-local/qwen3-0.6b-bf16",
+  "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+  "params_distinct": 596049920,
+  "linears": 440401920,
+  "embedding": 155582464,
+  "other": 65536,
+  "rows": [
+    {
+      "scheme": "BF16 (as published)",
+      "linear_bpw": 16.0,
+      "embedding": "bf16",
+      "total_MiB": 1137.0,
+      "whole_model_bpw": 16.002,
+      "note": "1 tensor written twice on disk; deduped here"
+    },
+    {
+      "scheme": "Q8_0 everywhere",
+      "linear_bpw": 8.5,
+      "embedding": "q8_0",
+      "total_MiB": 604.1,
+      "whole_model_bpw": 8.503,
+      "note": "docs/models.md measures 8.50 bpw whole-file"
+    },
+    {
+      "scheme": "Q4_K_M, exact recipe (what we ship)",
+      "linear_bpw": 4.5,
+      "embedding": "q6_k",
+      "total_MiB": 372.7,
+      "whole_model_bpw": 5.245,
+      "note": "MEASURED on the real file: 372.7 MiB, 5.24 bpw"
+    },
+    {
+      "scheme": "Q4_K flat (no Q6_K bumps)",
+      "linear_bpw": 4.5,
+      "embedding": "q6_k",
+      "total_MiB": 358.2,
+      "whole_model_bpw": 5.041,
+      "note": "the same recipe without llama.cpp's per-layer bumps"
+    },
+    {
+      "scheme": "Q3_K_M",
+      "linear_bpw": 3.4375,
+      "embedding": "q6_k",
+      "total_MiB": 302.4,
+      "whole_model_bpw": 4.256,
+      "note": "granite-350m says this survives but is a poor trade"
+    },
+    {
+      "scheme": "IQ2_XXS linears",
+      "linear_bpw": 2.0625,
+      "embedding": "q6_k",
+      "total_MiB": 230.2,
+      "whole_model_bpw": 3.24,
+      "note": "ingot decodes it today; generic kernel"
+    },
+    {
+      "scheme": "IQ1_S linears",
+      "linear_bpw": 1.5625,
+      "embedding": "q6_k",
+      "total_MiB": 204.0,
+      "whole_model_bpw": 2.871,
+      "note": "the conventional floor; quality unmeasured here"
+    },
+    {
+      "scheme": "w158_rowwise + bf16 embedding",
+      "linear_bpw": 1.6875,
+      "embedding": "bf16",
+      "total_MiB": 385.6,
+      "whole_model_bpw": 5.427,
+      "note": "TQ1_0 (exact fit)"
+    },
+    {
+      "scheme": "w158_rowwise + q6_k embedding",
+      "linear_bpw": 1.6875,
+      "embedding": "q6_k",
+      "total_MiB": 210.6,
+      "whole_model_bpw": 2.963,
+      "note": "TQ1_0 (exact fit)"
+    },
+    {
+      "scheme": "w158_g128 + bf16 embedding",
+      "linear_bpw": 1.9375,
+      "embedding": "bf16",
+      "total_MiB": 398.7,
+      "whole_model_bpw": 5.611,
+      "note": "TQ1_0 + a side scale tensor"
+    },
+    {
+      "scheme": "w158_g128 + q6_k embedding",
+      "linear_bpw": 1.9375,
+      "embedding": "q6_k",
+      "total_MiB": 223.7,
+      "whole_model_bpw": 3.148,
+      "note": "TQ1_0 + a side scale tensor"
+    },
+    {
+      "scheme": "ptqtp_rowwise + bf16 embedding",
+      "linear_bpw": 3.375,
+      "embedding": "bf16",
+      "total_MiB": 474.2,
+      "whole_model_bpw": 6.674,
+      "note": "two TQ1_0 tensors \u2014 no single ggml type holds this"
+    },
+    {
+      "scheme": "ptqtp_rowwise + q6_k embedding",
+      "linear_bpw": 3.375,
+      "embedding": "q6_k",
+      "total_MiB": 299.2,
+      "whole_model_bpw": 4.21,
+      "note": "two TQ1_0 tensors \u2014 no single ggml type holds this"
+    },
+    {
+      "scheme": "ptqtp_g128 + bf16 embedding",
+      "linear_bpw": 3.625,
+      "embedding": "bf16",
+      "total_MiB": 487.3,
+      "whole_model_bpw": 6.858,
+      "note": "two TQ1_0 tensors + side scales \u2014 no single ggml type"
+    },
+    {
+      "scheme": "ptqtp_g128 + q6_k embedding",
+      "linear_bpw": 3.625,
+      "embedding": "q6_k",
+      "total_MiB": 312.3,
+      "whole_model_bpw": 4.395,
+      "note": "two TQ1_0 tensors + side scales \u2014 no single ggml type"
+    }
+  ]
+}
