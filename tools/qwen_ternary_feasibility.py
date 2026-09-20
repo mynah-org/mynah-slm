@@ -707,7 +707,11 @@ def cmd_ppl(args) -> int:
     dev = args.device or ("mps" if torch.backends.mps.is_available() else "cpu")
     tok_dir = Path(args.tokenizer) if args.tokenizer else model_dir
     tok = AutoTokenizer.from_pretrained(tok_dir)
-    dtype = torch.float32 if dev == "cpu" else torch.float16
+    # IQ1_S overflowed fp16 on this harness and returned NaN; a badly damaged
+    # model can leave the fp16 activation range, which is a property of the
+    # quantization, not of the metric. --dtype fp32 gets a number out of it.
+    dtype = dict(fp32=torch.float32, fp16=torch.float16)[args.dtype] if args.dtype \
+        else (torch.float32 if dev == "cpu" else torch.float16)
     model = AutoModelForCausalLM.from_pretrained(
         model_dir, dtype=dtype, **load_kwargs).to(dev).eval()
 
@@ -1273,6 +1277,7 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--gguf", default=None,
                     help="score a GGUF inside --model instead of its safetensors; "
                          "transformers dequantizes it, so every format lands in ONE harness")
+    pp.add_argument("--dtype", choices=["fp16", "fp32"], default=None)
     pp.add_argument("--logit-chunk", type=int, default=256,
                     help="positions per lm_head/cross-entropy chunk")
     pp.set_defaults(fn=cmd_ppl)

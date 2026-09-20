@@ -1385,3 +1385,87 @@ it buys. That is a complete negative result across **four** conditions
 > AWQ family.** We can invert their scale exactly and reproduce the transform,
 > but not derive it, and every derivable rule in that family makes things worse.
 > What it is remains open, and settling it needs their code.
+
+---
+
+# PHASE A — the locked table, one harness, 2026-09-20
+
+Everything below is `[MEASURED]` on **one** harness with **one** protocol. The
+earlier split between our HF runs and llama.cpp's is gone: GGUF files are now
+loaded through `transformers` (which dequantizes them), so every format is
+scored identically and the absolutes are comparable across the whole table.
+
+## Reproducibility record
+
+| | |
+|---|---|
+| model | `Qwen/Qwen3-0.6B` @ `c1899de289a04d12100db370d81485cdf75e47ca` |
+| artifact | `yang31210999/Qwen3-0.6B-PTQTP-1.58b` @ `6dfb5a8fa4055ef2a67a4712342ab1562a2bb969` |
+| tokenizer | the model's own, same revision |
+| dataset | `Salesforce/wikitext`, config `wikitext-2-raw-v1`, split `test` |
+| join | `"\n\n".join(rows)`, tokenized once |
+| protocol | **non-overlapping** windows, score positions 1..L−1 of each |
+| seq len | 2048 |
+| windows | **146**, **298,862 tokens scored** |
+| dtype / device | fp16 / mps (fp32 where noted) |
+| loss | `lm_head` + cross-entropy in 256-position chunks, summed then averaged |
+| GGUF quants | `llama.cpp` `2115b73`, imatrix from WikiText-2 **train**, 200 chunks |
+| versions | recorded per run in `reports/ternary/ppl_*.json` |
+
+**Harness validation**: the rewritten harness reproduces the numbers taken
+before it to four decimals — BF16 **20.9541** against 20.954, PTQTP artifact
+**35.2560** against 35.256.
+
+## The table
+
+| condition | bits (linears) | ppl | ratio to BF16 |
+|---|---|---|---|
+| **BF16** | 16 | **20.9541** | 1.000 |
+| **Q8_0** | 8.5 | **20.9080** | **0.998** |
+| **Q4_K_M** | 4.5 | **21.6455** | **1.033** |
+| **Q3_K_M** | 3.4375 | **24.6408** | **1.176** |
+| **PTQTP, authors' artifact** | ~4.25 on 59.1% coverage | **35.2560** | **1.683** |
+| **IQ3_XXS** | 3.0625 | **39.8882** | **1.904** |
+| **Method C, q/k protected** | 4.25 on 59.1% | **43.3312** | **2.068** |
+| **Method C, all linears** | 4.25 on 73.9% | **59.5391** | **2.841** |
+| **IQ2_XXS** | 2.0625 | **1265.43** | **60.4** |
+| **IQ1_S** | 1.5625 | **NaN in fp16** | — |
+| **naive W1.58** | 1.6875 | **684,110.5** | **32,648** |
+
+`[MEASURED]` `IQ1_S` returns NaN under fp16: the damaged model leaves the fp16
+activation range. That is a property of the quantization, not of the metric, and
+it is reported rather than hidden. An fp32 re-run is in flight.
+
+## The result that changes the picture
+
+**`Q3_K_M` beats PTQTP on both axes at once.**
+
+| | bits/weight | whole-model MiB (deduplicated, Phase 0 model) | ppl ratio |
+|---|---|---|---|
+| **Q3_K_M** | 3.4375 | **302.4** | **1.176** |
+| PTQTP as implemented | 4.25 on 59.1% | 369.4 | 1.683 |
+
+`[DERIVED]` **18% smaller and 43% less perplexity damage**, in a format ingot
+already decodes and `src/qmat.c` already has a fused kernel for.
+
+This had been invisible because Q3_K_M's quality on *this* model had never been
+measured — `docs/models.md` carries it only for granite-350m, where it was
+recorded as "survives but a poor trade". On Qwen3-0.6B it is not a poor trade at
+all; it is the best sub-4-bit point measured, by a wide margin.
+
+## Two more corrections the table forces
+
+1. **`IQ3_XXS` is not the sub-3-bit survivor it looked like.** At 1.904 it is
+   *worse* than the PTQTP artifact, and far worse than Q3_K_M at a higher bit
+   rate. The K-quants beat the IQ codebook quants badly on this model — the
+   opposite of the ordering the bit rates suggest.
+2. **The cliff is between 3.06 and 2.06 bpw, and it is a cliff, not a slope**:
+   1.904 → 60.4 → NaN. C3's restated form survives, with the interval now
+   bounded from both sides by measurements on the same harness.
+
+## What the table does NOT say
+
+`[UNKNOWN]` Nothing here is a behavioural result. Per C11, a perplexity ratio of
+1.68 may or may not correspond to a usable model; the Tied paper documents a case
+where reconstruction error and perplexity both worsened while task fidelity did
+not. The tool-call eval is the missing measurement and it is cheap.
