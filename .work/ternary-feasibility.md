@@ -1173,3 +1173,58 @@ Two things are still missing and both are cheap:
   scale-absorbed Method C are outstanding.
 - **CLAIM SCOPE** One checkpoint, WikiText-2 only, no tool-call or multilingual
   eval yet, weights-only, A16. Says nothing about 4B, and nothing about Gate B.
+
+## A2 — channel-scale absorption, implemented and tested
+
+The artifact's undocumented step is worth 8 perplexity points (A1). It was
+implemented here in two forms, because which one it is decides whether §4.1's
+"no calibration" claim survives.
+
+### It is function-preserving, proven rather than asserted  `[MEASURED]`
+
+Absorb only, quantize nothing, compare logits on a 256-token sequence against
+the untouched model:
+
+| | groups rescaled | rel_l2(logits) | argmax agreement |
+|---|---|---|---|
+| weight-only, α=0.5 | 56 | **3.10e-06** | **100.00%** |
+| weight-only, α=1.0 | 56 | **2.60e-06** | **100.00%** |
+
+56 = 28 blocks × 2 absorbable norms. The residual is fp32 rounding. The control
+— reloading the original state dict and re-running — reproduces the base logits
+**exactly**, so the harness itself is not the thing being measured.
+
+### The weight-only form buys nothing  `[MEASURED]`
+
+`s_j = (col_rms of the stacked consumers)^(-α)`, geomean-normalised — the AWQ
+shape without AWQ's activation term, which is what §4.1's "no calibration"
+permits. Reconstruction error of Method C over nine representative tensors
+(blocks 0/13/27 × `v_proj`/`gate_proj`/`down_proj`):
+
+| α | 0.00 | 0.25 | 0.50 | 0.75 | 1.00 |
+|---|---|---|---|---|---|
+| mean rel err | 0.1789 | 0.1788 | 0.1787 | 0.1787 | 0.1788 |
+
+**Flat to 0.1%.** In hindsight this is predictable and worth writing down:
+PTQTP's α is already fitted **per group of 128 consecutive input channels**
+(§3.2 reshapes `n × d` to `nd/G × G`). A smooth per-channel rescale inside a
+group is largely redundant with the group's own scale, so flattening by a weight
+statistic moves almost nothing.
+
+**That is itself evidence about the artifact.** Their scale buys 8 perplexity
+points; the weight-only form of the same transformation buys ~0. Combined with
+the log-correlations of 0.04-0.52 against column max/rms/mean, the remaining
+candidate is an **activation**-derived scale — which §4.1 says was not used.
+
+Caveat kept explicit: reconstruction error is measured in *weight* space, and an
+activation-aware scale deliberately trades weight error for output error. A flat
+weight curve does not prove the weight-only form is useless for perplexity; it
+proves it does not reduce weight error. The perplexity run is the test.
+
+### The activation-aware form
+
+`s_j = (mean|x_j|)^α` over the norm's output, geomean-normalised, 32 calibration
+sequences of 2048 tokens from **WikiText-2 train** — never the test split the
+perplexity is measured on. Running: α ∈ {0.5, 1.0} with `q`/`k` protected, plus
+an **absorb-only control that must return 20.954** and which is the end-to-end
+proof that nothing else changed.

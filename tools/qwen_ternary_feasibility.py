@@ -716,6 +716,154 @@ def cmd_ppl(args) -> int:
 
 
 
+
+# ---------------------------------------------------------------------------
+# Channel-scale absorption.
+#
+# Found by inspecting the authors' released artifact, NOT in the paper: it
+# divides each RMSNorm's per-channel weight by s_j and multiplies column j of
+# every projection consuming that norm by s_j. For `RMSNorm -> Linear` this is
+# exactly function-preserving, it is free at inference (only the stored norm
+# values change), and on their artifact it is worth 8 perplexity points.
+# See .work/ptqtp-paper-reading.md.
+#
+# Their s_j is not derivable from the weights (log-correlation 0.04-0.52 against
+# column max/rms/mean, sign-flipping by layer), so it is probably activation
+# derived. Section 4.1 says no calibration was used anywhere, so what we can do
+# faithfully is the WEIGHT-ONLY form: flatten the per-channel magnitude of the
+# stacked consumers by a tunable exponent, the AWQ shape without AWQ's
+# activation term.
+#
+#     c_j = RMS over rows of the stacked consumer columns
+#     s_j = (c_j / geomean(c)) ** (-alpha)      alpha = 0 is a no-op
+#     W[:, j] *= s_j        g_j /= s_j
+#
+# alpha = 1 flattens the columns completely and throws away the information
+# about which channel matters; alpha = 0 changes nothing. AWQ's compromise is
+# ~0.5. We sweep it.
+#
+# Qwen3 consumer groups:
+#     input_layernorm          -> q_proj, k_proj, v_proj
+#     post_attention_layernorm -> gate_proj, up_proj
+# o_proj and down_proj consume an attention output and an MLP hidden state, and
+# neither has an absorbable norm in front of it.
+# ---------------------------------------------------------------------------
+
+ABSORB_GROUPS = (
+    ("input_layernorm", ("q_proj", "k_proj", "v_proj")),
+    ("post_attention_layernorm", ("gate_proj", "up_proj")),
+)
+
+
+def absorb_channel_scales(sd, n_layers: int, alpha: float, eps: float = 1e-5):
+    """In-place, function-preserving. Returns the number of groups rescaled."""
+    import torch
+
+    if alpha == 0.0:
+        return 0
+    done = 0
+    for L in range(n_layers):
+        for norm_suffix, consumers in ABSORB_GROUPS:
+            gname = f"model.layers.{L}.{norm_suffix}.weight"
+            wnames = [f"model.layers.{L}."
+                      f"{'self_attn' if c.startswith(('q_', 'k_', 'v_', 'o_')) else 'mlp'}."
+                      f"{c}.weight" for c in consumers]
+            if gname not in sd or any(w not in sd for w in wnames):
+                continue
+            cols = torch.cat([sd[w].to(torch.float32) for w in wnames], dim=0)
+            c = cols.pow(2).mean(0).sqrt().clamp_min(eps)          # per input channel
+            logc = c.log()
+            s = torch.exp(-alpha * (logc - logc.mean()))           # geomean-normalised
+            for w in wnames:
+                sd[w] = (sd[w].to(torch.float32) * s.unsqueeze(0)).to(sd[w].dtype)
+            sd[gname] = (sd[gname].to(torch.float32) / s).to(sd[gname].dtype)
+            done += 1
+    return done
+
+
+
+def collect_channel_activations(src: Path, n_seq: int, seq_len: int, seed: int,
+                                device: str):
+    """Mean |x| per input channel at each absorbable norm's OUTPUT.
+
+    AWQ's statistic, and the one a weight-only rule cannot see. Calibration is
+    WikiText-2 *train* -- never the test split the perplexity is measured on.
+
+    Returns {layer_index: {norm_suffix: tensor[hidden]}}.
+    """
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise Refusal("the `datasets` package is missing; use `--with datasets`")
+
+    tok = AutoTokenizer.from_pretrained(src)
+    model = AutoModelForCausalLM.from_pretrained(src, dtype=torch.float32).to(device).eval()
+
+    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
+    ids = tok("\n\n".join(ds["text"]), return_tensors="pt").input_ids
+    g = torch.Generator().manual_seed(seed)
+    n_windows = ids.numel() // seq_len
+    pick = torch.randperm(n_windows, generator=g)[:n_seq]
+
+    stats, hooks = {}, []
+
+    def mk(layer: int, suffix: str):
+        def hook(_m, _inp, out):
+            a = out.detach().abs().to(torch.float32).reshape(-1, out.shape[-1]).mean(0)
+            key = (layer, suffix)
+            if key in stats:
+                stats[key][0] += a.cpu()
+                stats[key][1] += 1
+            else:
+                stats[key] = [a.cpu(), 1]
+        return hook
+
+    for i, blk in enumerate(model.model.layers):
+        for suffix, _ in ABSORB_GROUPS:
+            hooks.append(getattr(blk, suffix).register_forward_hook(mk(i, suffix)))
+
+    with torch.no_grad():
+        for w in pick.tolist():
+            chunk = ids[:, w * seq_len:(w + 1) * seq_len].to(device)
+            model(chunk)
+    for h in hooks:
+        h.remove()
+    del model
+
+    out = {}
+    for (layer, suffix), (acc, n) in stats.items():
+        out.setdefault(layer, {})[suffix] = acc / n
+    return out
+
+
+def absorb_activation_aware(sd, n_layers: int, alpha: float, acts):
+    """AWQ-shaped: s_j = (mean|x_j|)^alpha, geomean-normalised. Function-preserving."""
+    import torch
+
+    done = 0
+    for L in range(n_layers):
+        for norm_suffix, consumers in ABSORB_GROUPS:
+            a = acts.get(L, {}).get(norm_suffix)
+            if a is None:
+                continue
+            gname = f"model.layers.{L}.{norm_suffix}.weight"
+            wnames = [f"model.layers.{L}."
+                      f"{'self_attn' if c.startswith(('q_', 'k_', 'v_', 'o_')) else 'mlp'}."
+                      f"{c}.weight" for c in consumers]
+            if gname not in sd or any(w not in sd for w in wnames):
+                continue
+            la = a.clamp_min(1e-8).log()
+            s = torch.exp(alpha * (la - la.mean()))   # big-activation channels scale UP
+            for w in wnames:
+                sd[w] = (sd[w].to(torch.float32) * s.unsqueeze(0)).to(sd[w].dtype)
+            sd[gname] = (sd[gname].to(torch.float32) / s).to(sd[gname].dtype)
+            done += 1
+    return done
+
+
 # ---------------------------------------------------------------------------
 # Method C — PTQTP, implemented from Algorithm 1 of arXiv 2509.16989.
 #
@@ -843,6 +991,20 @@ def cmd_quantize(args) -> int:
     sd = load_file(str(src / "model.safetensors"))
     dst.mkdir(parents=True, exist_ok=True)
 
+    cfg = _json.loads((src / "config.json").read_text())
+    if args.absorb_act:
+        acts = collect_channel_activations(src, args.absorb_samples, args.seq_len,
+                                           args.seed, dev)
+        absorbed = absorb_activation_aware(sd, cfg["num_hidden_layers"],
+                                           args.absorb_alpha, acts)
+        kind = f"activation-aware (AWQ-shaped, {args.absorb_samples} calib seqs)"
+    else:
+        absorbed = absorb_channel_scales(sd, cfg["num_hidden_layers"], args.absorb_alpha)
+        kind = "weight-only"
+    if absorbed:
+        print(f"channel-scale absorption: {kind}, alpha={args.absorb_alpha}, "
+              f"{absorbed} norm groups rescaled (function-preserving)")
+
     done, skipped, report = 0, 0, []
     for name in sorted(sd):
         _, fam = classify(name)
@@ -869,6 +1031,8 @@ def cmd_quantize(args) -> int:
     rels = [r["rel_err"] for r in report]
     summary = dict(source=str(src), out=str(dst), method=args.method or "ptqtp",
                    group=args.group, iters=args.iters, eps=args.eps, device=dev,
+                   absorb_alpha=args.absorb_alpha, norm_groups_absorbed=absorbed,
+                   absorb_kind=("activation" if args.absorb_act else "weight-only"),
                    protected_families=sorted(protect),
                    tensors_quantized=done, tensors_untouched=skipped,
                    rel_err_min=min(rels) if rels else None,
@@ -959,6 +1123,15 @@ def build_parser() -> argparse.ArgumentParser:
     qz.add_argument("--protect", nargs="*", default=None, choices=FAMILIES,
                     help="families to leave untouched; the authors' artifact "
                          "protects q_proj and k_proj")
+    qz.add_argument("--absorb-alpha", type=float, default=0.0,
+                    help="per-channel scale absorption into the preceding RMSNorm; "
+                         "0 disables it (the paper's algorithm), ~0.5 is AWQ's "
+                         "compromise. Function-preserving and free at inference.")
+    qz.add_argument("--absorb-act", action="store_true",
+                    help="derive the absorption scale from calibration activations "
+                         "(AWQ-shaped) instead of from the weights")
+    qz.add_argument("--absorb-samples", type=int, default=32,
+                    help="calibration sequences for --absorb-act, from WikiText-2 TRAIN")
     qz.add_argument("--device", default=None)
     qz.add_argument("--verbose", action="store_true")
     qz.set_defaults(fn=cmd_quantize)
