@@ -708,3 +708,235 @@ completely.
   model.** **DECISION** Phase 7b promoted ahead of Phases 3-5.
 - **CLAIM SCOPE** Traffic and shapes only. No quality of ours is measured, and no
   decode time has yet been attributed to any term.
+
+---
+
+# Addendum 2, 2026-09-20 — the premise was already falsified in our own `docs/perf.md`
+
+Before running Phase 7b, the repo was searched for an existing answer, per the
+method's rule that rejected ideas and past measurements are evidence. **It was
+already there, measured, and nobody had connected it to this question.**
+
+## E1 — a format that reads 1.6× MORE bytes decodes 30% FASTER
+
+`docs/perf.md`, the Q8_0 fused-matvec section, on granite-350m, ARM, 8 threads:
+
+> **Q8_0 was the best-quality rung of the Granite ladder and the slowest; it is
+> now the best-quality rung *and the fastest*, ahead of Q4_K_M (54.8 against
+> 42.2).** […] If this decode were bandwidth-bound, Q8_0 could not win — it reads
+> **1.6× the bytes** of Q4_K_M. **It is ALU-bound**, so the format that costs one
+> multiply per weight beats the ones that cost a bit-plane reassembly, and the
+> extra bytes are affordable. **The formats were never the ranking; the kernels
+> were.**
+
+That is a direct, already-measured refutation of this entire study's premise. The
+proposition "fewer weight bytes ⇒ faster decode" is **false for this engine at
+this model size**, and it was falsified by an experiment run for an unrelated
+reason.
+
+It is also the single most important paragraph in the repo for R1, and it came
+from the same interleaved round in which *"every one of the other three
+checkpoints drifted DOWN 5-10% on a warming machine while Q8_0 went up 61%"* —
+i.e. it has its own control.
+
+## E2 — the tied LM head is 42% of a decode step, and no method in the brief touches it
+
+`docs/perf.md`, per-matvec, single-threaded, weights warm:
+
+| tensor | type | shape | time |
+|---|---|---|---|
+| `attn_q` | Q4_K | 2048 × 1024 | 0.46 ms |
+| `ffn_up` | Q4_K | 3072 × 1024 | 0.70 ms |
+| `ffn_down` | Q6_K | 1024 × 3072 | 0.54 ms |
+| **`lm_head`** (tied `token_embd`) | Q6_K | **151936 × 1024** | **42.55 ms** |
+
+> **The LM head is 42% of a decode step, on its own.** Threading divides it but
+> does not change its share, so this stays the largest single item.
+
+Put beside Phase 7a: the head is **32.7% of decode bytes at Q4, 57.8% under
+W1.58, and 42% of decode *time*.** A ternary scheme that ternarizes 100% of the
+projections is optimising **58% of the bytes and 58% of the time**, and the
+better it does, the larger the share it cannot touch. This is Amdahl's law
+arriving twice, from two independent measurements, at the same tensor.
+
+## E3 — threading does not behave like a memory wall
+
+`docs/perf.md`'s thread table (taken earlier in the optimisation history, so the
+absolute numbers are stale; the *shape* is what matters):
+
+| threads | decode tok/s | vs 1 thread |
+|---|---|---|
+| 1 | 4.1 | 1.00× |
+| 4 | 12.9 | 3.15× |
+| 8 | 14.6 | **3.56×** |
+
+Against PocketTTS's backbone, which is the reference bandwidth wall on this same
+class of machine: **1.15× from eight cores.** Ours gets 3.56×. A region that
+scales 3.6× with cores is not waiting on DRAM.
+
+## E4 — `--fast` buys 25% without changing a single weight byte
+
+The shipped CLI flag: *"`--fast`: int8 activations in the matvec. ~25% more
+decode tok/s for ~1.4% perplexity — measured, not free."*
+
+Quantizing **activations** changes zero weight bytes. If a 25% decode gain is
+available on the activation side, at least that much of the step is not weight
+streaming.
+
+## What this does to the study
+
+**The brief's sharpened question — "can Qwen3 preserve enough capability at
+~1.6-3.2 effective bits that the reduction in DRAM traffic makes a dedicated CPU
+ternary decode kernel worthwhile" — has a premise that our own measurements
+reject.** The reduction in DRAM traffic is not the thing that makes decode fast
+here. It is ALU-bound, the kernels are the ranking, and the largest single cost
+is a matrix no ternary method quantizes.
+
+Combined with Phase 7a's ceiling (PTQTP buys 1.10-1.23× of *traffic*, and
+traffic is not the bottleneck) and F5's published quality (+82% perplexity on
+this exact model), the ledger is:
+
+| | |
+|---|---|
+| best case traffic saving, PTQTP | 1.10-1.23× end-to-end |
+| best case traffic saving, W1.58 | 1.25-1.72× end-to-end |
+| fraction of that convertible into time | **unknown, and demonstrably < 1** |
+| share of decode time the method cannot touch | **42%** (the tied head) |
+| published quality cost on this model | **+82% ppl, MMLU 47.1 → 33.6** |
+| storage vs a format ingot already decodes | PTQTP **+30%**, W1.58 **+3%** |
+| new work | PTQ pipeline, converter, new ggml type, NEON+AVX2 kernels, per-language quality gate |
+
+**Phase 7b is still run** — with our own current numbers on Qwen3-0.6B rather
+than granite-350m, because a conclusion inherited from another checkpoint is a
+hypothesis — but it is now a confirmation, not a discovery.
+
+## Evidence log — addendum 2
+
+- **FACT (E1)** `docs/perf.md`: Q8_0 decodes 54.8 tok/s against Q4_K_M's 42.2 on
+  granite-350m while reading **1.6× the bytes**. Recorded conclusion: *"It is
+  ALU-bound […] the formats were never the ranking; the kernels were."*
+- **FACT (E2)** The tied LM head is **42% of a decode step** and 57.8% of bytes
+  under W1.58. No method in the brief quantizes it.
+- **FACT (E3)** Decode scales **3.56×** on eight cores; the reference bandwidth
+  wall scales 1.15×.
+- **FACT (E4)** `--fast` buys ~25% decode by quantizing activations, changing no
+  weight bytes.
+- **DECISION** The premise "weight traffic dominates batch-1 decode" is rejected
+  for this engine at this model size, on four independent pieces of our own prior
+  evidence. Phase 7b is demoted from discovery to confirmation on Qwen3-0.6B.
+- **CLAIM SCOPE** This says nothing about a 4B or 8B model, where the head's
+  share falls and the weight/ALU balance shifts. Question 12 of the brief is
+  untouched by it.
+
+---
+
+# Phase 7b — **DONE 2026-09-20**: decode is ALU-bound, measured on Qwen3-0.6B
+
+Run against the pre-registered reading in the Phase 7b plan above, so the verdict
+could not be chosen after seeing the numbers.
+
+**Setup.** `mynah-slm v0.0.1-3-g2e52761`, built from a **clean committed tree**
+(`make clean && make`), `Qwen3-0.6B-Q4_K_M.gguf` **staged local** in
+`models-local/`, `-p "Write a short paragraph about the sea." -n 128 --think off
+--no-stream --seed 1 --temp 0`. Deterministic: every run generates the identical
+68 tokens, so the work is byte-for-byte the same at every thread count. Two
+discarded warm-up runs, then five measured runs per point, one process at a time.
+Median reported. M1, 4 performance + 4 efficiency cores. A development signal,
+not a product claim.
+
+| threads | decode tok/s | achieved GB/s | vs 1 thread | spread | `--fast` tok/s | `--fast` GB/s | gain |
+|---|---|---|---|---|---|---|---|
+| 1 | 12.8 | 5.00 | 1.00× | 0.8% | 18.9 | 7.39 | **+48%** |
+| 2 | 22.2 | 8.68 | 1.73× | 3.2% | 31.6 | 12.35 | +42% |
+| **4** | **37.8** | **14.77** | **2.95×** | 3.7% | **43.5** | **17.00** | +15% |
+| 8 | 37.1 | 14.50 | 2.90× | 1.9% | *37.7* | *14.73* | *+2%* |
+
+The 8-thread `--fast` row scattered from 22.6 to 45.4 tok/s — **60.5% spread**.
+Per the execution discipline it is **not a measurement** and nothing is concluded
+from it. Every other point held within 4%.
+
+## Verdict against the pre-registered reading
+
+The plan said: *flat from 2 threads up and ≥30 GB/s → traffic-bound, ternary is
+live; scales with cores and ≪30 GB/s → not traffic-bound, cutting weight bytes
+cannot pay.*
+
+**It scales 2.95× on four cores and tops out at 14.8 GB/s.** The plateau from 4
+to 8 threads is the P-core count, not a DRAM ceiling: the same machine was
+demonstrated to sustain **32-38 GB/s** on the PocketTTS backbone
+(`../mynah-tts/.work/backbone-bandwidth.md`), and that region scaled only 1.15×
+on eight cores. Ours reaches **39-46% of the bandwidth this machine is known to
+deliver** while scaling almost linearly with performance cores. Those are the two
+signatures of a compute-bound region, and they are the opposite of the two
+signatures of a memory wall.
+
+**The decisive control is `--fast`.** It quantizes **activations** to int8 and
+changes **not one weight byte**. At one thread it buys **+48%**. A step whose
+time were set by streaming weights from DRAM cannot gain 48% from arithmetic on
+the other operand. That single A/B, on our binary and our model, settles it more
+cleanly than the roofline does.
+
+## What this means for R1
+
+The brief's sharpened question assumes *"the reduction in DRAM traffic makes a
+dedicated CPU ternary decode kernel worthwhile"*. **On this engine, at this model
+size, DRAM traffic is not what decode is waiting for.** So the chain
+
+> ternary → 1.77× fewer weight bytes → 1.77× faster decode
+
+is broken at the second arrow, and it is broken by our own measurement, not by an
+argument. Phase 7a already showed the first arrow was worth only 1.10-1.23×
+end-to-end for PTQTP once the KV cache and the untouchable LM head are counted.
+
+Five independent lines now agree, three of them measured here and two inherited:
+
+| evidence | source |
+|---|---|
+| decode scales 2.95× on 4 cores, 14.8 GB/s of a demonstrated 32-38 | **this run** |
+| `--fast` buys +48% at 1 thread with zero weight-byte change | **this run** |
+| Q8_0 beats Q4_K_M 54.8 vs 42.2 tok/s reading **1.6× the bytes** | `docs/perf.md` |
+| the tied LM head is **42%** of a decode step and no method quantizes it | `docs/perf.md` |
+| PTQTP buys 1.10-1.23× of *traffic* end-to-end vs the shipped file | Phase 7a |
+
+## Consequences for the plan
+
+1. **The kernel question is closed for v0.1/v0.2 regardless of the quality
+   result.** Even a ternary scheme with zero quality loss would be optimising a
+   term that is not the bottleneck, for at most 1.25-1.72× of traffic, on 58% of
+   the bytes and 58% of the time. No C is written under R1; that was the rule
+   from the start and it now has a reason rather than a boundary.
+2. **Phases 1-5 are re-scoped from "is a backend justified" to "what is the
+   quality floor of this model".** That is still worth having — it feeds the
+   `IQ2`/`IQ3` decision the quantization policy already wants, and it answers U2
+   — but it is a smaller study with a different deliverable.
+3. **Phase 6's controls become the main event.** `IQ2_XXS` and `IQ1_S` are
+   already decodable, already smaller than PTQTP, and their quality on this
+   checkpoint is unmeasured. That is the cheapest unanswered question in the
+   whole brief.
+4. **The real optimisation target is now named and is not ternary**: the tied
+   `lm_head`, 151936 × 1024, 42% of a decode step, and the activation path that
+   `--fast` proves has 48% in it. Both are ordinary engineering in `src/`, and
+   both belong on the board as their own items rather than inside R1.
+5. **Question 12 is untouched.** Every number above is about a 0.6B model on an
+   M1. At 4B the head's share falls to ~9.7% of parameters and the arithmetic per
+   byte changes; on a many-core server with lower per-core bandwidth the roofline
+   moves. **Nothing here forecloses ternary at 4B on a server**, and the brief's
+   last question remains the one worth keeping open.
+
+## Evidence log — Phase 7b
+
+- **TEST** Thread sweep 1/2/4/8, five runs each, identical deterministic work,
+  clean committed tree, local weights, `--fast` as the activation-side control.
+- **RESULT** 12.8 / 22.2 / 37.8 / 37.1 tok/s; **2.95× on four cores**; peak
+  **14.8 GB/s** against 32-38 demonstrated on this machine.
+- **RESULT** `--fast` **+48%** at one thread, changing no weight bytes.
+- **REFUSED** The 8-thread `--fast` point: 60.5% spread. Not reported as a
+  measurement.
+- **DECISION** **VERDICT for the backend question: REJECT for v0.1/v0.2.** The
+  premise that batch-1 decode is weight-bandwidth-bound is false here, on five
+  independent lines of evidence.
+- **DECISION** R1 continues as a *quality* study (U2 and the `IQ` controls), not
+  as a backend investigation. Two new board items fall out of it: the tied LM
+  head, and the activation path.
+- **CLAIM SCOPE** One M1, one 0.6B checkpoint, one engine, Q4_K_M weights. Says
+  nothing about 4B/8B, about servers, or about any other engine's kernels.
