@@ -1018,12 +1018,16 @@ right number for "what did the paper do".
    closed-form weight-only fit. **Phase 1 is therefore not a prerequisite for
    Method C** — only for the activation-aware methods. Method C moves ahead of
    Phase 1 in the plan.
-3. **The released artifact may be broken.** `gate_proj` and `up_proj` reconstruct
-   with relative error up to **3.42** and norm ratio up to **4.34×** against the
-   original, while `v_proj`/`o_proj`/`down_proj` look like sane fits (0.17-0.57).
-   Its `q_proj` and layernorms match neither `Qwen3-0.6B` nor `Qwen3-0.6B-Base`.
-   **Running it and measuring perplexity is the test**, and it is Gate A
-   infrastructure we need regardless.
+3. **The artifact applies a channel-scale step the paper never mentions.**
+   `gate_proj`/`up_proj` carry norm ratios up to **4.95×** against the original —
+   and the layernorms that feed them are divided by exactly the reciprocal:
+   `post_attention_layernorm × gate_proj = 0.99-1.02` on every layer, and per
+   input channel `‖W_artifact − W_orig·s‖/‖W_artifact‖ = 2.9e-04`. This is
+   **per-channel scale migration**, the AWQ/SmoothQuant trick, used to flatten
+   the weight distribution before fitting a ternary grid. It is exactly
+   function-preserving and **free at inference** — the norms are already there.
+   A reimplementation from the paper alone (ours) does not have it. Detail in
+   [`ptqtp-paper-reading.md`](ptqtp-paper-reading.md).
 
 ## Plan changes
 
@@ -1049,8 +1053,38 @@ right number for "what did the paper do".
   `{0, ±0.04310, ±0.09045, ±0.13354, ±0.22400}` = `α₁=0.13354, α₂=0.09045`.
 - **RESULT** **PTQTP as implemented, at the artifact's coverage, is 1.01× the
   size of the file we already ship.**
-- **CONTRADICTION** `gate_proj`/`up_proj` reconstruct worse than zeros in 5 of 9
-  sampled blocks. Unexplained; provenance of the artifact could not be
-  established against either public Qwen3-0.6B checkpoint.
+- **CONTRADICTION, RESOLVED** `gate_proj`/`up_proj` norm ratios of up to 4.95×
+  looked like a broken upload. The artifact scores **35.256** ppl, so it is not.
+  The layernorms absorb the scale exactly (`post_ln × gate = 0.99-1.02`;
+  per-channel residual 2.9e-04): an **undocumented channel-scale
+  reparameterization**. The premature "may be broken" reading is corrected in
+  `ptqtp-paper-reading.md`. *When a result is absurd, suspect the setup before
+  the subject* — one `ppl` run settled it.
 - **CLAIM SCOPE** Storage, coverage and reconstruction only. No perplexity of
   ours has been measured yet; Gate A is unanswered.
+
+---
+
+# GATE A — 2026-09-20
+
+## A0 — the evaluation protocol reproduces the paper's FP16 number  `[MEASURED]`
+
+Before any quantized number can be read, the harness has to land on a figure
+someone else published. `tools/qwen_ternary_feasibility.py ppl`: WikiText-2-raw
+test, joined with `\n\n`, tokenized once, cut into **non-overlapping 2048-token
+windows** — the GPTQ-lineage protocol that PT²-LLM, TWLA and the Qwen3-4B study
+all inherit — averaging token NLL over all 146 full windows (298,862 tokens),
+fp16 on MPS.
+
+| | WikiText-2 ppl |
+|---|---|
+| **ours, `Qwen/Qwen3-0.6B` @ `c1899de2`** | **20.954** |
+| PTQTP Table 1, Qwen3 0.6B FP16 | **20.9** |
+| difference | **+0.26%** |
+
+**The gate passes.** Our numbers are directly comparable to the paper's, so a
+quantized result of ours can be read against their 38.02 without an asterisk.
+Worth stating why that matters: had the baseline come out at, say, 13 or 30, no
+quantized measurement afterwards could have been interpreted at all.
+
+Recorded: `reports/ternary/ppl_qwen3-0.6b-bf16.json`.

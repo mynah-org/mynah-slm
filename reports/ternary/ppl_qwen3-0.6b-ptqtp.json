@@ -1,0 +1,12 @@
+{
+  "model": "../models-local/qwen3-0.6b-ptqtp",
+  "revision": null,
+  "device": "mps",
+  "seq_len": 2048,
+  "windows": 146,
+  "tokens": 298862,
+  "nll_per_token": 3.5626355670902825,
+  "perplexity": 35.25599434319629,
+  "dataset": "wikitext-2-raw-v1/test",
+  "protocol": "non-overlapping windows"
+}

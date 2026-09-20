@@ -1,0 +1,1193 @@
+{
+  "source": "../models-local/qwen3-0.6b-bf16",
+  "out": "../models-local/q-naive-all",
+  "method": "naive",
+  "group": 128,
+  "iters": 50,
+  "eps": 0.0001,
+  "device": "mps",
+  "protected_families": [],
+  "tensors_quantized": 196,
+  "tensors_untouched": 115,
+  "rel_err_min": 0.435299813747406,
+  "rel_err_max": 0.4641423225402832,
+  "rel_err_mean": 0.4445799052411196,
+  "per_tensor": [
+    {
+      "tensor": "model.layers.0.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.4462437927722931,
+      "norm_ratio": 0.8949138522148132
+    },
+    {
+      "tensor": "model.layers.0.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.43895888328552246,
+      "norm_ratio": 0.8985090851783752
+    },
+    {
+      "tensor": "model.layers.0.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.4415318965911865,
+      "norm_ratio": 0.8972480893135071
+    },
+    {
+      "tensor": "model.layers.0.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.4395385980606079,
+      "norm_ratio": 0.8982243537902832
+    },
+    {
+      "tensor": "model.layers.0.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.436800092458725,
+      "norm_ratio": 0.8995603919029236
+    },
+    {
+      "tensor": "model.layers.0.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.4467335641384125,
+      "norm_ratio": 0.8946688175201416
+    },
+    {
+      "tensor": "model.layers.0.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.4423442482948303,
+      "norm_ratio": 0.8968462347984314
+    },
+    {
+      "tensor": "model.layers.1.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.4528052806854248,
+      "norm_ratio": 0.8916117548942566
+    },
+    {
+      "tensor": "model.layers.1.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.43565911054611206,
+      "norm_ratio": 0.9001139998435974
+    },
+    {
+      "tensor": "model.layers.1.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.440704882144928,
+      "norm_ratio": 0.8976545333862305
+    },
+    {
+      "tensor": "model.layers.1.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.44182920455932617,
+      "norm_ratio": 0.8970999121665955
+    },
+    {
+      "tensor": "model.layers.1.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4386599063873291,
+      "norm_ratio": 0.8986548781394958
+    },
+    {
+      "tensor": "model.layers.1.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.4409472346305847,
+      "norm_ratio": 0.8975347876548767
+    },
+    {
+      "tensor": "model.layers.1.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.439775675535202,
+      "norm_ratio": 0.8981084227561951
+    },
+    {
+      "tensor": "model.layers.10.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.45838406682014465,
+      "norm_ratio": 0.888756513595581
+    },
+    {
+      "tensor": "model.layers.10.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.4409228265285492,
+      "norm_ratio": 0.8975464701652527
+    },
+    {
+      "tensor": "model.layers.10.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.4441933035850525,
+      "norm_ratio": 0.8959330320358276
+    },
+    {
+      "tensor": "model.layers.10.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.4385058283805847,
+      "norm_ratio": 0.8987292051315308
+    },
+    {
+      "tensor": "model.layers.10.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4402889311313629,
+      "norm_ratio": 0.8978578448295593
+    },
+    {
+      "tensor": "model.layers.10.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.44098490476608276,
+      "norm_ratio": 0.8975163698196411
+    },
+    {
+      "tensor": "model.layers.10.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.4423922300338745,
+      "norm_ratio": 0.896822452545166
+    },
+    {
+      "tensor": "model.layers.11.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.4535866379737854,
+      "norm_ratio": 0.8912143707275391
+    },
+    {
+      "tensor": "model.layers.11.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.4406561553478241,
+      "norm_ratio": 0.8976778388023376
+    },
+    {
+      "tensor": "model.layers.11.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.44125571846961975,
+      "norm_ratio": 0.8973836302757263
+    },
+    {
+      "tensor": "model.layers.11.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.4504440128803253,
+      "norm_ratio": 0.8928053379058838
+    },
+    {
+      "tensor": "model.layers.11.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4416821002960205,
+      "norm_ratio": 0.897173285484314
+    },
+    {
+      "tensor": "model.layers.11.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.44572874903678894,
+      "norm_ratio": 0.8951694369316101
+    },
+    {
+      "tensor": "model.layers.11.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.45186424255371094,
+      "norm_ratio": 0.8920875787734985
+    },
+    {
+      "tensor": "model.layers.12.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.45193085074424744,
+      "norm_ratio": 0.8920552134513855
+    },
+    {
+      "tensor": "model.layers.12.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.4396092891693115,
+      "norm_ratio": 0.898190975189209
+    },
+    {
+      "tensor": "model.layers.12.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.4418743848800659,
+      "norm_ratio": 0.8970791101455688
+    },
+    {
+      "tensor": "model.layers.12.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.4424462616443634,
+      "norm_ratio": 0.8967958688735962
+    },
+    {
+      "tensor": "model.layers.12.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4397623538970947,
+      "norm_ratio": 0.8981155753135681
+    },
+    {
+      "tensor": "model.layers.12.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.44017231464385986,
+      "norm_ratio": 0.8979149460792542
+    },
+    {
+      "tensor": "model.layers.12.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.441274493932724,
+      "norm_ratio": 0.8973729610443115
+    },
+    {
+      "tensor": "model.layers.13.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.4554872214794159,
+      "norm_ratio": 0.8902445435523987
+    },
+    {
+      "tensor": "model.layers.13.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.44201818108558655,
+      "norm_ratio": 0.8970077633857727
+    },
+    {
+      "tensor": "model.layers.13.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.44231000542640686,
+      "norm_ratio": 0.8968645930290222
+    },
+    {
+      "tensor": "model.layers.13.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.44192609190940857,
+      "norm_ratio": 0.8970523476600647
+    },
+    {
+      "tensor": "model.layers.13.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.44039568305015564,
+      "norm_ratio": 0.8978053331375122
+    },
+    {
+      "tensor": "model.layers.13.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.4396129548549652,
+      "norm_ratio": 0.8981888294219971
+    },
+    {
+      "tensor": "model.layers.13.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.44149383902549744,
+      "norm_ratio": 0.8972650170326233
+    },
+    {
+      "tensor": "model.layers.14.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.45828619599342346,
+      "norm_ratio": 0.8888069987297058
+    },
+    {
+      "tensor": "model.layers.14.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.4443705081939697,
+      "norm_ratio": 0.8958449959754944
+    },
+    {
+      "tensor": "model.layers.14.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.443820983171463,
+      "norm_ratio": 0.8961178660392761
+    },
+    {
+      "tensor": "model.layers.14.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.4458404779434204,
+      "norm_ratio": 0.8951132893562317
+    },
+    {
+      "tensor": "model.layers.14.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4398472011089325,
+      "norm_ratio": 0.8980741500854492
+    },
+    {
+      "tensor": "model.layers.14.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.4427867829799652,
+      "norm_ratio": 0.8966283798217773
+    },
+    {
+      "tensor": "model.layers.14.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.44187691807746887,
+      "norm_ratio": 0.8970766067504883
+    },
+    {
+      "tensor": "model.layers.15.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.4578219950199127,
+      "norm_ratio": 0.8890461325645447
+    },
+    {
+      "tensor": "model.layers.15.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.4453619122505188,
+      "norm_ratio": 0.8953524827957153
+    },
+    {
+      "tensor": "model.layers.15.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.4441598653793335,
+      "norm_ratio": 0.8959497213363647
+    },
+    {
+      "tensor": "model.layers.15.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.44275715947151184,
+      "norm_ratio": 0.8966425657272339
+    },
+    {
+      "tensor": "model.layers.15.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.44157397747039795,
+      "norm_ratio": 0.8972262740135193
+    },
+    {
+      "tensor": "model.layers.15.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.44152238965034485,
+      "norm_ratio": 0.8972517848014832
+    },
+    {
+      "tensor": "model.layers.15.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.44676080346107483,
+      "norm_ratio": 0.8946542143821716
+    },
+    {
+      "tensor": "model.layers.16.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.4641423225402832,
+      "norm_ratio": 0.8857629299163818
+    },
+    {
+      "tensor": "model.layers.16.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.44842275977134705,
+      "norm_ratio": 0.8938234448432922
+    },
+    {
+      "tensor": "model.layers.16.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.44968461990356445,
+      "norm_ratio": 0.8931894302368164
+    },
+    {
+      "tensor": "model.layers.16.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.460420697927475,
+      "norm_ratio": 0.887701690196991
+    },
+    {
+      "tensor": "model.layers.16.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4413224756717682,
+      "norm_ratio": 0.8973498940467834
+    },
+    {
+      "tensor": "model.layers.16.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.4430713653564453,
+      "norm_ratio": 0.8964875340461731
+    },
+    {
+      "tensor": "model.layers.16.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.4462103545665741,
+      "norm_ratio": 0.8949288725852966
+    },
+    {
+      "tensor": "model.layers.17.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.4569720923900604,
+      "norm_ratio": 0.8894833326339722
+    },
+    {
+      "tensor": "model.layers.17.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.44842246174812317,
+      "norm_ratio": 0.8938236236572266
+    },
+    {
+      "tensor": "model.layers.17.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.4443202018737793,
+      "norm_ratio": 0.8958700895309448
+    },
+    {
+      "tensor": "model.layers.17.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.4457050561904907,
+      "norm_ratio": 0.895180881023407
+    },
+    {
+      "tensor": "model.layers.17.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.44131746888160706,
+      "norm_ratio": 0.8973525762557983
+    },
+    {
+      "tensor": "model.layers.17.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.44483551383018494,
+      "norm_ratio": 0.8956137299537659
+    },
+    {
+      "tensor": "model.layers.17.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.44751283526420593,
+      "norm_ratio": 0.8942784070968628
+    },
+    {
+      "tensor": "model.layers.18.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.45904678106307983,
+      "norm_ratio": 0.8884143829345703
+    },
+    {
+      "tensor": "model.layers.18.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.45083165168762207,
+      "norm_ratio": 0.892611026763916
+    },
+    {
+      "tensor": "model.layers.18.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.44533416628837585,
+      "norm_ratio": 0.8953664302825928
+    },
+    {
+      "tensor": "model.layers.18.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.44885024428367615,
+      "norm_ratio": 0.8936079144477844
+    },
+    {
+      "tensor": "model.layers.18.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.44183072447776794,
+      "norm_ratio": 0.8970999121665955
+    },
+    {
+      "tensor": "model.layers.18.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.44073137640953064,
+      "norm_ratio": 0.8976403474807739
+    },
+    {
+      "tensor": "model.layers.18.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.4494483470916748,
+      "norm_ratio": 0.8933072090148926
+    },
+    {
+      "tensor": "model.layers.19.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.46293213963508606,
+      "norm_ratio": 0.8863958716392517
+    },
+    {
+      "tensor": "model.layers.19.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.45025792717933655,
+      "norm_ratio": 0.8929004669189453
+    },
+    {
+      "tensor": "model.layers.19.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.4479953348636627,
+      "norm_ratio": 0.8940377831459045
+    },
+    {
+      "tensor": "model.layers.19.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.4496115744113922,
+      "norm_ratio": 0.8932250738143921
+    },
+    {
+      "tensor": "model.layers.19.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4414249658584595,
+      "norm_ratio": 0.8972998261451721
+    },
+    {
+      "tensor": "model.layers.19.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.44173410534858704,
+      "norm_ratio": 0.8971471786499023
+    },
+    {
+      "tensor": "model.layers.19.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.454622358083725,
+      "norm_ratio": 0.8906852602958679
+    },
+    {
+      "tensor": "model.layers.2.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.45356327295303345,
+      "norm_ratio": 0.8912267088890076
+    },
+    {
+      "tensor": "model.layers.2.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.437701553106308,
+      "norm_ratio": 0.8991223573684692
+    },
+    {
+      "tensor": "model.layers.2.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.44095760583877563,
+      "norm_ratio": 0.8975306153297424
+    },
+    {
+      "tensor": "model.layers.2.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.44097065925598145,
+      "norm_ratio": 0.8975221514701843
+    },
+    {
+      "tensor": "model.layers.2.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4388130009174347,
+      "norm_ratio": 0.8985801339149475
+    },
+    {
+      "tensor": "model.layers.2.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.44394975900650024,
+      "norm_ratio": 0.8960534334182739
+    },
+    {
+      "tensor": "model.layers.2.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.44171854853630066,
+      "norm_ratio": 0.8971543312072754
+    },
+    {
+      "tensor": "model.layers.20.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.45350438356399536,
+      "norm_ratio": 0.8912559747695923
+    },
+    {
+      "tensor": "model.layers.20.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.4485541880130768,
+      "norm_ratio": 0.8937575817108154
+    },
+    {
+      "tensor": "model.layers.20.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.4453996419906616,
+      "norm_ratio": 0.8953338265419006
+    },
+    {
+      "tensor": "model.layers.20.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.45347481966018677,
+      "norm_ratio": 0.8912699222564697
+    },
+    {
+      "tensor": "model.layers.20.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4445602595806122,
+      "norm_ratio": 0.8957504630088806
+    },
+    {
+      "tensor": "model.layers.20.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.4460470378398895,
+      "norm_ratio": 0.895010769367218
+    },
+    {
+      "tensor": "model.layers.20.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.46264389157295227,
+      "norm_ratio": 0.8865450024604797
+    },
+    {
+      "tensor": "model.layers.21.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.44571372866630554,
+      "norm_ratio": 0.8951773047447205
+    },
+    {
+      "tensor": "model.layers.21.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.44554606080055237,
+      "norm_ratio": 0.8952610492706299
+    },
+    {
+      "tensor": "model.layers.21.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.44452032446861267,
+      "norm_ratio": 0.895770788192749
+    },
+    {
+      "tensor": "model.layers.21.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.4539792537689209,
+      "norm_ratio": 0.891012966632843
+    },
+    {
+      "tensor": "model.layers.21.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.44190847873687744,
+      "norm_ratio": 0.8970617651939392
+    },
+    {
+      "tensor": "model.layers.21.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.4444969594478607,
+      "norm_ratio": 0.895781397819519
+    },
+    {
+      "tensor": "model.layers.21.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.4537695348262787,
+      "norm_ratio": 0.8911199569702148
+    },
+    {
+      "tensor": "model.layers.22.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.44303053617477417,
+      "norm_ratio": 0.8965084552764893
+    },
+    {
+      "tensor": "model.layers.22.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.4438208341598511,
+      "norm_ratio": 0.8961175680160522
+    },
+    {
+      "tensor": "model.layers.22.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.4423111081123352,
+      "norm_ratio": 0.8968635201454163
+    },
+    {
+      "tensor": "model.layers.22.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.446328341960907,
+      "norm_ratio": 0.8948699831962585
+    },
+    {
+      "tensor": "model.layers.22.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4376209080219269,
+      "norm_ratio": 0.8991612792015076
+    },
+    {
+      "tensor": "model.layers.22.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.4426146447658539,
+      "norm_ratio": 0.8967130780220032
+    },
+    {
+      "tensor": "model.layers.22.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.45650172233581543,
+      "norm_ratio": 0.8897232413291931
+    },
+    {
+      "tensor": "model.layers.23.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.44071438908576965,
+      "norm_ratio": 0.8976492285728455
+    },
+    {
+      "tensor": "model.layers.23.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.44019684195518494,
+      "norm_ratio": 0.897903323173523
+    },
+    {
+      "tensor": "model.layers.23.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.44099706411361694,
+      "norm_ratio": 0.8975103497505188
+    },
+    {
+      "tensor": "model.layers.23.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.4522875249385834,
+      "norm_ratio": 0.8918729424476624
+    },
+    {
+      "tensor": "model.layers.23.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4402545690536499,
+      "norm_ratio": 0.8978748321533203
+    },
+    {
+      "tensor": "model.layers.23.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.4474064111709595,
+      "norm_ratio": 0.894332230091095
+    },
+    {
+      "tensor": "model.layers.23.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.4579100012779236,
+      "norm_ratio": 0.8889992833137512
+    },
+    {
+      "tensor": "model.layers.24.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.4396752119064331,
+      "norm_ratio": 0.8981586694717407
+    },
+    {
+      "tensor": "model.layers.24.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.43965235352516174,
+      "norm_ratio": 0.8981700539588928
+    },
+    {
+      "tensor": "model.layers.24.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.4400688707828522,
+      "norm_ratio": 0.8979660868644714
+    },
+    {
+      "tensor": "model.layers.24.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.45137879252433777,
+      "norm_ratio": 0.8923331499099731
+    },
+    {
+      "tensor": "model.layers.24.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4395581781864166,
+      "norm_ratio": 0.8982157707214355
+    },
+    {
+      "tensor": "model.layers.24.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.44998517632484436,
+      "norm_ratio": 0.8930374383926392
+    },
+    {
+      "tensor": "model.layers.24.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.45423734188079834,
+      "norm_ratio": 0.8908814191818237
+    },
+    {
+      "tensor": "model.layers.25.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.4399590790271759,
+      "norm_ratio": 0.8980196714401245
+    },
+    {
+      "tensor": "model.layers.25.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.44075363874435425,
+      "norm_ratio": 0.8976301550865173
+    },
+    {
+      "tensor": "model.layers.25.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.4405876696109772,
+      "norm_ratio": 0.8977113366127014
+    },
+    {
+      "tensor": "model.layers.25.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.4501618444919586,
+      "norm_ratio": 0.8929479122161865
+    },
+    {
+      "tensor": "model.layers.25.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4385784864425659,
+      "norm_ratio": 0.898694634437561
+    },
+    {
+      "tensor": "model.layers.25.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.44962790608406067,
+      "norm_ratio": 0.8932170271873474
+    },
+    {
+      "tensor": "model.layers.25.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.4522147476673126,
+      "norm_ratio": 0.8919098973274231
+    },
+    {
+      "tensor": "model.layers.26.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.44328364729881287,
+      "norm_ratio": 0.8963834047317505
+    },
+    {
+      "tensor": "model.layers.26.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.4419095814228058,
+      "norm_ratio": 0.8970615863800049
+    },
+    {
+      "tensor": "model.layers.26.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.44077226519584656,
+      "norm_ratio": 0.8976209759712219
+    },
+    {
+      "tensor": "model.layers.26.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.44629931449890137,
+      "norm_ratio": 0.8948845863342285
+    },
+    {
+      "tensor": "model.layers.26.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4386811852455139,
+      "norm_ratio": 0.8986445069313049
+    },
+    {
+      "tensor": "model.layers.26.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.44741538166999817,
+      "norm_ratio": 0.8943272829055786
+    },
+    {
+      "tensor": "model.layers.26.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.4457429349422455,
+      "norm_ratio": 0.8951618075370789
+    },
+    {
+      "tensor": "model.layers.27.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.4557497203350067,
+      "norm_ratio": 0.890110194683075
+    },
+    {
+      "tensor": "model.layers.27.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.44136860966682434,
+      "norm_ratio": 0.8973276019096375
+    },
+    {
+      "tensor": "model.layers.27.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.44358402490615845,
+      "norm_ratio": 0.8962346911430359
+    },
+    {
+      "tensor": "model.layers.27.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.4400431215763092,
+      "norm_ratio": 0.8979774713516235
+    },
+    {
+      "tensor": "model.layers.27.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.43581220507621765,
+      "norm_ratio": 0.9000394940376282
+    },
+    {
+      "tensor": "model.layers.27.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.4395115077495575,
+      "norm_ratio": 0.8982385993003845
+    },
+    {
+      "tensor": "model.layers.27.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.44121113419532776,
+      "norm_ratio": 0.8974042534828186
+    },
+    {
+      "tensor": "model.layers.3.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.4468635022640228,
+      "norm_ratio": 0.8946046829223633
+    },
+    {
+      "tensor": "model.layers.3.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.437198668718338,
+      "norm_ratio": 0.899367094039917
+    },
+    {
+      "tensor": "model.layers.3.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.4405059516429901,
+      "norm_ratio": 0.8977523446083069
+    },
+    {
+      "tensor": "model.layers.3.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.4504794478416443,
+      "norm_ratio": 0.8927873969078064
+    },
+    {
+      "tensor": "model.layers.3.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4391780495643616,
+      "norm_ratio": 0.8984018564224243
+    },
+    {
+      "tensor": "model.layers.3.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.4431026875972748,
+      "norm_ratio": 0.8964724540710449
+    },
+    {
+      "tensor": "model.layers.3.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.444125771522522,
+      "norm_ratio": 0.8959652185440063
+    },
+    {
+      "tensor": "model.layers.4.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.4504021406173706,
+      "norm_ratio": 0.8928282856941223
+    },
+    {
+      "tensor": "model.layers.4.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.4360869824886322,
+      "norm_ratio": 0.8999063968658447
+    },
+    {
+      "tensor": "model.layers.4.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.4398295283317566,
+      "norm_ratio": 0.8980838060379028
+    },
+    {
+      "tensor": "model.layers.4.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.44216790795326233,
+      "norm_ratio": 0.8969330191612244
+    },
+    {
+      "tensor": "model.layers.4.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4398956000804901,
+      "norm_ratio": 0.8980506658554077
+    },
+    {
+      "tensor": "model.layers.4.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.44100892543792725,
+      "norm_ratio": 0.897504448890686
+    },
+    {
+      "tensor": "model.layers.4.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.44308018684387207,
+      "norm_ratio": 0.8964825868606567
+    },
+    {
+      "tensor": "model.layers.5.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.44777336716651917,
+      "norm_ratio": 0.8941494822502136
+    },
+    {
+      "tensor": "model.layers.5.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.4375108778476715,
+      "norm_ratio": 0.8992149233818054
+    },
+    {
+      "tensor": "model.layers.5.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.4404393434524536,
+      "norm_ratio": 0.8977845907211304
+    },
+    {
+      "tensor": "model.layers.5.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.439335435628891,
+      "norm_ratio": 0.8983238339424133
+    },
+    {
+      "tensor": "model.layers.5.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.435299813747406,
+      "norm_ratio": 0.900287389755249
+    },
+    {
+      "tensor": "model.layers.5.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.4426620900630951,
+      "norm_ratio": 0.8966901898384094
+    },
+    {
+      "tensor": "model.layers.5.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.4473232626914978,
+      "norm_ratio": 0.8943729996681213
+    },
+    {
+      "tensor": "model.layers.6.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.4489438831806183,
+      "norm_ratio": 0.893562376499176
+    },
+    {
+      "tensor": "model.layers.6.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.437391996383667,
+      "norm_ratio": 0.8992726802825928
+    },
+    {
+      "tensor": "model.layers.6.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.4397962689399719,
+      "norm_ratio": 0.8980998396873474
+    },
+    {
+      "tensor": "model.layers.6.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.4472825825214386,
+      "norm_ratio": 0.8943933844566345
+    },
+    {
+      "tensor": "model.layers.6.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4387323260307312,
+      "norm_ratio": 0.8986193537712097
+    },
+    {
+      "tensor": "model.layers.6.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.4421404004096985,
+      "norm_ratio": 0.89694744348526
+    },
+    {
+      "tensor": "model.layers.6.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.44339531660079956,
+      "norm_ratio": 0.8963268399238586
+    },
+    {
+      "tensor": "model.layers.7.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.44914963841438293,
+      "norm_ratio": 0.8934588432312012
+    },
+    {
+      "tensor": "model.layers.7.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.43625256419181824,
+      "norm_ratio": 0.8998258709907532
+    },
+    {
+      "tensor": "model.layers.7.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.43969598412513733,
+      "norm_ratio": 0.8981489539146423
+    },
+    {
+      "tensor": "model.layers.7.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.4394542872905731,
+      "norm_ratio": 0.8982656598091125
+    },
+    {
+      "tensor": "model.layers.7.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4386799931526184,
+      "norm_ratio": 0.8986451029777527
+    },
+    {
+      "tensor": "model.layers.7.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.44101956486701965,
+      "norm_ratio": 0.8974992632865906
+    },
+    {
+      "tensor": "model.layers.7.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.4432431757450104,
+      "norm_ratio": 0.89640212059021
+    },
+    {
+      "tensor": "model.layers.8.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.448574960231781,
+      "norm_ratio": 0.8937475085258484
+    },
+    {
+      "tensor": "model.layers.8.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.4375697374343872,
+      "norm_ratio": 0.8991861939430237
+    },
+    {
+      "tensor": "model.layers.8.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.44032829999923706,
+      "norm_ratio": 0.8978391289710999
+    },
+    {
+      "tensor": "model.layers.8.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.45151597261428833,
+      "norm_ratio": 0.8922637701034546
+    },
+    {
+      "tensor": "model.layers.8.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4388422966003418,
+      "norm_ratio": 0.8985656499862671
+    },
+    {
+      "tensor": "model.layers.8.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.4424651861190796,
+      "norm_ratio": 0.8967872262001038
+    },
+    {
+      "tensor": "model.layers.8.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.44193872809410095,
+      "norm_ratio": 0.8970460295677185
+    },
+    {
+      "tensor": "model.layers.9.mlp.down_proj.weight",
+      "family": "down_proj",
+      "rel_err": 0.45221900939941406,
+      "norm_ratio": 0.8919093012809753
+    },
+    {
+      "tensor": "model.layers.9.mlp.gate_proj.weight",
+      "family": "gate_proj",
+      "rel_err": 0.43839189410209656,
+      "norm_ratio": 0.8987855315208435
+    },
+    {
+      "tensor": "model.layers.9.mlp.up_proj.weight",
+      "family": "up_proj",
+      "rel_err": 0.440467894077301,
+      "norm_ratio": 0.8977706432342529
+    },
+    {
+      "tensor": "model.layers.9.self_attn.k_proj.weight",
+      "family": "k_proj",
+      "rel_err": 0.44713515043258667,
+      "norm_ratio": 0.8944672346115112
+    },
+    {
+      "tensor": "model.layers.9.self_attn.o_proj.weight",
+      "family": "o_proj",
+      "rel_err": 0.4388298988342285,
+      "norm_ratio": 0.898571789264679
+    },
+    {
+      "tensor": "model.layers.9.self_attn.q_proj.weight",
+      "family": "q_proj",
+      "rel_err": 0.4429612457752228,
+      "norm_ratio": 0.8965424299240112
+    },
+    {
+      "tensor": "model.layers.9.self_attn.v_proj.weight",
+      "family": "v_proj",
+      "rel_err": 0.4478267431259155,
+      "norm_ratio": 0.8941210508346558
+    }
+  ]
+}

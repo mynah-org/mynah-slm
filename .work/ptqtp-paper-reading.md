@@ -306,97 +306,131 @@ Q6_K on tensors they left at FP16 — is 1.12× smaller than the Q4_K_M file we 
 today**, and that is before any quality comparison. With the authors' actual
 representation and actual protected set, it is **1.73× larger**.
 
-### An unexplained anomaly: `gate_proj` and `up_proj` do not reconstruct
+### ~~An unexplained anomaly~~ — RESOLVED: a channel-scale reparameterization the paper does not describe
+
+> **This section previously read "the artifact may be broken". That was wrong
+> and is corrected here.** The reconstruction figures below are real, but the
+> conclusion drawn from them was not: the artifact scores **35.256** perplexity
+> (better than the paper's own 38.02), so it plainly works. Chasing that
+> contradiction produced the most useful finding of this note.
 
 Relative reconstruction error `‖Ŵ − W‖/‖W‖` and norm ratio `‖Ŵ‖/‖W‖` against the
-original `Qwen/Qwen3-0.6B`, first 8 rows per tensor:
+original `Qwen/Qwen3-0.6B`, whole tensors:
 
 | block | v_proj | o_proj | **gate_proj** | **up_proj** | down_proj |
 |---|---|---|---|---|---|
-| | ratio / err | ratio / err | ratio / err | ratio / err | ratio / err |
-| 0 | 0.93 / 0.18 | 0.98 / 0.19 | **1.77 / 0.81** | **1.81 / 0.87** | 0.82 / 0.25 |
-| 5 | 0.80 / 0.26 | 0.98 / 0.17 | **3.21 / 2.27** | **3.27 / 2.34** | 0.75 / 0.31 |
-| 13 | 0.70 / 0.34 | 0.99 / 0.17 | **4.34 / 3.42** | **3.56 / 2.65** | 0.82 / 0.29 |
-| 21 | 0.70 / 0.33 | 0.98 / 0.17 | **2.34 / 1.45** | 1.32 / 0.45 | 0.90 / 0.26 |
-| 27 | 0.99 / 0.17 | 0.98 / 0.17 | 0.82 / 0.27 | 1.10 / 0.54 | 0.91 / 0.57 |
+| 0 | 0.93 | 0.99 | **1.74** | **2.11** | 0.81 |
+| 5 | 0.78 | 0.99 | **2.99** | **3.92** | 0.74 |
+| 13 | 0.71 | 0.99 | **4.06** | **4.95** | 0.82 |
+| 21 | 0.72 | 0.99 | **2.09** | **2.40** | 0.86 |
+| 27 | 1.00 | 0.99 | 0.81 | 1.27 | 0.68 |
 
-`v_proj`, `o_proj` and `down_proj` look like sane ternary fits: norm ratio near 1,
-relative error 0.17-0.57, cosine 0.86-0.99.
+`gate_proj` L13 is 4.06× too large **on all 3072 rows** (median per-row ratio
+4.046, every row above 2), so it is not a sampling artifact either.
 
-**`gate_proj` and `up_proj` do not.** Their norm is up to **4.34× too large** and
-their relative error exceeds **1.0** in five of the nine blocks sampled — an error
-larger than the tensor itself, i.e. *worse than replacing the tensor with zeros*.
-The cosine is still 0.94, so the trit pattern is directionally right and only the
-scale is wrong. In a SwiGLU MLP, `gate` and `up` are multiplied together, so a 4×
-on each is 16× into `down_proj`.
+**The layernorms absorb it exactly.** Norm ratios of the *norm vectors* against
+the original, beside the projections they feed:
 
-A least-squares ridge fit (Eq. 1, Eq. 4) cannot produce a 4× overshoot; the
-paper's Algorithm 1 line 2 initialises `α ← [1,1]` and iterates to *decrease*
-`‖W − Ŵ‖²_F` monotonically. So this is a property of the upload, not of the
-method as described.
+| L | input_ln | q | k | v | post_attn_ln | gate | up | **post_ln × gate** |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 1.032 | 0.949 | 0.950 | 0.935 | 0.574 | 1.741 | 2.108 | **0.999** |
+| 5 | 1.253 | 0.790 | 0.794 | 0.778 | 0.334 | 2.988 | 3.924 | **0.999** |
+| 13 | 1.314 | 0.729 | 0.729 | 0.706 | 0.244 | 4.061 | 4.951 | **0.990** |
+| 21 | 1.277 | 0.725 | 0.738 | 0.718 | 0.480 | 2.090 | 2.399 | **1.004** |
+| 27 | 1.000 | 1.000 | 1.000 | 0.986 | 0.860 | 0.813 | 1.265 | **0.699** |
 
-**Provenance does not resolve it either.** The artifact's `q_proj` and
-`input_layernorm` match **neither** `Qwen/Qwen3-0.6B` nor `Qwen/Qwen3-0.6B-Base`
-— they sit ~5% away from both (cosine 1.000 against the instruct model, so the
-direction is identical and only the magnitudes are perturbed) — while
-`embed_tokens`, `model.norm` and some `k_proj` blocks **are bit-identical to the
-instruct model**. That mixture is not explained by either base checkpoint.
+And exactly, per input channel rather than in aggregate. For L13 `q_proj`, with
+`s_j = ln_orig[j] / ln_artifact[j]`:
 
-**Conclusion for the reproduction gate: this artifact cannot be used to reproduce
-Table 1's 38.02 until it is shown to run.** The decisive test is to load it and
-measure perplexity, which is Gate A infrastructure we need anyway; it is running
-(`tools/qwen_ternary_feasibility.py ppl`). Whatever it returns:
+```
+|| W_artifact − W_orig · s ||  /  || W_artifact ||  =  2.92e-04     <- fp16 rounding
+|| W_artifact − W_orig     ||  /  || W_artifact ||  =  4.12e-01     <- the raw diff
+```
 
-- if it lands near 38, the reconstruction analysis above is missing something and
-  this note gets corrected;
-- if it does not, the artifact is broken, and reproducing PTQTP means
-  **implementing Algorithm 1 ourselves** — which §4.1 makes cheap, because the
-  method needs **no calibration data at all**.
+**The artifact divides each RMSNorm's per-channel weight by `s_j` and multiplies
+column `j` of every projection that consumes it by `s_j`.** For `RMSNorm → Linear`
+this is exactly function-preserving, which is why the model runs and why nothing
+had to be "compensated".
 
-Either way the coverage finding (80% of linears, `q_proj`/`k_proj` protected) and
-the storage finding (dense FP16, 4.25 bpw by the paper's own accounting) stand
-independently of it: both are read off the file and the paper, not inferred from
-behaviour.
+### Why it matters, and why it is a finding rather than a footnote
 
-## Calibration: there is none, and that simplifies Phase 1
+This is **per-channel scale migration** — the same idea as AWQ's and
+SmoothQuant's activation/weight scale absorption — used here to flatten the
+per-channel dynamic range of the weight matrix *before* fitting a ternary grid.
+A flatter matrix is dramatically easier for 9 reachable values to cover.
 
-**§4.1:** *"No task-specific calibration, tuning, or fine-tuning was applied in
-any experiment."* PTQTP is a closed-form weight-only fit: Eq. 1 builds
-`A_i = S_iᵀS_i + λ_i I₂` and `b_i = S_iᵀW_iᵀ` **from the weights alone**, and Eq. 5
-searches the 9 ternary pairs against the weight, not against an activation.
+Three consequences:
 
-**Consequence for R1: Method C needs no calibration corpus at all.** Phase 1's
-calibration set is required only by the activation-aware methods (PT²-AGA, GPTQ
-compensation). Method C can be implemented and evaluated before Phase 1 exists.
-That reorders the plan in our favour.
+1. **The paper does not describe it.** §3.1-3.2 and Algorithm 1 contain no
+   channel-scaling step; §3.2 advertises the method as *"bias-free and
+   mask-free"*. Anyone reimplementing PTQTP from the paper alone — which is what
+   we did — produces a **different and weaker** algorithm.
+2. **It is free at inference.** The norms already exist and are already
+   multiplied in; only their stored values change. That is a strictly better
+   deal than TWLA's KOTMS, which buys a similar kind of conditioning but leaves
+   a permanent runtime rotation (see `ternary-feasibility.md`, T4).
+3. **It must be added to Method C** before our numbers are read as "PTQTP".
+   Until then, ours is *PTQTP-as-published*, and theirs is *PTQTP-as-implemented*.
 
-## Published Qwen3-0.6B results, for the reproduction gate
+### What the scale actually is, as far as it can be recovered
 
-- **Table 1** (WikiText2, group size 128): Qwen3-0.6B FP16 **20.9** → PTQTP
-  **38.02**. Same row: 1.7B 16.70 → 32.46; 4B 13.64 → 18.25; 8B 9.71 → 11.8;
-  32B 8.64 → 10.06.
-- **Table 10** (MMLU, Qwen3 0.6B-32B): PTQTP-b1.58 **33.64** at 0.6B, then 43.82,
-  63.65, 68.23, 76.20, 80.56.
-- Baselines on Qwen3-0.6B for scale: AWQ-3bit 2.20E2, GPTQ-3bit 3.14E4,
-  BiLLM 5.87E4, ARB-LLM_RC 8.43E2. **PTQTP at 38.02 is by far the best sub-4-bit
-  result on this model** — the comparison it loses is against 4-bit, which the
-  paper does not run at 0.6B.
+The scale is recoverable exactly: `s_j = ln_orig[j] / ln_artifact[j]`. What it is
+*made of* is less clear, and the honest answer is that we could not derive it.
 
-## Answers, in one table
+**It is genuinely per-channel, not a per-layer constant.** Fraction of the 1024
+channels whose `s_j` sits within 1% / 5% of that layer's median:
 
-| # | question | answer |
-|---|---|---|
-| 1 | why "2 × 1.58"? | two full-size ternary planes per weight; log₂3 = 1.585 per trit (§3.1) |
-| 2 | why 1.58 in Table 1? | a category label for the `# Bits` column, placing it beside 1.58-bit QAT and against 1.06-bit binary PTQ. Not a storage rate |
-| 3 | physical representation? | **2 bits per trit, unpacked → 4.000 bits/weight** (App. A.3). Packing is listed under future work (App. G) |
-| 4 | scale/metadata overhead? | two fp16 α vectors, G=128 → **+0.250 bits/weight**; total **4.250**. No bias, no mask (§3.2) |
-| 5 | inference operations? | `y = α₁⊙(T₁x) + α₂⊙(T₂x)`, two sign-accumulate passes (App. A.1). Their own kernel is 1.41× slower than GPTQ-4bit at batch 1 (Table 5) |
-| 6 | quantized vs protected? | paper says only "all linear layers"; resolved empirically against the released checkpoint |
+| layer | norm | median s | within 1% | within 5% |
+|---|---|---|---|---|
+| 5 | post_attn | 2.931 | 27.8% | 77.1% |
+| 13 | post_attn | 4.021 | 20.6% | 70.9% |
+| 21 | post_attn | 1.964 | 13.3% | 63.5% |
+| 13 | input | 0.719 | 17.4% | 62.7% |
 
-## Next action
+So there is a large per-layer component with real per-channel variation on top.
+(A per-layer *scalar* would have been a no-op for quality — a ternary fit is
+scale-equivariant, since α absorbs any global factor. The per-channel part is
+where the benefit must come from.)
 
-Fold the corrected bit accounting into `ternary-feasibility.md` (Phase 0 budget
-and Phase 7a traffic get a second PTQTP row, "as implemented"), then run Gate A.
+**It is not a simple weight-column statistic.** Log-correlation of `s` against
+the obvious candidates over the columns of `[gate; up]`, α ∈ {0.5, 1}:
+
+| layer | col max\|W\| | col rms | col mean\|W\| |
+|---|---|---|---|
+| 5 | +0.464 | +0.516 | +0.424 |
+| 13 | +0.199 | +0.492 | +0.470 |
+| 21 | +0.043 | −0.096 | −0.147 |
+
+Correlations that weak — and that change sign by layer — rule out a weight-only
+rule of that family.
+
+**Which leaves an uncomfortable possibility, stated as a hypothesis and not as a
+finding.** The natural remaining candidate is an *activation*-derived scale, the
+AWQ/SmoothQuant form `s_j ∝ (mean|x_j|)^α` over calibration data. If that is what
+it is, it contradicts §4.1's *"No task-specific calibration, tuning, or
+fine-tuning was applied in any experiment."* We cannot settle this: the code is
+unreleased, and a scale can be inverted but not attributed. What can be said with
+the evidence in hand:
+
+1. the artifact carries a per-channel scale migration;
+2. it is function-preserving and free at inference;
+3. it is absent from the paper;
+4. it is not derivable from the weights by any of the usual statistics.
+
+Anything further needs their code.
+
+### What this corrects
+
+| earlier claim | status |
+|---|---|
+| "the released artifact may be broken" | **WRONG.** It is a function-preserving reparameterization, and the artifact scores 35.256 |
+| "our implementation disagrees with the artifact by 19× on gate_proj" | **True but explained** — we do not do scale absorption; the comparison was never like-for-like |
+| "`q_proj`/`k_proj` are protected" | **Still true for ternarization** — 127 distinct values per 128-group, they are not ternary — but they *are* modified, by the channel rescaling |
+| "coverage is 80.0% of linears / 59.1% of the model" | **Unchanged** — ternarization coverage is what the bit budget depends on |
+
+The methodological lesson is the one the repo already has a rule for: *when a
+result is absurd, suspect the setup before the subject.* A 4× norm ratio in a
+working model was never plausible as damage, and one `ppl` run said so.
 
 ---
 
@@ -425,14 +459,18 @@ should, and it beats naive single-plane ternary by **2.4-2.5×**.
 | `down_proj` L27 | 0.211 | 0.25-0.29 ≈ | 0.82-0.91 |
 | **`gate_proj` L13** | **0.183** | **3.42** ✗ | **4.34** |
 
-**Our implementation agrees with the artifact on the tensors that look sane and
-disagrees by a factor of ~19 exactly where the artifact's norm ratio is 4.34.**
-That is the cleanest available evidence that:
+**Our implementation agrees with the artifact wherever the artifact does not
+rescale, and disagrees by ~19× exactly where it does.** Read together with the
+scale-absorption finding above, that says:
 
-1. the method as published works and our implementation of it is faithful;
-2. the released `Qwen3-0.6B-PTQTP-1.58b` upload is **defective on `gate_proj`
-   and `up_proj`**, not representative of the paper's own experiments.
+1. the algorithm as published works, and our implementation of Algorithm 1 is
+   faithful to the paper;
+2. the artifact is **not** defective — the gap is a channel-scale
+   reparameterization the paper omits, applied before fitting;
+3. `v_proj` is the control that proves both: 0.178 ours against 0.18 theirs, on a
+   tensor whose input channels were barely rescaled.
 
-Consequence: **the reproduction gate runs against our implementation**, and the
-artifact is used only as a spot check on `v_proj`/`o_proj`/`down_proj`. Whatever
-perplexity the artifact returns is a fact about the upload, not about PTQTP.
+Consequence: **our current Method C is PTQTP-as-published, not
+PTQTP-as-implemented**, and it should be expected to score worse than 38.02
+until channel-scale absorption is added. Both are worth measuring, and the gap
+between them is precisely the value of the undocumented step.
