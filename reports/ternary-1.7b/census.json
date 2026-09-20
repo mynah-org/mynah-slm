@@ -1,0 +1,113 @@
+{
+  "model": "models-local/Qwen_Qwen3-1.7B",
+  "revision": null,
+  "config": {
+    "model_type": "qwen3",
+    "num_hidden_layers": 28,
+    "hidden_size": 2048,
+    "intermediate_size": 6144,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "vocab_size": 151936,
+    "tie_word_embeddings": true,
+    "torch_dtype": "bfloat16"
+  },
+  "tie_check": {
+    "declared": true,
+    "both_stored": true,
+    "byte_identical": true,
+    "note": "the checkpoint stores the tied weight TWICE; the duplicate is 593.5 MiB of the file and is dropped by any converter that honours tie_word_embeddings"
+  },
+  "params_distinct": 1720574976,
+  "params_stored": 2031739904,
+  "families": [
+    {
+      "family": "down_proj",
+      "tensors": 28,
+      "shape": "[2048, 6144]",
+      "params": 352321536,
+      "pct_of_model": 20.47696502125578
+    },
+    {
+      "family": "gate_proj",
+      "tensors": 28,
+      "shape": "[6144, 2048]",
+      "params": 352321536,
+      "pct_of_model": 20.47696502125578
+    },
+    {
+      "family": "up_proj",
+      "tensors": 28,
+      "shape": "[6144, 2048]",
+      "params": 352321536,
+      "pct_of_model": 20.47696502125578
+    },
+    {
+      "family": "embedding",
+      "tensors": 1,
+      "shape": "[151936, 2048]",
+      "params": 311164928,
+      "pct_of_model": 18.08493860136206
+    },
+    {
+      "family": "o_proj",
+      "tensors": 28,
+      "shape": "[2048, 2048]",
+      "params": 117440512,
+      "pct_of_model": 6.82565500708526
+    },
+    {
+      "family": "q_proj",
+      "tensors": 28,
+      "shape": "[2048, 2048]",
+      "params": 117440512,
+      "pct_of_model": 6.82565500708526
+    },
+    {
+      "family": "k_proj",
+      "tensors": 28,
+      "shape": "[1024, 2048]",
+      "params": 58720256,
+      "pct_of_model": 3.41282750354263
+    },
+    {
+      "family": "v_proj",
+      "tensors": 28,
+      "shape": "[1024, 2048]",
+      "params": 58720256,
+      "pct_of_model": 3.41282750354263
+    },
+    {
+      "family": "norm",
+      "tensors": 113,
+      "shape": "[128] / [2048]",
+      "params": 123904,
+      "pct_of_model": 0.007201313614827326
+    }
+  ],
+  "groups": {
+    "transformer_linears": {
+      "params": 1409286144,
+      "pct": 81.90786008502312
+    },
+    "attention_linears": {
+      "params": 352321536,
+      "pct": 20.47696502125578,
+      "pct_of_linears": 25.0
+    },
+    "mlp_linears": {
+      "params": 1056964608,
+      "pct": 61.43089506376734,
+      "pct_of_linears": 75.0
+    },
+    "embedding": {
+      "params": 311164928,
+      "pct": 18.08493860136206
+    },
+    "norms": {
+      "params": 123904,
+      "pct": 0.007201313614827326
+    }
+  }
+}

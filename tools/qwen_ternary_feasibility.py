@@ -197,18 +197,22 @@ def tie_check(model_dir: Path, tensors: list[Tensor], cfg: dict) -> dict:
                     note="no lm_head tensor: the checkpoint stores the tied weight once")
     header = read_header(model_dir)
     a, b = header["lm_head.weight"], header["model.embed_tokens.weight"]
-    if a["_file"] != b["_file"]:
-        return dict(declared=declared, both_stored=True, byte_identical=None,
-                    note="the two tensors live in different shards; not compared")
-    path = model_dir / a["_file"]
-    with path.open("rb") as f:
-        (n,) = struct.unpack("<Q", f.read(8))
-        base = 8 + n
-        blobs = []
-        for t in (a, b):
-            s, e = t["data_offsets"]
-            f.seek(base + s)
-            blobs.append(f.read(e - s))
+
+    def blob(meta):
+        """Read one tensor's bytes, from whichever shard holds it.
+
+        Sharded checkpoints put lm_head and embed_tokens in different files, and
+        an earlier version gave up there -- which silently left 15-26% of the
+        parameter count double-counted on every model above 0.6B.
+        """
+        path = model_dir / meta["_file"]
+        with path.open("rb") as f:
+            (n,) = struct.unpack("<Q", f.read(8))
+            lo, hi = meta["data_offsets"]
+            f.seek(8 + n + lo)
+            return f.read(hi - lo)
+
+    blobs = [blob(a), blob(b)]
     same = blobs[0] == blobs[1]
     return dict(
         declared=declared,
