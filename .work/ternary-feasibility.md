@@ -1548,3 +1548,73 @@ non-additivity above: q and k are cheap alone and expensive in combination with
 the other five. That is a statement about interaction, not about their
 individual fragility, and it is the kind of thing that would have been asserted
 backwards without the measurement.
+
+---
+
+# PHASE H — three different numbers, none of them interchangeable
+
+Every "bit" figure in this study belongs to exactly one of three categories. They
+have been used loosely, including by us, and the confusion runs one way: toward
+flattering the method.
+
+## 1. Information / symbolic bits — a lower bound, never a file size
+
+One ternary symbol carries `log₂3 = 1.585` bits of entropy. Two carry
+`2 log₂3 = 3.170`. `[DERIVED]` This is the **entropy floor**: no encoder can
+store a uniform trit in less, and no real format reaches it.
+
+**This is the number PTQTP's Table 1 prints as `# Bits = 1.58`.** `[PAPER]` It is
+a category label placing the method beside 1.58-bit QAT and against 1.06-bit
+binary PTQ. It is not a storage rate and the paper never claims it is.
+
+## 2. Logical method representation — how many symbols per weight
+
+`[PAPER]` PTQTP stores **two full n×d ternary planes**, so **two trits per
+weight**, plus two fp16 scale vectors per group (§3.1, Eq. 6, G=128).
+`[ARTIFACT]` Confirmed on the released checkpoint: exactly 9 distinct values per
+128-group, factorising as `α₁ = 0.13354`, `α₂ = 0.09045` for `gate_proj` L13.
+
+## 3. Actual persistent storage — the only number that describes a file
+
+| representation | bits/weight | formula | source |
+|---|---|---|---|
+| entropy floor, 2 trits | 3.170 | `2 log₂3` | `[DERIVED]` |
+| **base-3 packed, 5 trits/byte, + f16 per 256** | **3.375** | `2 × (54 B / 256 w × 8)` = `2 × 1.6875` | `[DERIVED]`, ggml `TQ1_0` geometry |
+| **Tied Trit-Planes fold (ratio-3, 9 levels)** | **4.0625** | `520 B / (4 × 256 w) × 8` | `[PAPER]` 2608.08910 §2.2 |
+| **PTQTP free-scale serving format** | **4.125** | `2 × 2 bits + 2 × 16/256` | `[PAPER]` 2608.08910, Table 1 note |
+| **PTQTP as implemented, G=128** | **4.250** | `2 × 2 bits + 2 × 16/128` | `[DERIVED]` from `[PAPER]` App. A.3 + Eq. 9 |
+| `Q3_K_M` linears, for scale | 3.4375 | ggml block rate | `[MEASURED]` |
+| `Q4_K` linears, for scale | 4.5 | ggml block rate | `[MEASURED]` |
+
+`[PAPER]` **PTQTP does not pack.** App. A.3 stores *"each ternary element … with
+2 bits (since 3 ≤ 2²)"*, and bit-packing appears under *Limitations and Future
+Works* (App. G). So **4.000 before scales** is what the method as described
+costs, and the 3.375 row is a hypothetical nobody has built.
+
+## The paper's internal inconsistency, documented rather than resolved
+
+`[PAPER]` Appendix A.3 states a **4× compression ratio** and then, two sentences
+later, works an example claiming **7.96×**:
+
+> n = 1024, d = 4096: "reduces storage from 8MB to 1.004MB (i.e. **0.5 MB** for
+> trit-planes and **0.504 MB** for scaling coefficients)"
+
+By its own formula `nd/2` = **2 MB**, not 0.5 MB, and `4n` = **4 KB**, not
+0.504 MB → 2.004 MB → **4.0×**. `[PAPER]` Table 4 confirms 4×, not 8×: LLaMA-7B
+13.48 GB → 3.69 GB grouped = **3.65×**. `[PAPER]` App. G adds a third slip in the
+same direction — *"8 ternary elements are stored in a single byte"* is impossible
+(3⁸ = 6561 > 256; the maximum is 5).
+
+**All three slips flatter the method.** We record the inconsistency and use the
+paper's own 4× / Table 4 figures, not the 7.96×.
+
+## The whole-model number, which is the only one a user experiences
+
+`[MEASURED]`/`[DERIVED]` For Qwen3-0.6B, at the artifact's real 59.1% coverage
+with a Q6_K embedding, PTQTP-as-implemented is **369.4 MiB → 4.96 bits/weight
+over the complete model**. The label on the checkpoint says `1.58b`.
+
+**The ratio between the label and the file is 3.1×.** That is the single most
+misleading number in this entire literature, and it is not PTQTP's alone: the
+same effect made `Q4_K_M` 5.24 bits/weight on this model, which this repo had
+already documented before the study began.
