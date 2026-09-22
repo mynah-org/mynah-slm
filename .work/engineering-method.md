@@ -253,6 +253,41 @@ binary. Therefore: any gate that decides something gets a `make clean` first, or
 at minimum an `rm` of the objects under test; and a mutation test is evidence
 only if the mutated build is *observed* to differ.
 
+### A machine that stops computing is telling you something about your code
+
+**Incident, 2026-09-22, the Qwen3-4B eval.** A perplexity run sat at 8% CPU with
+14.1 GB of a 15.4 GB swapfile consumed and 72 MB of free memory, on a 16 GB Mac,
+with 8 GB of fp16 weights. The reflex reading is *"4B does not fit on this
+machine"* — which would have moved the experiment to another box and been wrong.
+
+The cause was one line of ours:
+
+```python
+AutoModelForCausalLM.from_pretrained(...).to(dev)    # peak = 2x the model
+AutoModelForCausalLM.from_pretrained(..., device_map={"": dev})   # peak = 1x
+```
+
+The first materialises the whole checkpoint in CPU RAM and *then* copies it to
+the device. **8 GB of weights, 16 GB of peak, on 16 GB of RAM.** With
+`device_map` the shards are placed straight onto the device from the mmap'd
+safetensors: same weights, same numerics, half the peak. The same eval then ran
+at **9 s per 2048-token window** — roughly 22 minutes for the locked 146-window
+protocol, against a run that was not going to finish at all.
+
+Three things generalise:
+
+- **Read swap and free pages, not just elapsed time.** "Slow" and "thrashing" are
+  different failures with different fixes, and the second one is not a
+  measurement — a number produced under paging is worthless whatever it says.
+- **A resource ceiling is a hypothesis, not a diagnosis.** *"It does not fit"*
+  has to be derived from what the code actually allocates, not from the model's
+  size on disk.
+- **Any change to how weights are loaded is a change to the harness**, so it gets
+  a regression run before it is trusted: 0.6B BF16 came back **20.9557** against
+  the locked **20.9541** — a 0.0075% fp16/MPS reduction-order difference, three
+  orders of magnitude below anything being decided. Had it moved by a percent,
+  the patch would have gone, not the baseline.
+
 ---
 
 ## 7. The asymmetry checklist — nine classes to grep for

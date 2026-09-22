@@ -712,8 +712,19 @@ def cmd_ppl(args) -> int:
     # quantization, not of the metric. --dtype fp32 gets a number out of it.
     dtype = dict(fp32=torch.float32, fp16=torch.float16)[args.dtype] if args.dtype \
         else (torch.float32 if dev == "cpu" else torch.float16)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_dir, dtype=dtype, **load_kwargs).to(dev).eval()
+    # `.from_pretrained(...).to(dev)` materialises the whole checkpoint in CPU
+    # RAM and THEN copies it to the device, so the peak is 2x the model. On a
+    # 16 GB Mac that is what turned a 4B fp16 eval (8 GB of weights) into a
+    # 14 GB swap thrash at 8% CPU. `device_map` places each shard straight onto
+    # the device from the mmap'd safetensors instead: same weights, same
+    # numerics, half the peak. A GGUF is dequantized on the CPU by transformers
+    # and cannot take that path.
+    if args.gguf:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir, dtype=dtype, **load_kwargs).to(dev).eval()
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir, dtype=dtype, device_map={"": dev}, **load_kwargs).eval()
 
     text = _load_wikitext2_test()
     ids = tok(text, return_tensors="pt").input_ids

@@ -23,3 +23,13 @@ Downloading 'vocab.json' to 'models-local/Qwen_Qwen3-4B/.cache/huggingface/downl
 Fetching 13 files:  46%|████▌     | 6/13 [00:00<00:00,  7.75it/s]Download complete. Moving file to models-local/Qwen_Qwen3-4B/tokenizer_config.json
 Download complete. Moving file to models-local/Qwen_Qwen3-4B/vocab.json
 Download complete. Moving file to models-local/Qwen_Qwen3-4B/tokenizer.json
+Download complete. Moving file to models-local/Qwen_Qwen3-4B/model-00003-of-00003.safetensors
+Download complete. Moving file to models-local/Qwen_Qwen3-4B/model-00001-of-00003.safetensors
+Fetching 13 files:  54%|█████▍    | 7/13 [31:18<37:38, 376.44s/it]Download complete. Moving file to models-local/Qwen_Qwen3-4B/model-00002-of-00003.safetensors
+Fetching 13 files:  62%|██████▏   | 8/13 [1:03:43<1:00:26, 725.38s/it]Fetching 13 files: 100%|██████████| 13/13 [1:03:43<00:00, 294.08s/it] 
+7.5G	models-local/Qwen_Qwen3-4B
+/dev/disk3s5   228Gi   185Gi    13Gi    94%    2.8M  134M    2%   /System/Volumes/Data
+kept tokenizer in models-local/qwen3-4b-tokenizer: merges.txt tokenizer.json tokenizer_config.json vocab.json 
+--- ppl  13:27:17
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s]Loading checkpoint shards:  33%|███▎      | 1/3 [00:12<00:25, 12.62s/it]Loading checkpoint shards:  67%|██████▋   | 2/3 [00:43<00:23, 23.60s/it]Loading checkpoint shards: 100%|██████████| 3/3 [00:45<00:00, 13.61s/it]Loading checkpoint shards: 100%|██████████| 3/3 [00:45<00:00, 15.21s/it]
+Token indices sequence length is longer than the specified maximum sequence length for this model (299078 > 131072). Running this sequence through the model will result in indexing errors
