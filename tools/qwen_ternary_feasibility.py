@@ -731,11 +731,17 @@ def cmd_ppl(args) -> int:
     # It is NOT the default, because it is not safe everywhere: on this repo's
     # canonical stack (python 3.13.2 / torch 2.13.0 / accelerate 1.15.0, MPS)
     # it **segfaults** during weight loading -- exit 139, reproducibly, on
-    # Qwen3-0.6B. It works on torch 2.7.1 + MPS and on Linux CPU. A memory
-    # optimisation that crashes the environment which produced every locked
-    # baseline does not get to be the default, so it is opt-in behind
-    # --low-mem, it falls back rather than dying, and the JSON records which
-    # placement actually ran so no number can be attributed to the wrong one.
+    # Qwen3-0.6B. It works on torch 2.7.1 + MPS and on Linux CPU.
+    #
+    # READ THE NEXT SENTENCE BEFORE TRUSTING THE try/except BELOW. A SIGSEGV
+    # KILLS THE PROCESS; Python cannot catch it. The handler here only covers
+    # ordinary exceptions -- a missing `accelerate`, an unsupported device map
+    # -- and does NOT protect against the crash that motivated the flag. That
+    # is precisely why the safe placement is the default and this one is
+    # opt-in: the protection is the flag, not the handler.
+    #
+    # The JSON records which placement actually ran, so no number can be
+    # attributed to the wrong one.
     load_path = "to(dev)"
     model = None
     if args.low_mem and not args.gguf:
@@ -744,6 +750,7 @@ def cmd_ppl(args) -> int:
                 model_dir, dtype=dtype, device_map={"": dev}, **load_kwargs).eval()
             load_path = "device_map (--low-mem)"
         except Exception as exc:                       # noqa: BLE001
+            # Ordinary failures only. A segfault never reaches here.
             print(f"  --low-mem placement failed ({type(exc).__name__}), "
                   f"falling back to to(dev)", file=sys.stderr)
             model = None
@@ -1427,7 +1434,8 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--dtype", choices=["fp16", "fp32"], default=None)
     pp.add_argument("--low-mem", action="store_true",
                     help="place weights straight onto the device (halves peak "
-                         "memory; SEGFAULTS on torch 2.13 + MPS, so it is opt-in)")
+                         "memory). SEGFAULTS on torch 2.13 + MPS and Python "
+                         "cannot catch that, so it is opt-in and unprotected.")
     pp.add_argument("--logit-chunk", type=int, default=256,
                     help="positions per lm_head/cross-entropy chunk")
     pp.set_defaults(fn=cmd_ppl)
