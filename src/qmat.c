@@ -209,7 +209,6 @@ static inline int hsum256i(__m256i v) {
     a = _mm_add_epi32(a, _mm_shuffle_epi32(a, 0xb1));
     return _mm_cvtsi128_si32(a);
 }
-#endif
 
 /* AVX-512 VNNI, ported from qwen-tts's int8 kernel stack (docs/prior-art.md).
  *
@@ -250,8 +249,8 @@ static inline void q4_k_pair_vnni(const unsigned char *q, const int8_t *xbase,
     *sum_lo = hsum256i(_mm512_extracti32x8_epi32(acc, 0));
     *sum_hi = hsum256i(_mm512_extracti32x8_epi32(acc, 1));
 }
-#endif
-#endif
+#endif /* AVX-512 VNNI */
+#endif /* __AVX2__ */
 
 static float q4_k_row_int8(const unsigned char *row, size_t blocks,
                            const int8_t *xq, const float *xscale,
