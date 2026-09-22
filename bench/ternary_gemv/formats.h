@@ -16,7 +16,13 @@
 
 /* Contract-dimension group. 256 matches ggml's K-quant super-block and the
  * `tq2_0_fx4` block of fucina/docs/PTQTP.md, so scale overheads are comparable. */
+/* Weights per scale group. Overridable from the build so the SCALE GRANULARITY
+ * can be swept independently of the bit width -- the experiment that separates
+ * "ternary is fast" from "coarse scale groups are fast". ggml's K-quants carry
+ * a scale every 32 elements; this carries one every TG. */
+#ifndef TG
 #define TG 256
+#endif
 
 typedef enum {
     FMT_T0_INT8 = 0, /* oracle: one int8 per trit, no packing           8.125 bpw */
