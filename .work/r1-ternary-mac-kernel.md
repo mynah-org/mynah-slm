@@ -320,24 +320,65 @@ still ~3.4× slower per GEMV.** So on this machine the shape of the trade is
 513,675 → 462,750 ns and Q6_K does not move at all (506,000 → 516,375, inside
 the noise). **There is no int8-activation Q3_K kernel anywhere in our stack.**
 
-So the honest decomposition is:
+### The gap decomposes, and most of it is not the bit width
 
-- `[MEASURED]` **The Q3_K path we ship today is 3.4× slower than the Q4_K path.**
-  That is a fact about the engine as it exists, and it is what a user would feel.
-- `[HYPOTHESIS]` **Some of that gap is an unoptimised kernel, not the format.**
-  Q4_K's advantage comes from *our* distribute-the-sum kernel with int8
-  activations and the cross-row `sum(x)` hoist; Q3_K has never had that treatment.
-  `[UNKNOWN]` how much of the 3.4× a Q3_K kernel written to the same standard
-  would recover. **Nothing here measures that**, and until it is measured, "Q3_K
-  is intrinsically slow" is not a claim this bench supports.
-- `[DERIVED]` Q3_K is also the hardest K-quant to decode — 3-bit payload split
-  across two planes plus 6-bit scales — so a same-standard kernel would be
-  expected to land *below* Q4_K's rate, not at it. That is a reason to expect a
-  residual gap, not a measurement of one.
+`[MEASURED]` Reading `third_party/ingot/src/kernels.c`: both
+`q3_k_dot_block_neon` and `q6_k_dot_block_neon` are **f32-domain** kernels. They
+widen the quants `int8 → int16 → int32 → float` and accumulate with
+`vmlaq_f32` against f32 activations — four FMAs plus eight widening ops per 16
+weights. Our `Q4_K` int8 kernel accumulates with `sdot`: **16 int8 MACs in one
+instruction, no widening at all.**
+
+That is measurable independently of the format, because our own `Q4_K` kernel has
+**both arms on the same bytes**:
+
+| | GB/s | |
+|---|---|---|
+| `Q4_K`, ours, **int8** arm (`sdot`) | **13.1–13.4** | |
+| `Q4_K`, ours, **f32** arm | **5.0–5.2** | ÷2.6 |
+| `Q6_K`, ingot, f32-domain | 5.1–5.3 | same rate as the f32 arm |
+| `Q3_K`, ingot, f32-domain | **2.9–3.1** | ÷1.7 again |
+
+`[DERIVED]` So the 4.5× **per byte** gap between our `Q4_K` and ingot's `Q3_K`
+factors cleanly:
+
+```
+  2.6x   arithmetic domain: int8 sdot vs f32 fmla + widening
+x 1.7x   Q3_K's decode complexity vs Q6_K's, both in f32
+= 4.5x   per byte
+x 0.76   Q3_K's byte credit (3.4375 / 4.5 bpw)
+= 3.4x   per GEMV                             <- the measured 462,750 / 135,375
+```
+
+**`[MEASURED]` 462,750 / 135,375 = 3.42×, and the decomposition predicts 3.44×.**
+
+The honest reading:
+
+- `[MEASURED]` **The `Q3_K` path we ship today is 3.4× slower than the `Q4_K`
+  path.** That is a fact about the engine as it exists and it is what a user
+  would feel. It is the number that belongs in any Q3-vs-ternary trade table
+  *today*.
+- `[MEASURED]` **Most of it is the arithmetic domain, not the bit width.** 2.6×
+  of the 4.5× is `f32` versus `sdot`, measured on our own kernel's two arms
+  against identical bytes. **`Q3_K` has no int8-activation kernel anywhere in our
+  stack**, and that is a gap in our engine, not a property of 3.4375 bpw.
+- `[UNKNOWN]` What a `Q3_K` kernel written to the same standard would reach.
+  `[DERIVED]` The residual 1.7× says it would still land below `Q4_K` — the
+  format really is harder to decode (2-bit payload plus a high-bit mask plus
+  6-bit packed scales) — but "3.4× slower" would not survive it. **"Q3_K is
+  intrinsically slow" is not a claim this bench supports.**
+- `[DERIVED]` The same argument cuts the other way for ternary: T3 fold9's
+  25–27 GB/s is **also** an `sdot` number. Against a hypothetical int8 `Q3_K`
+  kernel the honest expectation is ~2× or less, not 7.8×. **The 7.8× figure
+  compares our best kernel with ingot's worst one**, and it is quoted here only
+  as *the gap between the paths that exist today*.
 
 ## Ternary against the types the files actually use  `[MEASURED]`
 
-T3 fold9 K=2, NEON, single thread, against the **real** tensor at the same shape:
+T3 fold9 K=2, NEON, single thread, against the **real** tensor at the same shape.
+**Read the decomposition above first**: every row against `Q3_K` or `Q6_K`
+compares an `sdot` kernel with an `f32` one, and ~2.6× of each of those ratios is
+the arithmetic domain rather than the representation.
 
 | tensor | shape | real type | ternary is |
 |---|---|---|---|
