@@ -211,6 +211,48 @@ static inline int hsum256i(__m256i v) {
 }
 #endif
 
+/* AVX-512 VNNI, ported from qwen-tts's int8 kernel stack (docs/prior-art.md).
+ *
+ * WHY THIS EXISTS. The measurement that forced it: on an AMD EPYC 9254 (Zen 4)
+ * this Q4_K kernel ran at 7.8 GB/s while the SAME kernel on an Apple M1 ran at
+ * 13.1 -- a server was slower than a laptop, because `grep -c _mm512 src/qmat.c
+ * third_party/ingot/src/kernels.c` returned 0 and 0. Every x86 path we own was
+ * AVX2 at 256 bits with the pre-VNNI `maddubs_epi16 + madd_epi16` pair, on a
+ * CPU that has had a single-instruction u8xi8 dot product since 2022.
+ *
+ * THE LAYOUT TRICK. A Q4_K sub-block pair shares its 32 packed bytes: the low
+ * nibbles are elements [base, base+32) and the high nibbles [base+32, base+64).
+ * Concatenating the two unpacked halves into one 64-byte vector makes the
+ * matching activations EXACTLY the contiguous 64 bytes at xq+base, so one
+ * `vpdpbusd` covers both sub-blocks with a single load and no gather:
+ *
+ *     W = [ lo_nibbles(32B) | hi_nibbles(32B) ]     <- one insert
+ *     X = xq[base .. base+64)                       <- one contiguous load
+ *     acc = vpdpbusd(W, X)   lanes 0-7 -> sub-block s0, lanes 8-15 -> s1
+ *
+ * vpdpbusd wants an UNSIGNED first operand and the nibbles are 0..15, so no
+ * correction is needed -- the same reason the ternary bench stores biased
+ * codes. It also removes the one real hazard in the AVX2 path: `maddubs`
+ * accumulates into int16 and saturates, which is safe here only because
+ * 15*127*2 = 3810 happens to fit. VNNI accumulates in int32 and cannot. */
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__) && defined(__AVX512F__)
+#define MYNAH_SLM_HAVE_AVX512VNNI 1
+
+static inline void q4_k_pair_vnni(const unsigned char *q, const int8_t *xbase,
+                                  int *sum_lo, int *sum_hi) {
+    const __m256i p  = _mm256_loadu_si256((const __m256i *)(const void *)q);
+    const __m256i m  = _mm256_set1_epi8(0x0f);
+    const __m256i nl = _mm256_and_si256(p, m);
+    const __m256i nh = _mm256_and_si256(_mm256_srli_epi16(p, 4), m);
+    const __m512i w  = _mm512_inserti64x4(_mm512_castsi256_si512(nl), nh, 1);
+    const __m512i x  = _mm512_loadu_si512((const void *)xbase);
+    const __m512i acc = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w, x);
+    *sum_lo = hsum256i(_mm512_extracti32x8_epi32(acc, 0));
+    *sum_hi = hsum256i(_mm512_extracti32x8_epi32(acc, 1));
+}
+#endif
+#endif
+
 static float q4_k_row_int8(const unsigned char *row, size_t blocks,
                            const int8_t *xq, const float *xscale,
                            const float *xsum) {
@@ -243,6 +285,9 @@ static float q4_k_row_int8(const unsigned char *row, size_t blocks,
             }
             sum_lo = vaddvq_s32(alo);
             sum_hi = vaddvq_s32(ahi);
+#elif defined(MYNAH_SLM_HAVE_AVX512VNNI)
+            (void)xhi;   /* the 64-byte load at xlo covers both sub-blocks */
+            q4_k_pair_vnni(q, xlo, &sum_lo, &sum_hi);
 #else
             const __m256i ones = _mm256_set1_epi16(1);
             const __m256i p = _mm256_loadu_si256((const __m256i *)(const void *)q);
