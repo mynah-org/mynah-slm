@@ -24,10 +24,19 @@ fixtures = [
 
 # Only for proving the ORACLE itself right against transformers. Never needed
 # to run the oracle, and never installed in CI.
+#
+# `accelerate` is NOT optional here despite never being imported by our code:
+# transformers requires it both to load a GGUF checkpoint and to honour
+# `device_map`. It was present de facto in the environment that produced the
+# locked perplexity baselines and was never declared, so a later `uv sync`
+# pruned it and the harness started failing on runs that had worked for weeks.
+# An undeclared dependency is a reproducibility bug, not a convenience.
 check = [
     "torch>=2.4",
     "transformers>=4.51",
     "safetensors>=0.4",
+    "accelerate>=0.30",
+    "datasets>=2.19",
 ]
 
 [tool.uv]

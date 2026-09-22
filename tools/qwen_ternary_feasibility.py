@@ -720,12 +720,36 @@ def cmd_ppl(args) -> int:
     # the device from the mmap'd safetensors instead: same weights, same
     # numerics, half the peak. A GGUF is dequantized on the CPU by transformers
     # and cannot take that path.
-    if args.gguf:
+    # HOW THE WEIGHTS ARE PLACED, and why the default is the slow one.
+    #
+    # `.from_pretrained(...).to(dev)` materialises the whole checkpoint in CPU
+    # RAM and THEN copies it to the device, so the peak is 2x the model. On a
+    # 16 GB Mac that is what turned a 4B fp16 eval into a 14 GB swap thrash.
+    # `device_map={"": dev}` places each shard straight onto the device and
+    # halves the peak.
+    #
+    # It is NOT the default, because it is not safe everywhere: on this repo's
+    # canonical stack (python 3.13.2 / torch 2.13.0 / accelerate 1.15.0, MPS)
+    # it **segfaults** during weight loading -- exit 139, reproducibly, on
+    # Qwen3-0.6B. It works on torch 2.7.1 + MPS and on Linux CPU. A memory
+    # optimisation that crashes the environment which produced every locked
+    # baseline does not get to be the default, so it is opt-in behind
+    # --low-mem, it falls back rather than dying, and the JSON records which
+    # placement actually ran so no number can be attributed to the wrong one.
+    load_path = "to(dev)"
+    model = None
+    if args.low_mem and not args.gguf:
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_dir, dtype=dtype, device_map={"": dev}, **load_kwargs).eval()
+            load_path = "device_map (--low-mem)"
+        except Exception as exc:                       # noqa: BLE001
+            print(f"  --low-mem placement failed ({type(exc).__name__}), "
+                  f"falling back to to(dev)", file=sys.stderr)
+            model = None
+    if model is None:
         model = AutoModelForCausalLM.from_pretrained(
             model_dir, dtype=dtype, **load_kwargs).to(dev).eval()
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir, dtype=dtype, device_map={"": dev}, **load_kwargs).eval()
 
     text = _load_wikitext2_test()
     ids = tok(text, return_tensors="pt").input_ids
@@ -775,7 +799,7 @@ def cmd_ppl(args) -> int:
                revision=args.revision, seq_len=L, windows=n_windows,
                tokens_scored=n_tok, total_tokens=int(ids.numel()),
                nll_per_token=nll / n_tok, perplexity=ppl, dtype=str(dtype),
-               logit_chunk=CH, seed=args.seed,
+               logit_chunk=CH, seed=args.seed, load_path=load_path,
                dataset="Salesforce/wikitext", config="wikitext-2-raw-v1",
                split="test", join='"\n\n".join(rows)',
                protocol="non-overlapping windows, score positions 1..L-1",
@@ -1401,6 +1425,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="score a GGUF inside --model instead of its safetensors; "
                          "transformers dequantizes it, so every format lands in ONE harness")
     pp.add_argument("--dtype", choices=["fp16", "fp32"], default=None)
+    pp.add_argument("--low-mem", action="store_true",
+                    help="place weights straight onto the device (halves peak "
+                         "memory; SEGFAULTS on torch 2.13 + MPS, so it is opt-in)")
     pp.add_argument("--logit-chunk", type=int, default=256,
                     help="positions per lm_head/cross-entropy chunk")
     pp.set_defaults(fn=cmd_ppl)
