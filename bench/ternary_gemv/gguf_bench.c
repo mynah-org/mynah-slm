@@ -12,6 +12,7 @@
  * from the container rather than assumed.
  *
  * SPDX-License-Identifier: MIT */
+#include "dispatch.h"
 #include "formats.h"
 #include "qmat.h"
 #include "timing.h"
@@ -25,19 +26,20 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct {
-    int8_t  *q;
-    float   *scale;
-    int32_t *sum;
-    size_t   cols, groups;
-} act_t;
-void act_prepare(const float *x, size_t cols, act_t *a);
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 void tgemv_neon(ternary_fmt f, const uint8_t *w, size_t rows, size_t cols,
                 const act_t *a, const int8_t *xs2, const int8_t *xs4, float *y);
 #endif
 void shuffle_stride(const int8_t *in, int8_t *out, size_t cols, int blk, int stride);
 float bench_frand(void);
+void ternary_repack_pairs(const uint8_t *src, uint8_t *dst, size_t rows, size_t cols);
+void ternary_pair_acts(const int8_t *xq, int8_t *out, size_t cols);
+#if defined(TERNARY_BUILD_I8MM)
+int tgemv_i8mm_fold9(const uint8_t *w, size_t rows, size_t cols, const act_t *a,
+                     const int8_t *xpair, float *y);
+#endif
+int tgemv_pair_ref(const uint8_t *w, size_t rows, size_t cols, const act_t *a,
+                   const int8_t *xpair, float *y);
 
 /* One representative tensor per decode GEMV shape. Layer 5 rather than layer 0
  * because llama.cpp bumps the type of early layers, and quoting a bumped layer
@@ -112,6 +114,13 @@ int gguf_bench(const char *path, int reps, FILE *csv)
     if (ingot_gguf_open(&g, path, err, sizeof err) != 0 || !g) {
         fprintf(stderr, "REFUSED: cannot open %s: %s\n", path, err);
         return 2;
+    }
+    {
+        const ternary_caps *c = ternary_detect();
+        printf("\n# cpu=%s  neon=%d dotprod=%d i8mm=%d   arms: ref%s%s\n",
+               c->cpu, c->have_neon, c->have_dotprod, c->have_i8mm,
+               ternary_arm_available(ARM_DOTPROD) ? " sdot" : "",
+               ternary_arm_available(ARM_I8MM) ? " smmla" : " [smmla NOT AVAILABLE]");
     }
     printf("\n# ===== REAL GGUF: %s =====\n", path);
     printf("# arch=%s  gguf v%u  %zu tensors\n",
@@ -231,6 +240,39 @@ int gguf_bench(const char *path, int reps, FILE *csv)
                                  TERNARY_FORMATS[fl[k]].total_bpw, tern_ns[k],
                                  (double)(R * trb[k]) / 1048576.0,
                                  (double)(R * trb[k]) / tern_ns[k]);
+            }
+            /* The smmla arm, on the SAME bytes in the row-pair layout. Skipped
+             * with a printed reason on a CPU without FEAT_I8MM -- never
+             * silently, because a missing line reads as a missing result. */
+            if (R % 2 == 0) {
+                uint8_t *PW = malloc(R * trb[0]);
+                int8_t  *xp = malloc(C * 2);
+                ternary_repack_pairs(TW[0], PW, R, C);
+                ternary_pair_acts(a.q, xp, C);
+                if (tgemv_pair_ref(PW, R, C, &a, xp, y) == 0) {
+                    double chk = 0;
+                    for (size_t r = 0; r < R; r++) chk += fabs((double)y[r]);
+                    printf("    T3 pair layout validated (sum|y|=%.4g)\n", chk / (double)R);
+                }
+#if defined(TERNARY_BUILD_I8MM)
+                if (ternary_arm_available(ARM_I8MM)) {
+                    double t0 = mynah_slm_now();
+                    for (int it = 0; it < reps; it++)
+                        tgemv_i8mm_fold9(PW, R, C, &a, xp, y);
+                    double ns = (mynah_slm_now() - t0) * 1e9 / reps;
+                    printf("    %-10s %6.3f bpw  [smmla]     %10.0f ns  %6.1f GB/s  "
+                           "%.2fx the real %s(int8), %.2fx our sdot arm\n",
+                           "T3 pair", 4.125, ns, (double)(R * trb[0]) / ns,
+                           real_ns[1] / ns, ingot_type_name(t->type), tern_ns[0] / ns);
+                    if (csv) fprintf(csv, "%s,%zu,%zu,T3pair-smmla,%.4f,%.0f,%.2f,%.2f\n",
+                                     PICKS[p].label, R, C, 4.125, ns,
+                                     (double)(R * trb[0]) / 1048576.0,
+                                     (double)(R * trb[0]) / ns);
+                } else
+#endif
+                    printf("    T3 pair     REFUSED: this CPU has no FEAT_I8MM "
+                           "(layout is validated, kernel is not measured)\n");
+                free(PW); free(xp);
             }
             free(tv); free(ws);
         }

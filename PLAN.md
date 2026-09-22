@@ -92,10 +92,17 @@ instrumentation, M3 CLI polish, M5b quantization & footprint, M6 release.
       → [`.work/ptqtp-paper-reading.md`](.work/ptqtp-paper-reading.md)
 - [x] **R1-K** — Tied Trit-Planes read as a kernel paper; the fucina format spec
       and its Qwen3 measurements → [`.work/tied-trit-cpu-kernel-reading.md`](.work/tied-trit-cpu-kernel-reading.md)
-- [~] **R1-M** — ternary GEMV microbench on Apple Silicon. **PROMISING**: 2.0-2.3x
-      faster than the production Q4_K int8 kernel at 4.125 bpw vs 4.5, on every
-      projection shape, 1/2/4 threads. Gate B still UNDECIDED — no i8mm here
+- [~] **R1-M** — ternary GEMV microbench on Apple Silicon, now also off REAL
+      GGUF tensors. 2.0-2.3x the production Q4_K int8 kernel at 4.125 bpw vs 4.5;
+      **Q3_K measured at last and it is the slowest path we ship** (2.9 GB/s vs
+      Q4_K's 13.1); both shipped files store the lm_head as **Q6_K**, correcting
+      the synthetic table. Gate B still UNDECIDED — no i8mm here
       → [`.work/r1-ternary-mac-kernel.md`](.work/r1-ternary-mac-kernel.md)
+- [ ] **R1-N** — the same microbench on Neoverse V2 / GCP Axion, with the `smmla`
+      arm and its **prediction written before the run**: naive i8mm is ~1.4x
+      WORSE than sdot for GEMV, ~2x better only with a row-pair layout, and is
+      really a prefill instruction. Layout already gated bit-exact on a CPU
+      without i8mm → [`.work/r1-axion-ternary.md`](.work/r1-axion-ternary.md)
 - [ ] **R2** — the tied `lm_head`, `151936 x 1024`, is **42% of a decode step**
       and 32.7% of decode bytes. Fell out of R1; needs its own note before it is
       picked up

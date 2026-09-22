@@ -72,3 +72,6 @@ package-lock.json
 
 # Kernel microbench binary (bench/ternary_gemv/ sources are tracked)
 bench/ternary_gemv/ternary_gemv
+
+# Kernel microbench binaries
+bench/ternary_gemv/test_pair
