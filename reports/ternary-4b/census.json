@@ -1,0 +1,113 @@
+{
+  "model": "models-local/Qwen_Qwen3-4B",
+  "revision": null,
+  "config": {
+    "model_type": "qwen3",
+    "num_hidden_layers": 36,
+    "hidden_size": 2560,
+    "intermediate_size": 9728,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "vocab_size": 151936,
+    "tie_word_embeddings": true,
+    "torch_dtype": "bfloat16"
+  },
+  "tie_check": {
+    "declared": true,
+    "both_stored": false,
+    "byte_identical": null,
+    "note": "no lm_head tensor: the checkpoint stores the tied weight once"
+  },
+  "params_distinct": 4022468096,
+  "params_stored": 4022468096,
+  "families": [
+    {
+      "family": "down_proj",
+      "tensors": 36,
+      "shape": "[2560, 9728]",
+      "params": 896532480,
+      "pct_of_model": 22.28811910009988
+    },
+    {
+      "family": "gate_proj",
+      "tensors": 36,
+      "shape": "[9728, 2560]",
+      "params": 896532480,
+      "pct_of_model": 22.28811910009988
+    },
+    {
+      "family": "up_proj",
+      "tensors": 36,
+      "shape": "[9728, 2560]",
+      "params": 896532480,
+      "pct_of_model": 22.28811910009988
+    },
+    {
+      "family": "embedding",
+      "tensors": 1,
+      "shape": "[151936, 2560]",
+      "params": 388956160,
+      "pct_of_model": 9.669589682682222
+    },
+    {
+      "family": "o_proj",
+      "tensors": 36,
+      "shape": "[2560, 4096]",
+      "params": 377487360,
+      "pct_of_model": 9.384471200042055
+    },
+    {
+      "family": "q_proj",
+      "tensors": 36,
+      "shape": "[4096, 2560]",
+      "params": 377487360,
+      "pct_of_model": 9.384471200042055
+    },
+    {
+      "family": "k_proj",
+      "tensors": 36,
+      "shape": "[1024, 2560]",
+      "params": 94371840,
+      "pct_of_model": 2.346117800010514
+    },
+    {
+      "family": "v_proj",
+      "tensors": 36,
+      "shape": "[1024, 2560]",
+      "params": 94371840,
+      "pct_of_model": 2.346117800010514
+    },
+    {
+      "family": "norm",
+      "tensors": 145,
+      "shape": "[128] / [2560]",
+      "params": 196096,
+      "pct_of_model": 0.004875016912999277
+    }
+  ],
+  "groups": {
+    "transformer_linears": {
+      "params": 3633315840,
+      "pct": 90.32553530040478
+    },
+    "attention_linears": {
+      "params": 943718400,
+      "pct": 23.461178000105136,
+      "pct_of_linears": 25.974025974025974
+    },
+    "mlp_linears": {
+      "params": 2689597440,
+      "pct": 66.86435730029964,
+      "pct_of_linears": 74.02597402597402
+    },
+    "embedding": {
+      "params": 388956160,
+      "pct": 9.669589682682222
+    },
+    "norms": {
+      "params": 196096,
+      "pct": 0.004875016912999277
+    }
+  }
+}

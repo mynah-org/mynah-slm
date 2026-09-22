@@ -1,0 +1,31 @@
+{
+  "label": "Qwen_Qwen3-4B",
+  "model": "models-local/Qwen_Qwen3-4B",
+  "gguf": null,
+  "revision": null,
+  "seq_len": 2048,
+  "windows": 146,
+  "tokens_scored": 298862,
+  "total_tokens": 299078,
+  "nll_per_token": 2.6128757328819945,
+  "perplexity": 13.638214374454677,
+  "dtype": "torch.float16",
+  "logit_chunk": 256,
+  "seed": 0,
+  "dataset": "Salesforce/wikitext",
+  "config": "wikitext-2-raw-v1",
+  "split": "test",
+  "join": "\"\n\n\".join(rows)",
+  "protocol": "non-overlapping windows, score positions 1..L-1",
+  "environment": {
+    "python": "3.10.0",
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
+    "machine": "arm64",
+    "device": "mps",
+    "torch": "2.7.1",
+    "transformers": "4.57.3",
+    "datasets": "4.5.0",
+    "numpy": "2.2.6",
+    "safetensors": "0.5.3"
+  }
+}

@@ -31,6 +31,7 @@ import math
 import re
 import struct
 import sys
+import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -742,6 +743,7 @@ def cmd_ppl(args) -> int:
     # the mean is recomputed from the summed NLL over the same token set.
     CH = args.logit_chunk
     nll, n_tok = 0.0, 0
+    t_start = time.time()
     with torch.no_grad():
         for w in range(n_windows):
             chunk = ids[:, w * L:(w + 1) * L].to(dev)
@@ -752,9 +754,21 @@ def cmd_ppl(args) -> int:
                 logits = model.lm_head(hidden[a:b]).float()
                 nll += float(F.cross_entropy(logits, tgt[a:b], reduction="sum"))
                 n_tok += b - a
-            if args.verbose and (w + 1) % 20 == 0:
+            # Progress is NOT behind --verbose. A long run with no output is
+            # indistinguishable from a hung one, and this harness has already
+            # cost an hour to that ambiguity: a 4B eval was killed on the
+            # (correct) suspicion of swap thrash, and a second one could not be
+            # told apart from a healthy run because nothing printed. stdout
+            # stays clean, so this cannot corrupt a parsed result.
+            step = 20 if not args.verbose else 5
+            if (w + 1) % step == 0 or w + 1 == n_windows:
+                el = time.time() - t_start
+                rate = el / (w + 1)
                 print(f"  window {w+1}/{n_windows}  running ppl "
-                      f"{math.exp(nll / n_tok):.4f}", file=sys.stderr)
+                      f"{math.exp(nll / n_tok):.4f}  "
+                      f"{rate:.1f} s/window  elapsed {el/60:.1f} min  "
+                      f"eta {rate * (n_windows - w - 1) / 60:.1f} min",
+                      file=sys.stderr, flush=True)
 
     ppl = math.exp(nll / n_tok)
     res = dict(label=label, model=str(model_dir), gguf=args.gguf,
