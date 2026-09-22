@@ -1,0 +1,184 @@
+# ternary GEMV microbench -- Apple M1, sdot yes / i8mm no, 40 reps
+# baselines are mynah_slm_matvec, the production kernels
+
+## representation
+format           payload    scales     TOTAL  passes
+T0 int8            8.000     0.125     8.125       1
+T1 2-bit           2.000     0.125     2.125       1
+T2 base-3          1.625     0.125     1.750       1
+T3 fold9 K=2       4.000     0.125     4.125       1
+T3 K=3             6.000     0.125     6.125       2
+mask+sign          2.000     0.125     2.125       1
+
+(bits/weight. Entropy of one trit is 1.585 and is NOT a storage rate.)
+
+## activation prep + lane shuffle, cols=1024: 2600 ns (once per layer input, not per projection)
+
+## gate/up_proj  [3072 x 1024]
+  T0 int8        round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T0 int8        neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T0 int8       8.125 bpw  scalar    140100 ns   NEON    118000 ns     3.0 MiB    27.1 GB/s
+  T1 2-bit       round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T1 2-bit       neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T1 2-bit      2.125 bpw  scalar   1764650 ns   NEON     59700 ns     0.8 MiB    14.0 GB/s
+  T2 base-3      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    T2 base-3     1.750 bpw  scalar   2351350 ns
+  T3 fold9 K=2   round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 fold9 K=2   neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 fold9 K=2  4.125 bpw  scalar   1091600 ns   NEON     61025 ns     1.5 MiB    26.6 GB/s
+  T3 K=3         round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 K=3         neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 K=3        6.125 bpw  scalar   3110975 ns   NEON    100150 ns     2.3 MiB    24.0 GB/s
+  mask+sign      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    mask+sign     2.125 bpw  scalar   9165450 ns
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=f32 ]    287775 ns     3.2 MiB    11.6 GB/s
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=int8]    289675 ns     3.2 MiB    11.5 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=f32 ]    494725 ns     2.5 MiB     5.2 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=int8]    493200 ns     2.5 MiB     5.2 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=f32 ]    339875 ns     1.7 MiB     5.2 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=int8]    132225 ns     1.7 MiB    13.4 GB/s
+    Q3_K         REFUSED: no encoder or unknown geometry
+    threads=1   T3 fold9     60300 ns   Q4_K(int8)    132250 ns   ternary is 2.19x
+    threads=2   T3 fold9     31600 ns   Q4_K(int8)     68225 ns   ternary is 2.16x
+    threads=4   T3 fold9     17725 ns   Q4_K(int8)     36400 ns   ternary is 2.05x
+
+## down_proj  [1024 x 3072]
+  T0 int8        round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T0 int8        neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T0 int8       8.125 bpw  scalar     69500 ns   NEON     65375 ns     3.0 MiB    48.9 GB/s
+  T1 2-bit       round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T1 2-bit       neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T1 2-bit      2.125 bpw  scalar   1486800 ns   NEON     56550 ns     0.8 MiB    14.8 GB/s
+  T2 base-3      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    T2 base-3     1.750 bpw  scalar   2340175 ns
+  T3 fold9 K=2   round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 fold9 K=2   neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 fold9 K=2  4.125 bpw  scalar   1079600 ns   NEON     58425 ns     1.5 MiB    27.8 GB/s
+  T3 K=3         round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 K=3         neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 K=3        6.125 bpw  scalar   3119600 ns   NEON    103275 ns     2.3 MiB    23.3 GB/s
+  mask+sign      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    mask+sign     2.125 bpw  scalar   9599000 ns
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=f32 ]    313675 ns     3.2 MiB    10.7 GB/s
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=int8]    323000 ns     3.2 MiB    10.3 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=f32 ]    542975 ns     2.5 MiB     4.8 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=int8]    577700 ns     2.5 MiB     4.5 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=f32 ]    368125 ns     1.7 MiB     4.8 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=int8]    139750 ns     1.7 MiB    12.7 GB/s
+    Q3_K         REFUSED: no encoder or unknown geometry
+    threads=1   T3 fold9     68225 ns   Q4_K(int8)    140575 ns   ternary is 2.06x
+    threads=2   T3 fold9     34450 ns   Q4_K(int8)     75725 ns   ternary is 2.20x
+    threads=4   T3 fold9     20150 ns   Q4_K(int8)     44675 ns   ternary is 2.22x
+
+## q_proj  [2048 x 1024]
+  T0 int8        round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T0 int8        neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T0 int8       8.125 bpw  scalar     52925 ns   NEON     47650 ns     2.0 MiB    44.7 GB/s
+  T1 2-bit       round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T1 2-bit       neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T1 2-bit      2.125 bpw  scalar   1095225 ns   NEON     43300 ns     0.5 MiB    12.9 GB/s
+  T2 base-3      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    T2 base-3     1.750 bpw  scalar   1740275 ns
+  T3 fold9 K=2   round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 fold9 K=2   neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 fold9 K=2  4.125 bpw  scalar    786975 ns   NEON     43000 ns     1.0 MiB    25.1 GB/s
+  T3 K=3         round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 K=3         neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 K=3        6.125 bpw  scalar   2238875 ns   NEON     71225 ns     1.5 MiB    22.5 GB/s
+  mask+sign      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    mask+sign     2.125 bpw  scalar   6309225 ns
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=f32 ]    189700 ns     2.1 MiB    11.7 GB/s
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=int8]    194875 ns     2.1 MiB    11.4 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=f32 ]    328950 ns     1.6 MiB     5.2 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=int8]    329375 ns     1.6 MiB     5.2 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=f32 ]    227450 ns     1.1 MiB     5.2 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=int8]     89600 ns     1.1 MiB    13.2 GB/s
+    Q3_K         REFUSED: no encoder or unknown geometry
+    threads=1   T3 fold9     41150 ns   Q4_K(int8)     89850 ns   ternary is 2.18x
+    threads=2   T3 fold9     23200 ns   Q4_K(int8)     48850 ns   ternary is 2.11x
+    threads=4   T3 fold9     19975 ns   Q4_K(int8)     40375 ns   ternary is 2.02x
+
+## o_proj  [1024 x 2048]
+  T0 int8        round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T0 int8        neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T0 int8       8.125 bpw  scalar     46450 ns   NEON     43275 ns     2.0 MiB    49.2 GB/s
+  T1 2-bit       round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T1 2-bit       neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T1 2-bit      2.125 bpw  scalar   1000800 ns   NEON     39425 ns     0.5 MiB    14.1 GB/s
+  T2 base-3      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    T2 base-3     1.750 bpw  scalar   1572950 ns
+  T3 fold9 K=2   round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 fold9 K=2   neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 fold9 K=2  4.125 bpw  scalar    711950 ns   NEON     38300 ns     1.0 MiB    28.2 GB/s
+  T3 K=3         round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 K=3         neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 K=3        6.125 bpw  scalar   2071400 ns   NEON     69125 ns     1.5 MiB    23.2 GB/s
+  mask+sign      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    mask+sign     2.125 bpw  scalar   6201900 ns
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=f32 ]    191175 ns     2.1 MiB    11.7 GB/s
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=int8]    192025 ns     2.1 MiB    11.6 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=f32 ]    331675 ns     1.6 MiB     5.2 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=int8]    325225 ns     1.6 MiB     5.3 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=f32 ]    227200 ns     1.1 MiB     5.2 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=int8]     87375 ns     1.1 MiB    13.5 GB/s
+    Q3_K         REFUSED: no encoder or unknown geometry
+    threads=1   T3 fold9     39300 ns   Q4_K(int8)     89500 ns   ternary is 2.28x
+    threads=2   T3 fold9     22050 ns   Q4_K(int8)     47050 ns   ternary is 2.13x
+    threads=4   T3 fold9     19650 ns   Q4_K(int8)     40775 ns   ternary is 2.08x
+
+## k/v_proj  [1024 x 1024]
+  T0 int8        round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T0 int8        neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T0 int8       8.125 bpw  scalar     24400 ns   NEON     22625 ns     1.0 MiB    47.1 GB/s
+  T1 2-bit       round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T1 2-bit       neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T1 2-bit      2.125 bpw  scalar    500825 ns   NEON     20975 ns     0.3 MiB    13.3 GB/s
+  T2 base-3      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    T2 base-3     1.750 bpw  scalar    779800 ns
+  T3 fold9 K=2   round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 fold9 K=2   neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 fold9 K=2  4.125 bpw  scalar    361375 ns   NEON     19525 ns     0.5 MiB    27.7 GB/s
+  T3 K=3         round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 K=3         neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 K=3        6.125 bpw  scalar   1038000 ns   NEON     33850 ns     0.8 MiB    23.7 GB/s
+  mask+sign      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    mask+sign     2.125 bpw  scalar   3048175 ns
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=f32 ]     94725 ns     1.1 MiB    11.8 GB/s
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=int8]    102950 ns     1.1 MiB    10.8 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=f32 ]    163000 ns     0.8 MiB     5.3 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=int8]    168700 ns     0.8 MiB     5.1 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=f32 ]    113400 ns     0.6 MiB     5.2 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=int8]     43975 ns     0.6 MiB    13.4 GB/s
+    Q3_K         REFUSED: no encoder or unknown geometry
+    threads=1   T3 fold9     21675 ns   Q4_K(int8)     44175 ns   ternary is 2.04x
+    threads=2   T3 fold9     11900 ns   Q4_K(int8)     24200 ns   ternary is 2.03x
+    threads=4   T3 fold9     12425 ns   Q4_K(int8)     20750 ns   ternary is 1.67x
+
+## lm_head  [151936 x 1024]
+  T0 int8        round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T0 int8        neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T0 int8       8.125 bpw  scalar   3750325 ns   NEON   3379250 ns   150.7 MiB    46.8 GB/s
+  T1 2-bit       round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T1 2-bit       neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T1 2-bit      2.125 bpw  scalar  74123500 ns   NEON   3017650 ns    39.4 MiB    13.7 GB/s
+  T2 base-3      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    T2 base-3     1.750 bpw  scalar 116593800 ns
+  T3 fold9 K=2   round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 fold9 K=2   neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 fold9 K=2  4.125 bpw  scalar  54045950 ns   NEON   3054750 ns    76.5 MiB    26.3 GB/s
+  T3 K=3         round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 K=3         neon vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 K=3        6.125 bpw  scalar 157653850 ns   NEON   5128950 ns   113.6 MiB    23.2 GB/s
+  mask+sign      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    mask+sign     2.125 bpw  scalar 458053125 ns
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=f32 ]  14535250 ns   157.6 MiB    11.4 GB/s
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=int8]  14419000 ns   157.6 MiB    11.5 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=f32 ]  25875050 ns   121.7 MiB     4.9 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=int8]  24541975 ns   121.7 MiB     5.2 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=f32 ]  17456475 ns    83.5 MiB     5.0 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=int8]   6619700 ns    83.5 MiB    13.2 GB/s
+    Q3_K         REFUSED: no encoder or unknown geometry
+    threads=1   T3 fold9   3213200 ns   Q4_K(int8)   6604525 ns   ternary is 2.06x
+    threads=2   T3 fold9   1589225 ns   Q4_K(int8)   3373400 ns   ternary is 2.12x
+    threads=4   T3 fold9   1517575 ns   Q4_K(int8)   1817950 ns   ternary is 1.20x
+

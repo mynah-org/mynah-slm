@@ -90,6 +90,12 @@ instrumentation, M3 CLI polish, M5b quantization & footprint, M6 release.
 - [x] **R1-P** — reading PTQTP properly: what "2 x 1.58-bit" physically is, and
       what the authors' released Qwen3-0.6B artifact actually contains
       → [`.work/ptqtp-paper-reading.md`](.work/ptqtp-paper-reading.md)
+- [x] **R1-K** — Tied Trit-Planes read as a kernel paper; the fucina format spec
+      and its Qwen3 measurements → [`.work/tied-trit-cpu-kernel-reading.md`](.work/tied-trit-cpu-kernel-reading.md)
+- [~] **R1-M** — ternary GEMV microbench on Apple Silicon. **PROMISING**: 2.0-2.3x
+      faster than the production Q4_K int8 kernel at 4.125 bpw vs 4.5, on every
+      projection shape, 1/2/4 threads. Gate B still UNDECIDED — no i8mm here
+      → [`.work/r1-ternary-mac-kernel.md`](.work/r1-ternary-mac-kernel.md)
 - [ ] **R2** — the tied `lm_head`, `151936 x 1024`, is **42% of a decode step**
       and 32.7% of decode bytes. Fell out of R1; needs its own note before it is
       picked up

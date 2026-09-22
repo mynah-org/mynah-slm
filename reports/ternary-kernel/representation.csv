@@ -1,0 +1,12 @@
+format,description,payload_bpw,scale_bpw,pad_bpw,total_bpw,passes,note
+T0 int8,oracle,8.0,0.125,0.0,8.125,1,not a storage candidate
+T1 2-bit,"one plane, 4 trits/byte",2.0,0.125,0.0,2.125,1,3 shifts+4 ands per 64 w
+T2 base-3,"5 trits/byte, per-group padded",1.625,0.125,0.025,1.75,1,256/5=51.2 -> 52 B pad; no SIMD path
+T3 fold9 K=2,"c=3t1+t2 in [-4,4]",4.0,0.125,0.0,4.125,1,1 shift+2 ands per 32 w
+T3 K=3,c=9h+l; 2-bit plane + nibble,6.0,0.125,0.0,6.125,2,"ours: 2 passes, not fucina's 3"
+mask+sign,nonzero + sign bitplanes,2.0,0.125,0.0,2.125,1,rejected: 17.98% measured sparsity
+Q4_K,"ggml, production baseline",4.5,0.0,0.0,4.5,1,mynah kernel
+Q6_K,ggml,6.5625,0.0,0.0,6.5625,1,ingot kernel
+Q8_0,ggml,8.5,0.0,0.0,8.5,1,ingot kernel
+Q3_K,ggml,3.4375,0.0,0.0,3.4375,1,NOT BENCHMARKED: ingot has no encoder
+tq2_0_fx4,"fucina fold, 520B/4x256",4.0,0.0625,0.0,4.0625,1,[PAPER] arXiv 2608.08910

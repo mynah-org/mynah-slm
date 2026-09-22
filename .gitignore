@@ -69,3 +69,6 @@ package-lock.json
 
 # Reference PDFs and papers: stay local
 *.pdf
+
+# Kernel microbench binary (bench/ternary_gemv/ sources are tracked)
+bench/ternary_gemv/ternary_gemv

@@ -1,0 +1,133 @@
+shape,rows,cols,kernel,bpw,ns_per_gemv,weight_MiB,GB_s
+gate/up_proj,3072,1024,T0 int8-scalar,8.1250,140100,3.05,22.80
+gate/up_proj,3072,1024,T0 int8-neon,8.1250,118000,3.05,27.08
+gate/up_proj,3072,1024,T1 2-bit-scalar,2.1250,1764650,0.80,0.47
+gate/up_proj,3072,1024,T1 2-bit-neon,2.1250,59700,0.80,14.00
+gate/up_proj,3072,1024,T2 base-3-scalar,1.7500,2351350,0.66,0.29
+gate/up_proj,3072,1024,T3 fold9 K=2-scalar,4.1250,1091600,1.55,1.49
+gate/up_proj,3072,1024,T3 fold9 K=2-neon,4.1250,61025,1.55,26.58
+gate/up_proj,3072,1024,T3 K=3-scalar,6.1250,3110975,2.30,0.77
+gate/up_proj,3072,1024,T3 K=3-neon,6.1250,100150,2.30,24.05
+gate/up_proj,3072,1024,mask+sign-scalar,2.1250,9165450,0.80,0.09
+gate/up_proj,3072,1024,Q8_0-ingot-simd-actf32,8.5000,287775,3.19,11.61
+gate/up_proj,3072,1024,Q8_0-ingot-simd-actint8,8.5000,289675,3.19,11.54
+gate/up_proj,3072,1024,Q6_K-ingot-simd-actf32,6.5625,494725,2.46,5.22
+gate/up_proj,3072,1024,Q6_K-ingot-simd-actint8,6.5625,493200,2.46,5.23
+gate/up_proj,3072,1024,Q4_K-mynah-actf32,4.5000,339875,1.69,5.21
+gate/up_proj,3072,1024,Q4_K-mynah-actint8,4.5000,132225,1.69,13.38
+gate/up_proj,3072,1024,threads1-fold9,4.1250,60300,0,0
+gate/up_proj,3072,1024,threads1-Q4_K,4.5000,132250,0,0
+gate/up_proj,3072,1024,threads2-fold9,4.1250,31600,0,0
+gate/up_proj,3072,1024,threads2-Q4_K,4.5000,68225,0,0
+gate/up_proj,3072,1024,threads4-fold9,4.1250,17725,0,0
+gate/up_proj,3072,1024,threads4-Q4_K,4.5000,36400,0,0
+down_proj,1024,3072,T0 int8-scalar,8.1250,69500,3.05,45.97
+down_proj,1024,3072,T0 int8-neon,8.1250,65375,3.05,48.87
+down_proj,1024,3072,T1 2-bit-scalar,2.1250,1486800,0.80,0.56
+down_proj,1024,3072,T1 2-bit-neon,2.1250,56550,0.80,14.78
+down_proj,1024,3072,T2 base-3-scalar,1.7500,2340175,0.66,0.29
+down_proj,1024,3072,T3 fold9 K=2-scalar,4.1250,1079600,1.55,1.50
+down_proj,1024,3072,T3 fold9 K=2-neon,4.1250,58425,1.55,27.76
+down_proj,1024,3072,T3 K=3-scalar,6.1250,3119600,2.30,0.77
+down_proj,1024,3072,T3 K=3-neon,6.1250,103275,2.30,23.32
+down_proj,1024,3072,mask+sign-scalar,2.1250,9599000,0.80,0.09
+down_proj,1024,3072,Q8_0-ingot-simd-actf32,8.5000,313675,3.19,10.66
+down_proj,1024,3072,Q8_0-ingot-simd-actint8,8.5000,323000,3.19,10.35
+down_proj,1024,3072,Q6_K-ingot-simd-actf32,6.5625,542975,2.46,4.75
+down_proj,1024,3072,Q6_K-ingot-simd-actint8,6.5625,577700,2.46,4.47
+down_proj,1024,3072,Q4_K-mynah-actf32,4.5000,368125,1.69,4.81
+down_proj,1024,3072,Q4_K-mynah-actint8,4.5000,139750,1.69,12.66
+down_proj,1024,3072,threads1-fold9,4.1250,68225,0,0
+down_proj,1024,3072,threads1-Q4_K,4.5000,140575,0,0
+down_proj,1024,3072,threads2-fold9,4.1250,34450,0,0
+down_proj,1024,3072,threads2-Q4_K,4.5000,75725,0,0
+down_proj,1024,3072,threads4-fold9,4.1250,20150,0,0
+down_proj,1024,3072,threads4-Q4_K,4.5000,44675,0,0
+q_proj,2048,1024,T0 int8-scalar,8.1250,52925,2.03,40.24
+q_proj,2048,1024,T0 int8-neon,8.1250,47650,2.03,44.70
+q_proj,2048,1024,T1 2-bit-scalar,2.1250,1095225,0.53,0.51
+q_proj,2048,1024,T1 2-bit-neon,2.1250,43300,0.53,12.87
+q_proj,2048,1024,T2 base-3-scalar,1.7500,1740275,0.44,0.26
+q_proj,2048,1024,T3 fold9 K=2-scalar,4.1250,786975,1.03,1.37
+q_proj,2048,1024,T3 fold9 K=2-neon,4.1250,43000,1.03,25.15
+q_proj,2048,1024,T3 K=3-scalar,6.1250,2238875,1.53,0.72
+q_proj,2048,1024,T3 K=3-neon,6.1250,71225,1.53,22.54
+q_proj,2048,1024,mask+sign-scalar,2.1250,6309225,0.53,0.09
+q_proj,2048,1024,Q8_0-ingot-simd-actf32,8.5000,189700,2.12,11.75
+q_proj,2048,1024,Q8_0-ingot-simd-actint8,8.5000,194875,2.12,11.43
+q_proj,2048,1024,Q6_K-ingot-simd-actf32,6.5625,328950,1.64,5.23
+q_proj,2048,1024,Q6_K-ingot-simd-actint8,6.5625,329375,1.64,5.22
+q_proj,2048,1024,Q4_K-mynah-actf32,4.5000,227450,1.12,5.19
+q_proj,2048,1024,Q4_K-mynah-actint8,4.5000,89600,1.12,13.17
+q_proj,2048,1024,threads1-fold9,4.1250,41150,0,0
+q_proj,2048,1024,threads1-Q4_K,4.5000,89850,0,0
+q_proj,2048,1024,threads2-fold9,4.1250,23200,0,0
+q_proj,2048,1024,threads2-Q4_K,4.5000,48850,0,0
+q_proj,2048,1024,threads4-fold9,4.1250,19975,0,0
+q_proj,2048,1024,threads4-Q4_K,4.5000,40375,0,0
+o_proj,1024,2048,T0 int8-scalar,8.1250,46450,2.03,45.85
+o_proj,1024,2048,T0 int8-neon,8.1250,43275,2.03,49.22
+o_proj,1024,2048,T1 2-bit-scalar,2.1250,1000800,0.53,0.56
+o_proj,1024,2048,T1 2-bit-neon,2.1250,39425,0.53,14.13
+o_proj,1024,2048,T2 base-3-scalar,1.7500,1572950,0.44,0.29
+o_proj,1024,2048,T3 fold9 K=2-scalar,4.1250,711950,1.03,1.52
+o_proj,1024,2048,T3 fold9 K=2-neon,4.1250,38300,1.03,28.23
+o_proj,1024,2048,T3 K=3-scalar,6.1250,2071400,1.53,0.78
+o_proj,1024,2048,T3 K=3-neon,6.1250,69125,1.53,23.23
+o_proj,1024,2048,mask+sign-scalar,2.1250,6201900,0.53,0.09
+o_proj,1024,2048,Q8_0-ingot-simd-actf32,8.5000,191175,2.12,11.66
+o_proj,1024,2048,Q8_0-ingot-simd-actint8,8.5000,192025,2.12,11.60
+o_proj,1024,2048,Q6_K-ingot-simd-actf32,6.5625,331675,1.64,5.19
+o_proj,1024,2048,Q6_K-ingot-simd-actint8,6.5625,325225,1.64,5.29
+o_proj,1024,2048,Q4_K-mynah-actf32,4.5000,227200,1.12,5.19
+o_proj,1024,2048,Q4_K-mynah-actint8,4.5000,87375,1.12,13.50
+o_proj,1024,2048,threads1-fold9,4.1250,39300,0,0
+o_proj,1024,2048,threads1-Q4_K,4.5000,89500,0,0
+o_proj,1024,2048,threads2-fold9,4.1250,22050,0,0
+o_proj,1024,2048,threads2-Q4_K,4.5000,47050,0,0
+o_proj,1024,2048,threads4-fold9,4.1250,19650,0,0
+o_proj,1024,2048,threads4-Q4_K,4.5000,40775,0,0
+k/v_proj,1024,1024,T0 int8-scalar,8.1250,24400,1.02,43.65
+k/v_proj,1024,1024,T0 int8-neon,8.1250,22625,1.02,47.07
+k/v_proj,1024,1024,T1 2-bit-scalar,2.1250,500825,0.27,0.56
+k/v_proj,1024,1024,T1 2-bit-neon,2.1250,20975,0.27,13.28
+k/v_proj,1024,1024,T2 base-3-scalar,1.7500,779800,0.22,0.29
+k/v_proj,1024,1024,T3 fold9 K=2-scalar,4.1250,361375,0.52,1.50
+k/v_proj,1024,1024,T3 fold9 K=2-neon,4.1250,19525,0.52,27.69
+k/v_proj,1024,1024,T3 K=3-scalar,6.1250,1038000,0.77,0.77
+k/v_proj,1024,1024,T3 K=3-neon,6.1250,33850,0.77,23.72
+k/v_proj,1024,1024,mask+sign-scalar,2.1250,3048175,0.27,0.09
+k/v_proj,1024,1024,Q8_0-ingot-simd-actf32,8.5000,94725,1.06,11.76
+k/v_proj,1024,1024,Q8_0-ingot-simd-actint8,8.5000,102950,1.06,10.82
+k/v_proj,1024,1024,Q6_K-ingot-simd-actf32,6.5625,163000,0.82,5.28
+k/v_proj,1024,1024,Q6_K-ingot-simd-actint8,6.5625,168700,0.82,5.10
+k/v_proj,1024,1024,Q4_K-mynah-actf32,4.5000,113400,0.56,5.20
+k/v_proj,1024,1024,Q4_K-mynah-actint8,4.5000,43975,0.56,13.41
+k/v_proj,1024,1024,threads1-fold9,4.1250,21675,0,0
+k/v_proj,1024,1024,threads1-Q4_K,4.5000,44175,0,0
+k/v_proj,1024,1024,threads2-fold9,4.1250,11900,0,0
+k/v_proj,1024,1024,threads2-Q4_K,4.5000,24200,0,0
+k/v_proj,1024,1024,threads4-fold9,4.1250,12425,0,0
+k/v_proj,1024,1024,threads4-Q4_K,4.5000,20750,0,0
+lm_head,151936,1024,T0 int8-scalar,8.1250,3750325,150.69,42.13
+lm_head,151936,1024,T0 int8-neon,8.1250,3379250,150.69,46.76
+lm_head,151936,1024,T1 2-bit-scalar,2.1250,74123500,39.41,0.56
+lm_head,151936,1024,T1 2-bit-neon,2.1250,3017650,39.41,13.69
+lm_head,151936,1024,T2 base-3-scalar,1.7500,116593800,32.46,0.29
+lm_head,151936,1024,T3 fold9 K=2-scalar,4.1250,54045950,76.51,1.48
+lm_head,151936,1024,T3 fold9 K=2-neon,4.1250,3054750,76.51,26.26
+lm_head,151936,1024,T3 K=3-scalar,6.1250,157653850,113.60,0.76
+lm_head,151936,1024,T3 K=3-neon,6.1250,5128950,113.60,23.22
+lm_head,151936,1024,mask+sign-scalar,2.1250,458053125,39.41,0.09
+lm_head,151936,1024,Q8_0-ingot-simd-actf32,8.5000,14535250,157.65,11.37
+lm_head,151936,1024,Q8_0-ingot-simd-actint8,8.5000,14419000,157.65,11.46
+lm_head,151936,1024,Q6_K-ingot-simd-actf32,6.5625,25875050,121.71,4.93
+lm_head,151936,1024,Q6_K-ingot-simd-actint8,6.5625,24541975,121.71,5.20
+lm_head,151936,1024,Q4_K-mynah-actf32,4.5000,17456475,83.46,5.01
+lm_head,151936,1024,Q4_K-mynah-actint8,4.5000,6619700,83.46,13.22
+lm_head,151936,1024,threads1-fold9,4.1250,3213200,0,0
+lm_head,151936,1024,threads1-Q4_K,4.5000,6604525,0,0
+lm_head,151936,1024,threads2-fold9,4.1250,1589225,0,0
+lm_head,151936,1024,threads2-Q4_K,4.5000,3373400,0,0
+lm_head,151936,1024,threads4-fold9,4.1250,1517575,0,0
+lm_head,151936,1024,threads4-Q4_K,4.5000,1817950,0,0

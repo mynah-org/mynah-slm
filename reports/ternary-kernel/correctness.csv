@@ -1,0 +1,61 @@
+shape,format,max_abs,mean_abs,rel_l2
+gate/up_proj,T0 int8-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+gate/up_proj,T0 int8,0.000000e+00,0.000000e+00,0.000000e+00
+gate/up_proj,T1 2-bit-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+gate/up_proj,T1 2-bit,0.000000e+00,0.000000e+00,0.000000e+00
+gate/up_proj,T2 base-3-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+gate/up_proj,T3 fold9 K=2-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+gate/up_proj,T3 fold9 K=2,0.000000e+00,0.000000e+00,0.000000e+00
+gate/up_proj,T3 K=3-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+gate/up_proj,T3 K=3,0.000000e+00,0.000000e+00,0.000000e+00
+gate/up_proj,mask+sign-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+down_proj,T0 int8-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+down_proj,T0 int8,0.000000e+00,0.000000e+00,0.000000e+00
+down_proj,T1 2-bit-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+down_proj,T1 2-bit,0.000000e+00,0.000000e+00,0.000000e+00
+down_proj,T2 base-3-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+down_proj,T3 fold9 K=2-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+down_proj,T3 fold9 K=2,0.000000e+00,0.000000e+00,0.000000e+00
+down_proj,T3 K=3-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+down_proj,T3 K=3,0.000000e+00,0.000000e+00,0.000000e+00
+down_proj,mask+sign-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+q_proj,T0 int8-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+q_proj,T0 int8,0.000000e+00,0.000000e+00,0.000000e+00
+q_proj,T1 2-bit-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+q_proj,T1 2-bit,0.000000e+00,0.000000e+00,0.000000e+00
+q_proj,T2 base-3-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+q_proj,T3 fold9 K=2-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+q_proj,T3 fold9 K=2,0.000000e+00,0.000000e+00,0.000000e+00
+q_proj,T3 K=3-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+q_proj,T3 K=3,0.000000e+00,0.000000e+00,0.000000e+00
+q_proj,mask+sign-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+o_proj,T0 int8-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+o_proj,T0 int8,0.000000e+00,0.000000e+00,0.000000e+00
+o_proj,T1 2-bit-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+o_proj,T1 2-bit,0.000000e+00,0.000000e+00,0.000000e+00
+o_proj,T2 base-3-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+o_proj,T3 fold9 K=2-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+o_proj,T3 fold9 K=2,0.000000e+00,0.000000e+00,0.000000e+00
+o_proj,T3 K=3-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+o_proj,T3 K=3,0.000000e+00,0.000000e+00,0.000000e+00
+o_proj,mask+sign-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+k/v_proj,T0 int8-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+k/v_proj,T0 int8,0.000000e+00,0.000000e+00,0.000000e+00
+k/v_proj,T1 2-bit-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+k/v_proj,T1 2-bit,0.000000e+00,0.000000e+00,0.000000e+00
+k/v_proj,T2 base-3-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+k/v_proj,T3 fold9 K=2-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+k/v_proj,T3 fold9 K=2,0.000000e+00,0.000000e+00,0.000000e+00
+k/v_proj,T3 K=3-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+k/v_proj,T3 K=3,0.000000e+00,0.000000e+00,0.000000e+00
+k/v_proj,mask+sign-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+lm_head,T0 int8-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+lm_head,T0 int8,0.000000e+00,0.000000e+00,0.000000e+00
+lm_head,T1 2-bit-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+lm_head,T1 2-bit,0.000000e+00,0.000000e+00,0.000000e+00
+lm_head,T2 base-3-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+lm_head,T3 fold9 K=2-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+lm_head,T3 fold9 K=2,0.000000e+00,0.000000e+00,0.000000e+00
+lm_head,T3 K=3-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
+lm_head,T3 K=3,0.000000e+00,0.000000e+00,0.000000e+00
+lm_head,mask+sign-roundtrip,0.000000e+00,0.000000e+00,0.000000e+00
