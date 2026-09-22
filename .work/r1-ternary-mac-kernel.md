@@ -22,9 +22,18 @@ win on Neoverse V2 or AVX-512 VNNI?"*
 | `FEAT_BF16` | 0 |
 
 `[PAPER]` fucina names **`i8mm`/`smmla` as the fix** for ARM's per-instruction
-density gap against `vpdpbusd`. **This machine does not have it.** So the Mac is
-close to the *worst* ARM case for the format, and a good result here is a strong
-signal while a bad one would have been weak evidence.
+density gap against `vpdpbusd`.
+
+Stated at the strength the evidence supports, and no further:
+
+- `[MEASURED]` This M1 **has `FEAT_DotProd` and lacks `FEAT_I8MM`**.
+- `[HYPOTHESIS]` A Neoverse-V2 implementation using `i8mm`/`smmla` **may** improve
+  the ternary result relative to this M1 path. **Axion is the test of that
+  hypothesis, and nothing here is evidence for or against it.**
+
+The earlier wording — *"the Mac is close to the worst ARM case"* — is **withdrawn**.
+It ranked unmeasured machines from a single measured one. A missing feature bit is
+a fact; a position in an ordering of implementations we have never run is not.
 
 ---
 
@@ -104,7 +113,7 @@ win — `Q4_K` is 340 µs on f32 activations and **139 µs on int8**.
 | Q4_K, mynah, act=f32 | 4.5 | 356,867 | 1.7 | 0.39× |
 | Q8_0, ingot-simd | 8.5 | 288,500 | 3.2 | 0.48× |
 | Q6_K, ingot-simd | 6.5625 | 501,933 | 2.5 | 0.28× |
-| Q3_K | — | **REFUSED** | — | ingot has no encoder |
+| Q3_K | — | **REFUSED** | — | ingot has no encoder — measured later off a real GGUF: **462,750 ns**, 3.4x slower than Q4_K |
 
 ### Thread scaling, T3 fold9 against Q4_K(int8)
 
@@ -121,18 +130,31 @@ win — `Q4_K` is 340 µs on f32 activations and **139 µs on int8**.
 That independently reproduces fucina's *"per plane the TQ2_0 kernel is ~2.1×
 Q4_K on ARM"* — different engine, different language, different author.
 
-### The `lm_head` 4-thread cell is the most informative number here
+### The `lm_head` 4-thread cell — read the correction below before using it
+
+> **Scope warning.** Everything in this subsection compares ternary against a
+> **synthetic `Q4_K` lm_head**. `[MEASURED]` **No shipped GGUF has one**: both
+> `q-Q3_K_M.gguf` and `q-Q4_K_M.gguf` store `output.weight` as **`Q6_K`**. See
+> *"Thread scaling and the `lm_head` correction"* below.
 
 `[DERIVED]` 151936 × 1024 at 4.125 bpw is **76.6 MiB**, far beyond any cache. At
 4 threads: ternary 1.518 ms for 80.3 MB = **53 GB/s**; Q4_K 1.818 ms for 85.7 MB
 = **47 GB/s**. **Both have hit the M1's memory wall**, and the advantage collapses
 from 2.1× to **1.20×** — which is close to the pure byte ratio 4.5/4.125 = 1.09×.
 
-**So ternary's ~2.1× is an arithmetic/unpack advantage, not a bandwidth one, and
-it exists only while the operand fits cache.** That fits the repo's own earlier
-finding that Qwen3-0.6B decode on this machine is ALU-bound: the ALU-bound regime
-is exactly where this format wins, and the one DRAM-bound tensor is exactly where
-it stops winning.
+**Stated at the strength of the evidence:** on the measured **cache-resident
+projection GEMVs**, the observed advantage is dominated by
+**representation/unpack/kernel efficiency rather than raw weight bandwidth**. On
+the large `lm_head` both paths approach the **memory-bandwidth regime** and the
+advantage **falls substantially**, towards the byte ratio.
+
+`[HYPOTHESIS]` that this is a general cache-residency threshold rather than a
+property of these two particular kernels at these two particular sizes. One shape
+crossing one boundary on one machine does not locate that boundary.
+
+It is at least *consistent* with the repo's earlier finding that Qwen3-0.6B decode
+on this machine is ALU-bound — but consistency is not confirmation, and no third
+measurement was made to separate the two explanations.
 
 ### Overheads that were excluded, and their size
 
@@ -213,7 +235,160 @@ which is the single most useful thing this bench produced.
 - `[UNKNOWN]` **Neoverse V2 / AVX-512 VNNI.** `[PAPER]` predicts x86-VNNI is
   *better* for this format (4.8× per plane) and that `i8mm` would lift ARM. This
   M1 has neither. **Gate B stays UNDECIDED.**
-- `[MEASURED, limitation]` **Q3_K could not be benchmarked**: ingot has no Q3_K
-  encoder, so the format that won Gate A on quality/size is missing from the
-  execution table. Measuring it needs a real Q3_K tensor from a GGUF instead of a
-  synthesized one.
+- ~~`[MEASURED, limitation]` **Q3_K could not be benchmarked**~~ — **closed**, see
+  the next section. A `--gguf` mode now multiplies straight off a real
+  checkpoint, and Q3_K is measured.
+
+---
+
+# The real-GGUF benchmark: Q3_K measured, and two earlier claims corrected
+
+`bench/ternary_gemv/ternary_gemv --gguf <file>` skips encoding entirely and
+multiplies off the bytes of a real quantized checkpoint through the same
+`mynah_slm_matvec` call the engine makes. That is the only way to reach Q3_K,
+which ingot **reads** but cannot **write**.
+
+Files: `models-local/q-Q3_K_M.gguf` and `models-local/q-Q4_K_M.gguf`, both
+produced here from the same BF16 Qwen3-0.6B with the same imatrix
+(`quantize.imatrix.chunks_count = 200`, WikiText-2 train). Machine: Apple M1,
+`FEAT_DotProd=1`, `FEAT_I8MM=0`. Raw output in
+`reports/ternary-kernel/gguf_q3km.txt`, `gguf_q4km.txt`,
+`gguf_q4km_repeat.txt`; rows in `gguf_bench.csv`.
+
+## First: a `_K_M` name is a recipe, and the recipe is not what we assumed
+
+`[MEASURED]` type census straight from the containers:
+
+| file | F32 | Q3_K | Q4_K | Q5_K | Q6_K |
+|---|---|---|---|---|---|
+| `q-Q3_K_M.gguf` | ×113, 0.2 MiB | **×113, 172.0 MiB** | ×81, 91.7 MiB | ×3, 3.4 MiB | **×1, 121.7 MiB** |
+| `q-Q4_K_M.gguf` | ×113, 0.2 MiB | — | ×169, 288.2 MiB | — | **×29, 167.7 MiB** |
+
+`[MEASURED]` per-tensor types at `blk.5`:
+
+| tensor | in Q3_K_M | in Q4_K_M |
+|---|---|---|
+| `ffn_gate` / `ffn_up` | Q3_K | Q4_K |
+| `attn_q` / `attn_k` | Q3_K | Q4_K |
+| `attn_output` | **Q4_K** | Q4_K |
+| `attn_v` | **Q4_K** | **Q6_K** |
+| `ffn_down` | **Q4_K** | **Q6_K** |
+| `token_embd` | Q3_K | Q4_K |
+| **`output` (lm_head)** | **Q6_K** | **Q6_K** |
+
+**Two consequences, and both invalidate a row of the synthetic table.**
+
+1. `[MEASURED]` **The `lm_head` is `Q6_K` in both files.** The synthetic bench
+   compared ternary against a *`Q4_K` lm_head*, which **no shipped file
+   contains**. Every `lm_head` conclusion drawn from that row describes a
+   configuration that does not exist.
+2. `[MEASURED]` **The tied embedding is stored twice, at two different rates.**
+   `token_embd` + `output` are **185.5 MiB of the 394.8 MiB Q3_K_M file (47.0%)**
+   and **205.1 MiB of the 461.8 MiB Q4_K_M file (44.4%)**. This is the GGUF
+   counterpart of the duplicate-tied-embedding finding already recorded for the
+   safetensors checkpoint — the same tensor, the same waste, a different
+   container.
+
+## Q3_K measured, and it is the slowest path we ship  `[MEASURED]`
+
+Single thread, real tensors, `ns` per full GEMV, and **effective GB/s over the
+tensor's own bytes** (the fair per-format bandwidth figure):
+
+| tensor | type | bpw | kernel | ns | **GB/s** |
+|---|---|---|---|---|---|
+| `ffn_gate` [3072×1024] | **Q3_K** | 3.4375 | ingot-simd | **462,750** | **2.9** |
+| `attn_q` [2048×1024] | **Q3_K** | 3.4375 | ingot-simd | **294,750** | **3.1** |
+| `attn_k` [1024×1024] | **Q3_K** | 3.4375 | ingot-simd | **147,025** | **3.1** |
+| `ffn_gate` [3072×1024] | Q4_K | 4.5 | mynah, int8 | 135,375 | 13.1 |
+| `attn_q` [2048×1024] | Q4_K | 4.5 | mynah, int8 | 87,975 | 13.4 |
+| `ffn_down` [1024×3072] | Q6_K | 6.5625 | ingot-simd | 506,000 | 5.1 |
+| `output` [151936×1024] | Q6_K | 6.5625 | ingot-simd | 24,302,550 | 5.3 |
+| — T3 fold9 K=2, same shapes | — | 4.125 | ours, NEON | — | **25–27** |
+| — T1 2-bit, same shapes | — | 2.125 | ours, NEON | — | **13–14** |
+
+`[MEASURED]` **Q3_K's production GEMV runs at 2.9–3.1 GB/s against Q4_K's
+13.1–13.4 — it is 3.4× slower per byte and, at 3.4375 bpw against 4.5,
+still ~3.4× slower per GEMV.** So on this machine the shape of the trade is
+**not** "Q3 = better quality, somewhat slower". It is *much* slower.
+
+### Why, and the part of it that is not the format's fault  `[MEASURED]`
+
+`[MEASURED]` `mynah_slm_matvec_have()` returns true for **`Q4_K` only**
+(`src/qmat.c:130`). Every other type falls through to `ingot_matvec`, which takes
+**f32 activations** — which is exactly what the two arms show: Q4_K goes
+356,400 → 135,375 ns when the int8 arm is switched on, while Q3_K moves
+513,675 → 462,750 ns and Q6_K does not move at all (506,000 → 516,375, inside
+the noise). **There is no int8-activation Q3_K kernel anywhere in our stack.**
+
+So the honest decomposition is:
+
+- `[MEASURED]` **The Q3_K path we ship today is 3.4× slower than the Q4_K path.**
+  That is a fact about the engine as it exists, and it is what a user would feel.
+- `[HYPOTHESIS]` **Some of that gap is an unoptimised kernel, not the format.**
+  Q4_K's advantage comes from *our* distribute-the-sum kernel with int8
+  activations and the cross-row `sum(x)` hoist; Q3_K has never had that treatment.
+  `[UNKNOWN]` how much of the 3.4× a Q3_K kernel written to the same standard
+  would recover. **Nothing here measures that**, and until it is measured, "Q3_K
+  is intrinsically slow" is not a claim this bench supports.
+- `[DERIVED]` Q3_K is also the hardest K-quant to decode — 3-bit payload split
+  across two planes plus 6-bit scales — so a same-standard kernel would be
+  expected to land *below* Q4_K's rate, not at it. That is a reason to expect a
+  residual gap, not a measurement of one.
+
+## Ternary against the types the files actually use  `[MEASURED]`
+
+T3 fold9 K=2, NEON, single thread, against the **real** tensor at the same shape:
+
+| tensor | shape | real type | ternary is |
+|---|---|---|---|
+| `ffn_gate` | 3072×1024 | Q3_K | **7.79×** |
+| `attn_q` | 2048×1024 | Q3_K | **7.30×** |
+| `attn_k` | 1024×1024 | Q3_K | **7.26×** |
+| `ffn_gate` | 3072×1024 | Q4_K | **2.10×** |
+| `ffn_down` | 1024×3072 | Q4_K | 2.21× |
+| `attn_output` | 1024×2048 | Q4_K | 2.20× |
+| `ffn_down` | 1024×3072 | Q6_K | **7.97×** |
+| `attn_v` | 1024×1024 | Q6_K | 7.88× |
+| **`output`** | **151936×1024** | **Q6_K** | **7.63×** |
+
+## Thread scaling and the `lm_head` correction  `[MEASURED]`
+
+Cleanest run (`gguf_q4km_repeat.txt`, repeat 1, 120 reps). **Effective GB/s, the
+number that says whether a path is bandwidth-bound:**
+
+| tensor | type | 1 thread | 2 threads | 4 threads |
+|---|---|---|---|---|
+| `ffn_gate` | Q4_K | 13.5 | 26.1 | 50.1 |
+| `ffn_gate` | T3 fold9 | 27.4 | 52.6 | **99.7** |
+| `ffn_down` | Q6_K | 5.1 | 10.3 | 18.5 |
+| `ffn_down` | T3 fold9 | 27.8 | 54.2 | **102.0** |
+| **`output`** | **Q6_K** | 5.2 | 9.8 | **16.6** |
+| **`output`** | **T3 fold9** | 25.8 | 50.5 | **53.2** |
+
+`[MEASURED]` **T3 fold9 saturates and Q6_K does not.** On the cache-resident
+tensors ternary scales to ~100 GB/s; on the 76.6 MiB `lm_head` it stops at
+**53.2 GB/s**, which is the M1's DRAM wall and is where its scaling curve breaks
+(25.8 → 50.5 → 53.2). `Q6_K` climbs to only **16.6 GB/s** on the same tensor —
+**it never reaches the wall at all**, because it is still compute-bound there.
+
+**Correction to the synthetic table.** It reported *"`lm_head` at 4 threads
+collapses to 1.20×, both paths are DRAM-bound"*. That is true **of ternary
+against a synthetic `Q4_K` lm_head**, and only of that. Against the `Q6_K`
+lm_head the files actually ship, ternary at 4 threads is **5.10×**
+(7,689,608 ns vs 1,508,883 ns), because only one of the two paths is
+bandwidth-bound. Scope both statements or neither:
+
+| `lm_head`, 4 threads | ratio | why |
+|---|---|---|
+| T3 fold9 vs **synthetic Q4_K** | **1.20×** | both saturate DRAM; ratio → byte ratio |
+| T3 fold9 vs **real Q6_K** | **5.10×** | ternary saturates, Q6_K is still compute-bound |
+
+### Measurement noise, stated  `[MEASURED]`
+
+Three runs of the same file. The **ratio** T3/real is stable — 2.0–2.3× against
+Q4_K and 7.7–9.0× against Q6_K on every shape at every thread count. The
+**absolute** 4-thread numbers are not: `ffn_gate` Q4_K came back as 35,342 /
+59,300 / 60,975 ns across the three. The M1 is **4 performance + 4 efficiency
+cores** and these threads carry no affinity, so at `nt=4` some land on E-cores.
+**The 1- and 2-thread columns are the reliable ones**; 4-thread absolutes are
+quoted only where the ratio is what matters.

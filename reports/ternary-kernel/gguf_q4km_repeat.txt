@@ -1,0 +1,58 @@
+### repeat 1
+## gate/up_proj blk.5.ffn_gate.weight    [3072 x 1024]  Q4_K   4.5000 bpw  1.7 MiB
+    threads=1  Q4_K       130733 ns ( 13.5 GB/s)   T3 fold9      59108 ns ( 27.4 GB/s)   ternary 2.21x
+    threads=2  Q4_K        67708 ns ( 26.1 GB/s)   T3 fold9      30808 ns ( 52.6 GB/s)   ternary 2.20x
+    threads=4  Q4_K        35342 ns ( 50.1 GB/s)   T3 fold9      16267 ns ( 99.7 GB/s)   ternary 2.17x
+## down_proj    blk.5.ffn_down.weight    [1024 x 3072]  Q6_K   6.5625 bpw  2.5 MiB
+    threads=1  Q6_K       502867 ns (  5.1 GB/s)   T3 fold9      58267 ns ( 27.8 GB/s)   ternary 8.63x
+    threads=2  Q6_K       250975 ns ( 10.3 GB/s)   T3 fold9      29942 ns ( 54.2 GB/s)   ternary 8.38x
+    threads=4  Q6_K       139675 ns ( 18.5 GB/s)   T3 fold9      15908 ns (102.0 GB/s)   ternary 8.78x
+## q_proj       blk.5.attn_q.weight      [2048 x 1024]  Q4_K   4.5000 bpw  1.1 MiB
+    threads=1  Q4_K        87233 ns ( 13.5 GB/s)   T3 fold9      39400 ns ( 27.4 GB/s)   ternary 2.21x
+    threads=2  Q4_K        45250 ns ( 26.1 GB/s)   T3 fold9      20842 ns ( 51.9 GB/s)   ternary 2.17x
+    threads=4  Q4_K        23775 ns ( 49.6 GB/s)   T3 fold9      11575 ns ( 93.4 GB/s)   ternary 2.05x
+## o_proj       blk.5.attn_output.weight [1024 x 2048]  Q4_K   4.5000 bpw  1.1 MiB
+    threads=1  Q4_K        87658 ns ( 13.5 GB/s)   T3 fold9      40792 ns ( 26.5 GB/s)   ternary 2.15x
+    threads=2  Q4_K        48433 ns ( 24.4 GB/s)   T3 fold9      20808 ns ( 52.0 GB/s)   ternary 2.33x
+    threads=4  Q4_K        31825 ns ( 37.1 GB/s)   T3 fold9      11000 ns ( 98.3 GB/s)   ternary 2.89x
+## k_proj       blk.5.attn_k.weight      [1024 x 1024]  Q4_K   4.5000 bpw  0.6 MiB
+    threads=1  Q4_K        43483 ns ( 13.6 GB/s)   T3 fold9      19867 ns ( 27.2 GB/s)   ternary 2.19x
+    threads=2  Q4_K        22658 ns ( 26.0 GB/s)   T3 fold9      10367 ns ( 52.2 GB/s)   ternary 2.19x
+    threads=4  Q4_K        12125 ns ( 48.6 GB/s)   T3 fold9       5850 ns ( 92.4 GB/s)   ternary 2.07x
+## v_proj       blk.5.attn_v.weight      [1024 x 1024]  Q6_K   6.5625 bpw  0.8 MiB
+    threads=1  Q6_K       162008 ns (  5.3 GB/s)   T3 fold9      19775 ns ( 27.3 GB/s)   ternary 8.19x
+    threads=2  Q6_K        83850 ns ( 10.3 GB/s)   T3 fold9      10883 ns ( 49.7 GB/s)   ternary 7.70x
+    threads=4  Q6_K        46842 ns ( 18.4 GB/s)   T3 fold9       5767 ns ( 93.8 GB/s)   ternary 8.12x
+## lm_head      output.weight            [151936 x 1024]  Q6_K   6.5625 bpw  121.7 MiB
+    threads=1  Q6_K     24669042 ns (  5.2 GB/s)   T3 fold9    3114017 ns ( 25.8 GB/s)   ternary 7.92x
+    threads=2  Q6_K     12961425 ns (  9.8 GB/s)   T3 fold9    1589217 ns ( 50.5 GB/s)   ternary 8.16x
+    threads=4  Q6_K      7689608 ns ( 16.6 GB/s)   T3 fold9    1508883 ns ( 53.2 GB/s)   ternary 5.10x
+### repeat 2
+## gate/up_proj blk.5.ffn_gate.weight    [3072 x 1024]  Q4_K   4.5000 bpw  1.7 MiB
+    threads=1  Q4_K       137425 ns ( 12.9 GB/s)   T3 fold9      60900 ns ( 26.6 GB/s)   ternary 2.26x
+    threads=2  Q4_K        91975 ns ( 19.2 GB/s)   T3 fold9      45633 ns ( 35.5 GB/s)   ternary 2.02x
+    threads=4  Q4_K        59300 ns ( 29.8 GB/s)   T3 fold9      28167 ns ( 57.6 GB/s)   ternary 2.11x
+## down_proj    blk.5.ffn_down.weight    [1024 x 3072]  Q6_K   6.5625 bpw  2.5 MiB
+    threads=1  Q6_K       538683 ns (  4.8 GB/s)   T3 fold9      60017 ns ( 27.0 GB/s)   ternary 8.98x
+    threads=2  Q6_K       252567 ns ( 10.2 GB/s)   T3 fold9      30125 ns ( 53.8 GB/s)   ternary 8.38x
+    threads=4  Q6_K       133758 ns ( 19.3 GB/s)   T3 fold9      16258 ns ( 99.8 GB/s)   ternary 8.23x
+## q_proj       blk.5.attn_q.weight      [2048 x 1024]  Q4_K   4.5000 bpw  1.1 MiB
+    threads=1  Q4_K        88792 ns ( 13.3 GB/s)   T3 fold9      40050 ns ( 27.0 GB/s)   ternary 2.22x
+    threads=2  Q4_K        44983 ns ( 26.2 GB/s)   T3 fold9      21083 ns ( 51.3 GB/s)   ternary 2.13x
+    threads=4  Q4_K        25750 ns ( 45.8 GB/s)   T3 fold9      11033 ns ( 98.0 GB/s)   ternary 2.33x
+## o_proj       blk.5.attn_output.weight [1024 x 2048]  Q4_K   4.5000 bpw  1.1 MiB
+    threads=1  Q4_K        88033 ns ( 13.4 GB/s)   T3 fold9      39458 ns ( 27.4 GB/s)   ternary 2.23x
+    threads=2  Q4_K        46567 ns ( 25.3 GB/s)   T3 fold9      20683 ns ( 52.3 GB/s)   ternary 2.25x
+    threads=4  Q4_K        23717 ns ( 49.7 GB/s)   T3 fold9      12750 ns ( 84.8 GB/s)   ternary 1.86x
+## k_proj       blk.5.attn_k.weight      [1024 x 1024]  Q4_K   4.5000 bpw  0.6 MiB
+    threads=1  Q4_K        44783 ns ( 13.2 GB/s)   T3 fold9      20408 ns ( 26.5 GB/s)   ternary 2.19x
+    threads=2  Q4_K        23542 ns ( 25.1 GB/s)   T3 fold9      10992 ns ( 49.2 GB/s)   ternary 2.14x
+    threads=4  Q4_K        20250 ns ( 29.1 GB/s)   T3 fold9       9675 ns ( 55.9 GB/s)   ternary 2.09x
+## v_proj       blk.5.attn_v.weight      [1024 x 1024]  Q6_K   6.5625 bpw  0.8 MiB
+    threads=1  Q6_K       164950 ns (  5.2 GB/s)   T3 fold9      20242 ns ( 26.7 GB/s)   ternary 8.15x
+    threads=2  Q6_K        84933 ns ( 10.1 GB/s)   T3 fold9      10783 ns ( 50.1 GB/s)   ternary 7.88x
+    threads=4  Q6_K        48250 ns ( 17.8 GB/s)   T3 fold9       7225 ns ( 74.8 GB/s)   ternary 6.68x
+## lm_head      output.weight            [151936 x 1024]  Q6_K   6.5625 bpw  121.7 MiB
+    threads=1  Q6_K     24658483 ns (  5.2 GB/s)   T3 fold9    3085908 ns ( 26.0 GB/s)   ternary 7.99x
+    threads=2  Q6_K     12702308 ns ( 10.0 GB/s)   T3 fold9    1903933 ns ( 42.1 GB/s)   ternary 6.67x
+    threads=4  Q6_K      6902125 ns ( 18.5 GB/s)   T3 fold9    1452442 ns ( 55.2 GB/s)   ternary 4.75x

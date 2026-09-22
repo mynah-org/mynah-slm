@@ -1,0 +1,25 @@
+=== Qwen/Qwen3-4B @ 1cfa9a720891   12:23:33
+/dev/disk3s5   228Gi   177Gi    22Gi    90%    2.8M  227M    1%   /System/Volumes/Data
+Fetching 13 files:   0%|          | 0/13 [00:00<?, ?it/s]Downloading 'model-00001-of-00003.safetensors' to 'models-local/Qwen_Qwen3-4B/.cache/huggingface/download/Y6g195DXbsCiN_Ka1NwH6jyLkvc=.328a91d3122359d5547f9d79521205bc0a46e1f79a792dfe650e99fc2d651223.incomplete'
+Downloading 'model-00002-of-00003.safetensors' to 'models-local/Qwen_Qwen3-4B/.cache/huggingface/download/D5-QTaCbl9VUFv9Wr0C28eFewRc=.6cd087b316306a68c562436b5492edbcf6e16c6dba3a1308279caa5a58e21ca5.incomplete'
+Downloading 'config.json' to 'models-local/Qwen_Qwen3-4B/.cache/huggingface/download/8_PA_wEVGiVa2goH2H4KQOQpvVY=.e49eccdc32f36da9c09cfa0e737084f9e0105e5e.incomplete'
+Downloading 'LICENSE' to 'models-local/Qwen_Qwen3-4B/.cache/huggingface/download/DhCjcNQuMpl4FL346qr3tvNUCgY=.6634c8cc3133b3848ec74b9f275acaaa1ea618ab.incomplete'
+Downloading 'generation_config.json' to 'models-local/Qwen_Qwen3-4B/.cache/huggingface/download/3EVKVggOldJcKSsGjSdoUCN1AyQ=.20a8a9156fc8c3f25295ca067f61fdf120d517c5.incomplete'
+Download complete. Moving file to models-local/Qwen_Qwen3-4B/config.json
+Downloading '.gitattributes' to 'models-local/Qwen_Qwen3-4B/.cache/huggingface/download/wPaCkH-WbT7GsmxMKKrNZTV4nSM=.52373fe24473b1aa44333d318f578ae6bf04b49b.incomplete'
+Downloading 'README.md' to 'models-local/Qwen_Qwen3-4B/.cache/huggingface/download/Xn7B-BWUGOee2Y6hCZtEhtFu4BE=.2de5ee7eee214bb55ea33ec7505c5838a7adf7f6.incomplete'
+Download complete. Moving file to models-local/Qwen_Qwen3-4B/LICENSE
+Downloading 'merges.txt' to 'models-local/Qwen_Qwen3-4B/.cache/huggingface/download/PtHk0z_I45atnj23IIRhTExwT3w=.31349551d90c7606f325fe0f11bbb8bd5fa0d7c7.incomplete'
+Download complete. Moving file to models-local/Qwen_Qwen3-4B/generation_config.json
+Download complete. Moving file to models-local/Qwen_Qwen3-4B/.gitattributes
+Download complete. Moving file to models-local/Qwen_Qwen3-4B/README.md
+Fetching 13 files:   8%|▊         | 1/13 [00:00<00:06,  1.90it/s]Downloading 'model-00003-of-00003.safetensors' to 'models-local/Qwen_Qwen3-4B/.cache/huggingface/download/NmVQgThqhsRkG2FlXLh-M51MilA=.e4bf436957184f4eeb86a80e9db394503f1f56446b2e6b7edeac5b81470f4ca1.incomplete'
+Downloading 'tokenizer.json' to 'models-local/Qwen_Qwen3-4B/.cache/huggingface/download/HgM_lKo9sdSCfRtVg7MMFS7EKqo=.aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4.incomplete'
+Downloading 'model.safetensors.index.json' to 'models-local/Qwen_Qwen3-4B/.cache/huggingface/download/yVzAsSxRSINSz-tQbpx-TLpfkLU=.95c0a0059df040d75dc6c396b174382cf61d2f91.incomplete'
+Downloading 'tokenizer_config.json' to 'models-local/Qwen_Qwen3-4B/.cache/huggingface/download/vzaExXFZNBay89bvlQv-ZcI6BTg=.417d038a63fa3de29cfde265caedae14d1a58d92.incomplete'
+Download complete. Moving file to models-local/Qwen_Qwen3-4B/model.safetensors.index.json
+Download complete. Moving file to models-local/Qwen_Qwen3-4B/merges.txt
+Downloading 'vocab.json' to 'models-local/Qwen_Qwen3-4B/.cache/huggingface/download/j3m-Hy6QvBddw8RXA1uSWl1AJ0c=.4783fe10ac3adce15ac8f358ef5462739852c569.incomplete'
+Fetching 13 files:  46%|████▌     | 6/13 [00:00<00:00,  7.75it/s]Download complete. Moving file to models-local/Qwen_Qwen3-4B/tokenizer_config.json
+Download complete. Moving file to models-local/Qwen_Qwen3-4B/vocab.json
+Download complete. Moving file to models-local/Qwen_Qwen3-4B/tokenizer.json

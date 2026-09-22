@@ -53,11 +53,16 @@ static inline float frand(void)
     rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
     return (float)((double)(rng >> 11) / 9007199254740992.0) * 2.0f - 1.0f;
 }
+float bench_frand(void);
+float bench_frand(void) { return frand(); }
+
+int gguf_bench(const char *path, int reps, FILE *csv);
 
 /* Deinterleave activations so sdot lanes line up with the packed code order.
  * Done ONCE per GEMV, amortised over every row -- which is why a kernel that
  * owns its activation layout beats one that takes whatever it is handed. */
-static void shuffle_stride(const int8_t *in, int8_t *out, size_t cols, int blk, int stride)
+void shuffle_stride(const int8_t *in, int8_t *out, size_t cols, int blk, int stride);
+void shuffle_stride(const int8_t *in, int8_t *out, size_t cols, int blk, int stride)
 {
     for (size_t b = 0; b < cols; b += (size_t)blk)
         for (int s = 0; s < stride; s++)
@@ -110,6 +115,20 @@ static double bench_threads(int nt, int reps, int kind, const void *W, size_t rb
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    /* --gguf <path> multiplies off a REAL quantized checkpoint instead of
+     * synthesizing weights, which is the only way to reach Q3_K: ingot reads
+     * it but has no encoder. */
+    if (argc > 2 && strcmp(argv[1], "--gguf") == 0) {
+        int greps = argc > 3 ? atoi(argv[3]) : 40;
+        FILE *gc = fopen("reports/ternary-kernel/gguf_bench.csv", "a");
+        if (gc && ftell(gc) == 0)
+            fprintf(gc, "shape,rows,cols,kernel,bpw,ns_per_gemv,weight_MiB,GB_s\n");
+        int rc = gguf_bench(argv[2], greps, gc);
+        if (gc) fclose(gc);
+        return rc;
+    }
+
     int reps = argc > 1 ? atoi(argv[1]) : 40;
     printf("# ternary GEMV microbench -- Apple M1, sdot yes / i8mm no, %d reps\n", reps);
     printf("# baselines are mynah_slm_matvec, the production kernels\n\n");

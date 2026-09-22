@@ -187,6 +187,8 @@ here.
    streams — with the caveat that **K=3's 27 levels do not fit a nibble**, so K=3
    needs 5 bits or a different packing. That tension is the interesting design
    space.
-4. **`i8mm`/`smmla` is the named ARM fix.** Apple Silicon M1 does **not** have
-   i8mm (ARMv8.4); M4 does. So this Mac is close to the worst ARM case for the
-   format, which makes a negative Mac result even less transferable than usual.
+4. **`i8mm`/`smmla` is the named ARM fix.** `[MEASURED]` Apple Silicon M1 has
+   `FEAT_DotProd` and does **not** have `FEAT_I8MM`. `[HYPOTHESIS]` a Neoverse-V2
+   `i8mm`/`smmla` path may improve the result relative to the M1 path — Axion
+   measures it. **No claim is made here about where the M1 sits in an ordering of
+   ARM implementations**; that ordering has not been measured.
