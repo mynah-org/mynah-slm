@@ -1704,18 +1704,42 @@ weights and the Mac harness peaked at 2x that until `device_map` was fixed.
 Same locked protocol: 146 non-overlapping 2048-token windows, WikiText-2-raw
 test, positions 1..L-1, 298,862 tokens scored.
 
-## The harness validates itself across two machines
+## The harness validates itself across two machines — corrected, then re-done properly
 
-`[MEASURED]` Qwen3-4B BF16, same protocol, everything else different:
+`[CORRECTED]` The first version of this section was **wrong about its own
+evidence**. It claimed the Mac 4B run used "torch 2.13, transformers 5.14", the
+stack that produced every other number here. It did not: `python3` was invoked
+bare instead of through `uv`, so that run used **python 3.10.0 / torch 2.7.1 /
+transformers 4.57.3**, and the box run used **3.12.3 / torch 2.14.0 / 5.17.0**.
+Neither was the canonical stack, so what was presented as "same protocol,
+different device" was in fact **three different software stacks**, and the 4B
+numbers were not demonstrably comparable with the 0.6B and 1.7B ones.
 
-| | ppl |
-|---|---|
-| Mac, **fp16 / MPS**, torch 2.13, transformers 5.14 | **13.6382** |
-| Box, **fp32 / CPU**, torch 2.14, transformers 5.17 | **13.6377** |
+`[MEASURED]` Re-done with the **declared** environment on both sides —
+python 3.13.2 / torch 2.13.0 / transformers 5.14.1 / accelerate 1.15.0, installed
+through `uv` from `tools/pyproject.toml`:
 
-**Agreement to 0.004%.** Different device, different dtype, different library
-versions. The protocol is not a property of the machine, so the 0.6B, 1.7B and
-4B numbers are comparable with each other.
+| model | machine | device | dtype | ppl |
+|---|---|---|---|---|
+| Qwen3-0.6B | Mac (locked baseline) | mps | fp16 | **20.9541** |
+| Qwen3-0.6B | **Box, canonical** | cpu | fp32 | **20.9538** |
+| Qwen3-4B | Box, non-canonical | cpu | fp32 | 13.6377 |
+| Qwen3-4B | **Box, canonical** | cpu | fp32 | **13.6377** |
+
+**0.6B agrees to 0.0014% across two machines, two devices and two dtypes**, and
+**4B is bit-identical to four decimals between the canonical and non-canonical
+stacks** — so the library versions really did not matter, but that is now a
+measurement rather than an assumption. The three model sizes are comparable.
+
+`[MEASURED]` **What made this failure possible**, recorded because it caused
+three separate wrong conclusions in one session: `accelerate` and `datasets`
+were present de facto in the environment that produced every locked baseline and
+were **never declared** in `tools/pyproject.toml`. A later `uv sync` pruned them,
+runs that had worked for weeks began failing, and the failures were misread as
+capacity problems and as library-version differences. `[UNKNOWN]` why
+`uv sync --extra check` still resolves differently on Linux than on macOS even
+after they were declared; they had to be installed explicitly on the box, so
+"the declared environment reproduces" is **not yet true** and is open work.
 
 ## The series
 
