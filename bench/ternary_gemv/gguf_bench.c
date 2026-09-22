@@ -26,10 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-void tgemv_neon(ternary_fmt f, const uint8_t *w, size_t rows, size_t cols,
-                const act_t *a, const int8_t *xs2, const int8_t *xs4, float *y);
-#endif
+static tgemv_arm VARM = ARM_REF;
 void shuffle_stride(const int8_t *in, int8_t *out, size_t cols, int blk, int stride);
 float bench_frand(void);
 void ternary_repack_pairs(const uint8_t *src, uint8_t *dst, size_t rows, size_t cols);
@@ -67,19 +64,11 @@ static void *gworker(void *v)
     gjob_t *j = v;
     for (int it = 0; it < j->reps; it++) {
         if (j->kind == 0)
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-            tgemv_neon(FMT_T3_FOLD9, (const uint8_t *)j->W + j->r0 * j->rb,
-                       j->r1 - j->r0, j->cols, j->a, j->xs2, j->xs4, j->y + j->r0);
-#else
-            (void)0;
-#endif
+            tgemv(VARM, FMT_T3_FOLD9, (const uint8_t *)j->W + j->r0 * j->rb,
+                  j->r1 - j->r0, j->cols, j->a, j->xs2, j->xs4, j->y + j->r0);
         else if (j->kind == 1)
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-            tgemv_neon(FMT_T1_2BIT, (const uint8_t *)j->W + j->r0 * j->rb,
-                       j->r1 - j->r0, j->cols, j->a, j->xs2, j->xs4, j->y + j->r0);
-#else
-            (void)0;
-#endif
+            tgemv(VARM, FMT_T1_2BIT, (const uint8_t *)j->W + j->r0 * j->rb,
+                  j->r1 - j->r0, j->cols, j->a, j->xs2, j->xs4, j->y + j->r0);
         else if (j->ours)
             mynah_slm_matvec(j->type, (const uint8_t *)j->W + j->r0 * j->rb,
                              j->r1 - j->r0, j->cols, j->xf, j->prep, j->y + j->r0);
@@ -115,12 +104,13 @@ int gguf_bench(const char *path, int reps, FILE *csv)
         fprintf(stderr, "REFUSED: cannot open %s: %s\n", path, err);
         return 2;
     }
+    VARM = ternary_best_arm();
     {
         const ternary_caps *c = ternary_detect();
-        printf("\n# cpu=%s  neon=%d dotprod=%d i8mm=%d   arms: ref%s%s\n",
-               c->cpu, c->have_neon, c->have_dotprod, c->have_i8mm,
-               ternary_arm_available(ARM_DOTPROD) ? " sdot" : "",
-               ternary_arm_available(ARM_I8MM) ? " smmla" : " [smmla NOT AVAILABLE]");
+        printf("\n# cpu=%s\n# neon=%d dotprod=%d i8mm=%d avx2=%d avx512vnni=%d"
+               "  -> vector arm: %s\n", c->cpu, c->have_neon, c->have_dotprod,
+               c->have_i8mm, c->have_avx2, c->have_avx512vnni,
+               ternary_arm_name(VARM));
     }
     printf("\n# ===== REAL GGUF: %s =====\n", path);
     printf("# arch=%s  gguf v%u  %zu tensors\n",
@@ -167,8 +157,7 @@ int gguf_bench(const char *path, int reps, FILE *csv)
                    malloc(C / TG * sizeof(int32_t)), C, C / TG};
         act_prepare(x, C, &a);
         int8_t *xs2 = malloc(C), *xs4 = malloc(C);
-        shuffle_stride(a.q, xs2, C, 64, 4);
-        shuffle_stride(a.q, xs4, C, 32, 2);
+        ternary_shuffle_acts(VARM, a.q, xs2, xs4, C);
 
         /* The real tensor, both activation arms. A GEMV whose output is all
          * zeros has not run; the checksum is printed so that cannot hide. */
@@ -204,8 +193,7 @@ int gguf_bench(const char *path, int reps, FILE *csv)
         double tern_ns[2] = {0, 0};
         size_t trb[2] = {0, 0};
         uint8_t *TW[2] = {NULL, NULL};
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-        {
+        if (VARM != ARM_REF) {
             int8_t *tv = malloc(R * C);
             float  *ws = malloc(R * (C / TG) * sizeof(float));
             for (size_t i = 0; i < R * C; i++) {
@@ -226,6 +214,11 @@ int gguf_bench(const char *path, int reps, FILE *csv)
                         src = tmp;
                     }
                     ternary_encode_row(fl[k], src, ws + r * (C / TG), C, TW[k] + r * trb[k]);
+                }
+                if (tgemv(VARM, fl[k], TW[k], R, C, &a, xs2, xs4, y) != 0) {
+                    printf("    %-10s REFUSED by the %s arm\n",
+                           TERNARY_FORMATS[fl[k]].name, ternary_arm_name(VARM));
+                    continue;
                 }
                 gjob_t j = {k == 0 ? 0 : 1, reps, TW[k], trb[k], 0, R, C, &a, xs2, xs4, y,
                             NULL, 0, NULL, 0};
@@ -276,7 +269,6 @@ int gguf_bench(const char *path, int reps, FILE *csv)
             }
             free(tv); free(ws);
         }
-#endif
         /* Thread scaling, real tensor against T3 fold9. */
         for (int nt = 1; nt <= 4; nt *= 2) {
             gjob_t jr = {2, reps, W, rb, 0, R, C, &a, xs2, xs4, y, x, t->type, &prep, ours_flag};

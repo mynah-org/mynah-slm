@@ -8,6 +8,7 @@
  * against the T0 oracle first.
  *
  * SPDX-License-Identifier: MIT */
+#include "dispatch.h"
 #include "formats.h"
 #include "qmat.h"
 #include "timing.h"
@@ -20,19 +21,12 @@
 #include <string.h>
 #include <pthread.h>
 
-typedef struct {
-    int8_t  *q;
-    float   *scale;
-    int32_t *sum;
-    size_t   cols, groups;
-} act_t;
-void act_prepare(const float *x, size_t cols, act_t *a);
 void tgemv_scalar(ternary_fmt f, const uint8_t *w, size_t rows, size_t cols,
                   const act_t *a, float *y);
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-void tgemv_neon(ternary_fmt f, const uint8_t *w, size_t rows, size_t cols,
-                const act_t *a, const int8_t *xs2, const int8_t *xs4, float *y);
-#endif
+
+/* The vector arm this CPU can actually run: sdot on ARM, vpdpbusd on x86,
+ * ARM_REF when neither. Chosen once, printed, and never assumed. */
+static tgemv_arm VARM = ARM_REF;
 
 /* The dominant decode GEMV shapes, from reports/ternary/traffic_shapes.csv.
  * Real model dimensions, not square toys. */
@@ -58,18 +52,6 @@ float bench_frand(void) { return frand(); }
 
 int gguf_bench(const char *path, int reps, FILE *csv);
 
-/* Deinterleave activations so sdot lanes line up with the packed code order.
- * Done ONCE per GEMV, amortised over every row -- which is why a kernel that
- * owns its activation layout beats one that takes whatever it is handed. */
-void shuffle_stride(const int8_t *in, int8_t *out, size_t cols, int blk, int stride);
-void shuffle_stride(const int8_t *in, int8_t *out, size_t cols, int blk, int stride)
-{
-    for (size_t b = 0; b < cols; b += (size_t)blk)
-        for (int s = 0; s < stride; s++)
-            for (int i = 0; i < blk / stride; i++)
-                out[b + (size_t)s * (blk / stride) + i] = in[b + (size_t)i * stride + s];
-}
-
 typedef struct {
     int kind, reps; const void *W; size_t rb, r0, r1, cols;
     const act_t *a; const int8_t *xs2, *xs4; float *y;
@@ -86,8 +68,8 @@ static void *worker(void *v)
     job_t *j = v;
     for (int it = 0; it < j->reps; it++) {
         if (j->kind == 0)
-            tgemv_neon(FMT_T3_FOLD9, (const uint8_t *)j->W + j->r0 * j->rb,
-                       j->r1 - j->r0, j->cols, j->a, j->xs2, j->xs4, j->y + j->r0);
+            tgemv(VARM, FMT_T3_FOLD9, (const uint8_t *)j->W + j->r0 * j->rb,
+                  j->r1 - j->r0, j->cols, j->a, j->xs2, j->xs4, j->y + j->r0);
         else
             mynah_slm_matvec(j->type, (const uint8_t *)j->W + j->r0 * j->rb,
                              j->r1 - j->r0, j->cols, j->xf, j->prep, j->y + j->r0);
@@ -130,8 +112,16 @@ int main(int argc, char **argv)
     }
 
     int reps = argc > 1 ? atoi(argv[1]) : 40;
-    printf("# ternary GEMV microbench -- Apple M1, sdot yes / i8mm no, %d reps\n", reps);
-    printf("# baselines are mynah_slm_matvec, the production kernels\n\n");
+    VARM = ternary_best_arm();
+    {
+        const ternary_caps *c = ternary_detect();
+        printf("# ternary GEMV microbench -- %d reps\n", reps);
+        printf("# cpu=%s\n# neon=%d dotprod=%d i8mm=%d avx2=%d avx512vnni=%d"
+               "  -> vector arm: %s\n", c->cpu, c->have_neon, c->have_dotprod,
+               c->have_i8mm, c->have_avx2, c->have_avx512vnni,
+               ternary_arm_name(VARM));
+        printf("# baselines are mynah_slm_matvec, the production kernels\n\n");
+    }
 
     printf("## representation\n");
     printf("%-14s %9s %9s %9s %7s\n", "format", "payload", "scales", "TOTAL", "passes");
@@ -161,8 +151,7 @@ int main(int argc, char **argv)
         double t0 = mynah_slm_now();
         for (int it = 0; it < reps * 50; it++) {
             act_prepare(x, C, &a);
-            shuffle_stride(a.q, s2, C, 64, 4);
-            shuffle_stride(a.q, s4, C, 32, 2);
+            ternary_shuffle_acts(VARM, a.q, s2, s4, C);
         }
         double ns = (mynah_slm_now() - t0) * 1e9 / (reps * 50);
         printf("## activation prep + lane shuffle, cols=1024: %.0f ns "
@@ -183,8 +172,7 @@ int main(int argc, char **argv)
                    malloc(C / TG * sizeof(int32_t)), C, C / TG};
         act_prepare(x, C, &a);
         int8_t *xs2 = malloc(C), *xs4 = malloc(C);
-        shuffle_stride(a.q, xs2, C, 64, 4);
-        shuffle_stride(a.q, xs4, C, 32, 2);
+        ternary_shuffle_acts(VARM, a.q, xs2, xs4, C);
 
         /* one set of trits, encoded into every format, so the comparison is
          * between REPRESENTATIONS and not between random draws */
@@ -249,10 +237,10 @@ int main(int argc, char **argv)
 
             double ne_ns = 0.0;
             int have_neon = 0;
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-            if (f != FMT_T2_BASE3 && f != FMT_MASKSIGN) {
+            if (VARM != ARM_REF &&
+                tgemv(VARM, f, W, R, C, &a, xs2, xs4, y) == 0) {
                 have_neon = 1;
-                tgemv_neon(f, W, R, C, &a, xs2, xs4, y);
+                {
                 double mx = 0, sum = 0, num = 0, den = 0;
                 for (size_t r = 0; r < R; r++) {
                     double d = fabs((double)y[r] - yref[r]);
@@ -260,8 +248,8 @@ int main(int argc, char **argv)
                     num += d * d; den += (double)yref[r] * yref[r];
                 }
                 double rel = den > 0 ? sqrt(num / den) : 0;
-                printf("  %-14s neon vs scalar: max %.3e  mean %.3e  rel_l2 %.3e %s\n",
-                       TERNARY_FORMATS[f].name, mx, sum / R, rel,
+                printf("  %-14s %s vs scalar: max %.3e  mean %.3e  rel_l2 %.3e %s\n",
+                       TERNARY_FORMATS[f].name, ternary_arm_name(VARM), mx, sum / R, rel,
                        rel < 1e-5 ? "OK" : "*** MISMATCH ***");
                 if (cc) fprintf(cc, "%s,%s,%.6e,%.6e,%.6e\n", SHAPES[s].name,
                                 TERNARY_FORMATS[f].name, mx, sum / R, rel);
@@ -269,26 +257,27 @@ int main(int argc, char **argv)
                 else {
                     t0 = mynah_slm_now();
                     for (int it = 0; it < reps; it++)
-                        tgemv_neon(f, W, R, C, &a, xs2, xs4, y);
+                        tgemv(VARM, f, W, R, C, &a, xs2, xs4, y);
                     ne_ns = (mynah_slm_now() - t0) * 1e9 / reps;
                 }
+                }
             }
-#endif
             double mib = (double)(R * rb) / 1048576.0;
             printf("    %-12s %6.3f bpw  scalar %9.0f ns", TERNARY_FORMATS[f].name,
                    TERNARY_FORMATS[f].total_bpw, sc_ns);
             if (have_neon)
-                printf("   NEON %9.0f ns  %6.1f MiB  %6.1f GB/s",
-                       ne_ns, mib, (double)(R * rb) / ne_ns);
+                printf("   %-11s %9.0f ns  %6.1f MiB  %6.1f GB/s",
+                       ternary_arm_name(VARM), ne_ns, mib, (double)(R * rb) / ne_ns);
             printf("\n");
             if (csv) {
                 fprintf(csv, "%s,%zu,%zu,%s-scalar,%.4f,%.0f,%.2f,%.2f\n", SHAPES[s].name,
                         R, C, TERNARY_FORMATS[f].name, TERNARY_FORMATS[f].total_bpw,
                         sc_ns, mib, (double)(R * rb) / sc_ns);
                 if (have_neon)
-                    fprintf(csv, "%s,%zu,%zu,%s-neon,%.4f,%.0f,%.2f,%.2f\n", SHAPES[s].name,
-                            R, C, TERNARY_FORMATS[f].name, TERNARY_FORMATS[f].total_bpw,
-                            ne_ns, mib, (double)(R * rb) / ne_ns);
+                    fprintf(csv, "%s,%zu,%zu,%s-%s,%.4f,%.0f,%.2f,%.2f\n", SHAPES[s].name,
+                            R, C, TERNARY_FORMATS[f].name, ternary_arm_name(VARM),
+                            TERNARY_FORMATS[f].total_bpw, ne_ns, mib,
+                            (double)(R * rb) / ne_ns);
             }
             free(W);
         }
