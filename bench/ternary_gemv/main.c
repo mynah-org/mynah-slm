@@ -27,6 +27,11 @@ void tgemv_scalar(ternary_fmt f, const uint8_t *w, size_t rows, size_t cols,
 /* The vector arm this CPU can actually run: sdot on ARM, vpdpbusd on x86,
  * ARM_REF when neither. Chosen once, printed, and never assumed. */
 static tgemv_arm VARM = ARM_REF;
+/* The WIDTH CONTROL arm, when the machine has one. Our production x86 kernels
+ * are all AVX2 at 256 bits, so timing a 512-bit ternary kernel against them
+ * measures register width, not representation. This arm runs the identical
+ * algorithm at 256 bits so the width can be taken back out. */
+static tgemv_arm CARM = ARM_REF;
 
 /* The dominant decode GEMV shapes, from reports/ternary/traffic_shapes.csv.
  * Real model dimensions, not square toys. */
@@ -113,6 +118,7 @@ int main(int argc, char **argv)
 
     int reps = argc > 1 ? atoi(argv[1]) : 40;
     VARM = ternary_best_arm();
+    if (VARM == ARM_AVX512 && ternary_arm_available(ARM_VNNI256)) CARM = ARM_VNNI256;
     {
         const ternary_caps *c = ternary_detect();
         printf("# ternary GEMV microbench -- %d reps\n", reps);
@@ -120,6 +126,10 @@ int main(int argc, char **argv)
                "  -> vector arm: %s\n", c->cpu, c->have_neon, c->have_dotprod,
                c->have_i8mm, c->have_avx2, c->have_avx512vnni,
                ternary_arm_name(VARM));
+        if (CARM != ARM_REF)
+            printf("# width control arm: %s (same algorithm, 256-bit, because every\n"
+                   "#   production x86 kernel in src/ and ingot is AVX2 at 256 bits)\n",
+                   ternary_arm_name(CARM));
         printf("# baselines are mynah_slm_matvec, the production kernels\n\n");
     }
 
@@ -173,6 +183,8 @@ int main(int argc, char **argv)
         act_prepare(x, C, &a);
         int8_t *xs2 = malloc(C), *xs4 = malloc(C);
         ternary_shuffle_acts(VARM, a.q, xs2, xs4, C);
+        int8_t *cs2 = malloc(C), *cs4 = malloc(C);
+        ternary_shuffle_acts(CARM, a.q, cs2, cs4, C);
 
         /* one set of trits, encoded into every format, so the comparison is
          * between REPRESENTATIONS and not between random draws */
@@ -262,13 +274,37 @@ int main(int argc, char **argv)
                 }
                 }
             }
+            /* The control arm, timed only after it agrees with the scalar
+             * reference on this format -- same gate as every other arm. */
+            double c_ns = 0.0;
+            if (CARM != ARM_REF && tgemv(CARM, f, W, R, C, &a, cs2, cs4, y) == 0) {
+                double num = 0, den = 0;
+                for (size_t r = 0; r < R; r++) {
+                    double d = (double)y[r] - yref[r];
+                    num += d * d; den += (double)yref[r] * yref[r];
+                }
+                if (den > 0 && sqrt(num / den) < 1e-5) {
+                    double t1 = mynah_slm_now();
+                    for (int it = 0; it < reps; it++)
+                        tgemv(CARM, f, W, R, C, &a, cs2, cs4, y);
+                    c_ns = (mynah_slm_now() - t1) * 1e9 / reps;
+                }
+            }
             double mib = (double)(R * rb) / 1048576.0;
             printf("    %-12s %6.3f bpw  scalar %9.0f ns", TERNARY_FORMATS[f].name,
                    TERNARY_FORMATS[f].total_bpw, sc_ns);
             if (have_neon)
                 printf("   %-11s %9.0f ns  %6.1f MiB  %6.1f GB/s",
                        ternary_arm_name(VARM), ne_ns, mib, (double)(R * rb) / ne_ns);
+            if (c_ns > 0)
+                printf("   %-9s %9.0f ns  %6.1f GB/s",
+                       ternary_arm_name(CARM), c_ns, (double)(R * rb) / c_ns);
             printf("\n");
+            if (c_ns > 0 && csv)
+                fprintf(csv, "%s,%zu,%zu,%s-%s,%.4f,%.0f,%.2f,%.2f\n", SHAPES[s].name,
+                        R, C, TERNARY_FORMATS[f].name, ternary_arm_name(CARM),
+                        TERNARY_FORMATS[f].total_bpw, c_ns, mib,
+                        (double)(R * rb) / c_ns);
             if (csv) {
                 fprintf(csv, "%s,%zu,%zu,%s-scalar,%.4f,%.0f,%.2f,%.2f\n", SHAPES[s].name,
                         R, C, TERNARY_FORMATS[f].name, TERNARY_FORMATS[f].total_bpw,
@@ -384,7 +420,8 @@ int main(int argc, char **argv)
         }
         printf("\n");
         free(x); free(y); free(yref); free(a.q); free(a.scale); free(a.sum);
-        free(xs2); free(xs4); free(t1); free(tk2); free(tk3); free(ws);
+        free(xs2); free(xs4); free(cs2); free(cs4);
+        free(t1); free(tk2); free(tk3); free(ws);
     }
     if (csv) fclose(csv);
     if (cc) fclose(cc);

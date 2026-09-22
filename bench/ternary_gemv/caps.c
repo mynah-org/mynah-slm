@@ -86,10 +86,10 @@ const ternary_caps *ternary_detect(void)
      * without running one AVX2 kernel. Here the failure mode is the reverse
      * and worse -- an unsupported AVX-512 instruction is SIGILL. */
     __builtin_cpu_init();
-    g_caps.have_avx2 = __builtin_cpu_supports("avx2");
-    g_caps.have_avx512vnni = __builtin_cpu_supports("avx512f") &&
+    g_caps.have_avx2 = !!__builtin_cpu_supports("avx2");
+    g_caps.have_avx512vnni = !!(__builtin_cpu_supports("avx512f") &&
                              __builtin_cpu_supports("avx512bw") &&
-                             __builtin_cpu_supports("avx512vnni");
+                             __builtin_cpu_supports("avx512vnni"));
     cpu_from_proc("model name");
 #endif
     return &g_caps;
@@ -102,6 +102,7 @@ const char *ternary_arm_name(tgemv_arm a)
     case ARM_DOTPROD: return "sdot";
     case ARM_I8MM:    return "smmla";
     case ARM_AVX512:  return "avx512-vnni";
+    case ARM_VNNI256: return "vnni256";
     default:          return "?";
     }
 }
@@ -119,7 +120,8 @@ int ternary_arm_available(tgemv_arm a)
     case ARM_I8MM: return c->have_i8mm;
 #endif
 #if defined(TERNARY_BUILD_AVX512)
-    case ARM_AVX512: return c->have_avx512vnni;
+    case ARM_AVX512:  return c->have_avx512vnni;
+    case ARM_VNNI256: return c->have_avx512vnni;   /* EVEX 256-bit form */
 #endif
     default: return 0;
     }
@@ -152,6 +154,9 @@ void ternary_shuffle_acts(tgemv_arm arm, const int8_t *q, int8_t *xs2,
     if (arm == ARM_AVX512) {          /* 64-byte loads */
         shuffle_stride(q, xs2, cols, 256, 4);
         shuffle_stride(q, xs4, cols, 128, 2);
+    } else if (arm == ARM_VNNI256) {  /* 32-byte loads */
+        shuffle_stride(q, xs2, cols, 128, 4);
+        shuffle_stride(q, xs4, cols, 64, 2);
     } else {                          /* 16-byte loads */
         shuffle_stride(q, xs2, cols, 64, 4);
         shuffle_stride(q, xs4, cols, 32, 2);
@@ -165,6 +170,8 @@ void tgemv_neon(ternary_fmt f, const uint8_t *w, size_t rows, size_t cols,
 #if defined(TERNARY_BUILD_AVX512)
 int tgemv_avx512(ternary_fmt f, const uint8_t *w, size_t rows, size_t cols,
                  const act_t *a, const int8_t *xs2, const int8_t *xs4, float *y);
+int tgemv_vnni256(ternary_fmt f, const uint8_t *w, size_t rows, size_t cols,
+                  const act_t *a, const int8_t *xs2, const int8_t *xs4, float *y);
 #endif
 void tgemv_scalar(ternary_fmt f, const uint8_t *w, size_t rows, size_t cols,
                   const act_t *a, float *y);
@@ -186,6 +193,8 @@ int tgemv(tgemv_arm arm, ternary_fmt f, const uint8_t *w, size_t rows, size_t co
 #if defined(TERNARY_BUILD_AVX512)
     case ARM_AVX512:
         return tgemv_avx512(f, w, rows, cols, a, xs2, xs4, y);
+    case ARM_VNNI256:
+        return tgemv_vnni256(f, w, rows, cols, a, xs2, xs4, y);
 #endif
     default:
         return -1;

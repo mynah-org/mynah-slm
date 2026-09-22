@@ -7,7 +7,8 @@
  *   tgemv_ref      portable C, the oracle. Always built, always correct.
  *   tgemv_dotprod  ARM sdot          (M1: yes, Neoverse V2: yes)
  *   tgemv_i8mm     ARM smmla         (M1: NO,  Neoverse V2: yes)
- *   tgemv_avx512   x86 vpdpbusd      (Zen 4 / Ice Lake+: yes)
+ *   tgemv_avx512   x86 vpdpbusd, 512-bit  (Zen 4 / Ice Lake+: yes)
+ *   tgemv_vnni256  x86 vpdpbusd, 256-bit  -- the WIDTH CONTROL, see below
  *
  * An arm that the running CPU does not implement is not selectable: the caps
  * are read from the OS, never from the compiler. A kernel compiled for an
@@ -28,7 +29,8 @@ typedef struct {
     size_t   cols, groups;
 } act_t;
 
-typedef enum { ARM_REF = 0, ARM_DOTPROD, ARM_I8MM, ARM_AVX512, ARM__COUNT } tgemv_arm;
+typedef enum { ARM_REF = 0, ARM_DOTPROD, ARM_I8MM, ARM_AVX512, ARM_VNNI256,
+               ARM__COUNT } tgemv_arm;
 
 typedef struct {
     int have_dotprod;      /* FEAT_DotProd / HWCAP_ASIMDDP     */
