@@ -1,0 +1,188 @@
+# ternary GEMV microbench -- 120 reps
+# cpu=AMD EPYC 9254 24-Core Processor
+# neon=0 dotprod=0 i8mm=0 avx2=1 avx512vnni=1  -> vector arm: avx512-vnni
+# width control arm: vnni256 (same algorithm, 256-bit, because every
+#   production x86 kernel in src/ and ingot is AVX2 at 256 bits)
+# baselines are mynah_slm_matvec, the production kernels
+
+## representation
+format           payload    scales     TOTAL  passes
+T0 int8            8.000     0.125     8.125       1
+T1 2-bit           2.000     0.125     2.125       1
+T2 base-3          1.625     0.125     1.750       1
+T3 fold9 K=2       4.000     0.125     4.125       1
+T3 K=3             6.000     0.125     6.125       2
+mask+sign          2.000     0.125     2.125       1
+
+(bits/weight. Entropy of one trit is 1.585 and is NOT a storage rate.)
+
+## activation prep + lane shuffle, cols=1024: 2870 ns (once per layer input, not per projection)
+
+## gate/up_proj  [3072 x 1024]
+  T0 int8        round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T0 int8        avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T0 int8       8.125 bpw  scalar    170690 ns   avx512-vnni     51343 ns     3.0 MiB    62.2 GB/s   vnni256       49053 ns    65.1 GB/s
+  T1 2-bit       round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T1 2-bit       avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T1 2-bit      2.125 bpw  scalar   2546064 ns   avx512-vnni     42906 ns     0.8 MiB    19.5 GB/s   vnni256       51180 ns    16.3 GB/s
+  T2 base-3      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    T2 base-3     1.750 bpw  scalar   2939129 ns
+  T3 fold9 K=2   round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 fold9 K=2   avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 fold9 K=2  4.125 bpw  scalar   1988236 ns   avx512-vnni     46787 ns     1.5 MiB    34.7 GB/s   vnni256       49446 ns    32.8 GB/s
+  T3 K=3         round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 K=3         avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 K=3        6.125 bpw  scalar   3798181 ns   avx512-vnni     85369 ns     2.3 MiB    28.2 GB/s   vnni256       89370 ns    26.9 GB/s
+  mask+sign      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    mask+sign     2.125 bpw  scalar   8469934 ns
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=f32 ]    221024 ns     3.2 MiB    15.1 GB/s
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=int8]    220726 ns     3.2 MiB    15.1 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=f32 ]    390995 ns     2.5 MiB     6.6 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=int8]    390561 ns     2.5 MiB     6.6 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=f32 ]    252159 ns     1.7 MiB     7.0 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=int8]    232777 ns     1.7 MiB     7.6 GB/s
+    Q3_K         REFUSED: no encoder or unknown geometry
+    threads=1   T3 fold9     48575 ns   Q4_K(int8)    233600 ns   ternary is 4.81x
+    threads=2   T3 fold9     24761 ns   Q4_K(int8)    117181 ns   ternary is 4.73x
+    threads=4   T3 fold9     13282 ns   Q4_K(int8)     58942 ns   ternary is 4.44x
+
+## down_proj  [1024 x 3072]
+  T0 int8        round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T0 int8        avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T0 int8       8.125 bpw  scalar    168150 ns   avx512-vnni     46138 ns     3.0 MiB    69.2 GB/s   vnni256       46173 ns    69.2 GB/s
+  T1 2-bit       round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T1 2-bit       avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T1 2-bit      2.125 bpw  scalar   2497353 ns   avx512-vnni     42113 ns     0.8 MiB    19.8 GB/s   vnni256       49779 ns    16.8 GB/s
+  T2 base-3      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    T2 base-3     1.750 bpw  scalar   2941958 ns
+  T3 fold9 K=2   round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 fold9 K=2   avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 fold9 K=2  4.125 bpw  scalar   1973592 ns   avx512-vnni     45525 ns     1.5 MiB    35.6 GB/s   vnni256       47684 ns    34.0 GB/s
+  T3 K=3         round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 K=3         avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 K=3        6.125 bpw  scalar   3798232 ns   avx512-vnni     89556 ns     2.3 MiB    26.9 GB/s   vnni256       93305 ns    25.8 GB/s
+  mask+sign      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    mask+sign     2.125 bpw  scalar   8471071 ns
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=f32 ]    245254 ns     3.2 MiB    13.6 GB/s
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=int8]    245862 ns     3.2 MiB    13.6 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=f32 ]    389098 ns     2.5 MiB     6.6 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=int8]    389276 ns     2.5 MiB     6.6 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=f32 ]    242523 ns     1.7 MiB     7.3 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=int8]    230566 ns     1.7 MiB     7.7 GB/s
+    Q3_K         REFUSED: no encoder or unknown geometry
+    threads=1   T3 fold9     46833 ns   Q4_K(int8)    236466 ns   ternary is 5.05x
+    threads=2   T3 fold9     23963 ns   Q4_K(int8)    115942 ns   ternary is 4.84x
+    threads=4   T3 fold9     12274 ns   Q4_K(int8)     58121 ns   ternary is 4.74x
+
+## q_proj  [2048 x 1024]
+  T0 int8        round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T0 int8        avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T0 int8       8.125 bpw  scalar    112307 ns   avx512-vnni     33584 ns     2.0 MiB    63.4 GB/s   vnni256       31847 ns    66.9 GB/s
+  T1 2-bit       round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T1 2-bit       avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T1 2-bit      2.125 bpw  scalar   1672664 ns   avx512-vnni     28558 ns     0.5 MiB    19.5 GB/s   vnni256       33949 ns    16.4 GB/s
+  T2 base-3      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    T2 base-3     1.750 bpw  scalar   1959008 ns
+  T3 fold9 K=2   round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 fold9 K=2   avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 fold9 K=2  4.125 bpw  scalar   1324352 ns   avx512-vnni     31106 ns     1.0 MiB    34.8 GB/s   vnni256       33612 ns    32.2 GB/s
+  T3 K=3         round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 K=3         avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 K=3        6.125 bpw  scalar   2527852 ns   avx512-vnni     56913 ns     1.5 MiB    28.2 GB/s   vnni256       59428 ns    27.0 GB/s
+  mask+sign      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    mask+sign     2.125 bpw  scalar   5654999 ns
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=f32 ]    147237 ns     2.1 MiB    15.1 GB/s
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=int8]    147540 ns     2.1 MiB    15.1 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=f32 ]    260434 ns     1.6 MiB     6.6 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=int8]    260397 ns     1.6 MiB     6.6 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=f32 ]    168428 ns     1.1 MiB     7.0 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=int8]    155105 ns     1.1 MiB     7.6 GB/s
+    Q3_K         REFUSED: no encoder or unknown geometry
+    threads=1   T3 fold9     32361 ns   Q4_K(int8)    156288 ns   ternary is 4.83x
+    threads=2   T3 fold9     16549 ns   Q4_K(int8)     77860 ns   ternary is 4.70x
+    threads=4   T3 fold9      8736 ns   Q4_K(int8)     39490 ns   ternary is 4.52x
+
+## o_proj  [1024 x 2048]
+  T0 int8        round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T0 int8        avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T0 int8       8.125 bpw  scalar    111821 ns   avx512-vnni     32321 ns     2.0 MiB    65.9 GB/s   vnni256       30796 ns    69.2 GB/s
+  T1 2-bit       round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T1 2-bit       avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T1 2-bit      2.125 bpw  scalar   1667672 ns   avx512-vnni     27848 ns     0.5 MiB    20.0 GB/s   vnni256       33017 ns    16.9 GB/s
+  T2 base-3      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    T2 base-3     1.750 bpw  scalar   1959891 ns
+  T3 fold9 K=2   round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 fold9 K=2   avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 fold9 K=2  4.125 bpw  scalar   1317710 ns   avx512-vnni     30025 ns     1.0 MiB    36.0 GB/s   vnni256       32332 ns    33.4 GB/s
+  T3 K=3         round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 K=3         avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 K=3        6.125 bpw  scalar   2530070 ns   avx512-vnni     59886 ns     1.5 MiB    26.8 GB/s   vnni256       61873 ns    26.0 GB/s
+  mask+sign      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    mask+sign     2.125 bpw  scalar   5639450 ns
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=f32 ]    146287 ns     2.1 MiB    15.2 GB/s
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=int8]    146250 ns     2.1 MiB    15.2 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=f32 ]    260293 ns     1.6 MiB     6.6 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=int8]    259834 ns     1.6 MiB     6.6 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=f32 ]    163445 ns     1.1 MiB     7.2 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=int8]    154481 ns     1.1 MiB     7.6 GB/s
+    Q3_K         REFUSED: no encoder or unknown geometry
+    threads=1   T3 fold9     31839 ns   Q4_K(int8)    155001 ns   ternary is 4.87x
+    threads=2   T3 fold9     16682 ns   Q4_K(int8)     77211 ns   ternary is 4.63x
+    threads=4   T3 fold9      9132 ns   Q4_K(int8)     39117 ns   ternary is 4.28x
+
+## k/v_proj  [1024 x 1024]
+  T0 int8        round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T0 int8        avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T0 int8       8.125 bpw  scalar     56270 ns   avx512-vnni     17174 ns     1.0 MiB    62.0 GB/s   vnni256       16451 ns    64.7 GB/s
+  T1 2-bit       round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T1 2-bit       avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T1 2-bit      2.125 bpw  scalar    836830 ns   avx512-vnni     14111 ns     0.3 MiB    19.7 GB/s   vnni256       17046 ns    16.3 GB/s
+  T2 base-3      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    T2 base-3     1.750 bpw  scalar    979774 ns
+  T3 fold9 K=2   round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 fold9 K=2   avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 fold9 K=2  4.125 bpw  scalar    661759 ns   avx512-vnni     15335 ns     0.5 MiB    35.3 GB/s   vnni256       16416 ns    32.9 GB/s
+  T3 K=3         round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 K=3         avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 K=3        6.125 bpw  scalar   1264799 ns   avx512-vnni     28111 ns     0.8 MiB    28.6 GB/s   vnni256       29821 ns    26.9 GB/s
+  mask+sign      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    mask+sign     2.125 bpw  scalar   2820450 ns
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=f32 ]     73768 ns     1.1 MiB    15.1 GB/s
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=int8]     73811 ns     1.1 MiB    15.1 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=f32 ]    130353 ns     0.8 MiB     6.6 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=int8]    130948 ns     0.8 MiB     6.6 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=f32 ]     83751 ns     0.6 MiB     7.0 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=int8]     77183 ns     0.6 MiB     7.6 GB/s
+    Q3_K         REFUSED: no encoder or unknown geometry
+    threads=1   T3 fold9     16439 ns   Q4_K(int8)     77941 ns   ternary is 4.74x
+    threads=2   T3 fold9      8946 ns   Q4_K(int8)     39003 ns   ternary is 4.36x
+    threads=4   T3 fold9      4961 ns   Q4_K(int8)     19879 ns   ternary is 4.01x
+
+## lm_head  [151936 x 1024]
+  T0 int8        round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T0 int8        avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T0 int8       8.125 bpw  scalar  10097669 ns   avx512-vnni   4630999 ns   150.7 MiB    34.1 GB/s   vnni256     4585605 ns    34.5 GB/s
+  T1 2-bit       round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T1 2-bit       avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T1 2-bit      2.125 bpw  scalar 124098436 ns   avx512-vnni   2185400 ns    39.4 MiB    18.9 GB/s   vnni256     2564086 ns    16.1 GB/s
+  T2 base-3      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    T2 base-3     1.750 bpw  scalar 145445579 ns
+  T3 fold9 K=2   round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 fold9 K=2   avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 fold9 K=2  4.125 bpw  scalar  98116300 ns   avx512-vnni   3591676 ns    76.5 MiB    22.3 GB/s   vnni256     3362198 ns    23.9 GB/s
+  T3 K=3         round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+  T3 K=3         avx512-vnni vs scalar: max 0.000e+00  mean 0.000e+00  rel_l2 0.000e+00 OK
+    T3 K=3        6.125 bpw  scalar 187757192 ns   avx512-vnni   6142734 ns   113.6 MiB    19.4 GB/s   vnni256     6229520 ns    19.1 GB/s
+  mask+sign      round-trip vs T0 oracle: max 0.000e+00  rel_l2 0.000e+00 OK
+    mask+sign     2.125 bpw  scalar 419277637 ns
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=f32 ]  11973083 ns   157.6 MiB    13.8 GB/s
+    Q8_0          8.500 bpw  BASELINE [ingot-simd    act=int8]  11630370 ns   157.6 MiB    14.2 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=f32 ]  19397245 ns   121.7 MiB     6.6 GB/s
+    Q6_K          6.562 bpw  BASELINE [ingot-simd    act=int8]  19380013 ns   121.7 MiB     6.6 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=f32 ]  12530240 ns    83.5 MiB     7.0 GB/s
+    Q4_K          4.500 bpw  BASELINE [mynah         act=int8]  11515208 ns    83.5 MiB     7.6 GB/s
+    Q3_K         REFUSED: no encoder or unknown geometry
+    threads=1   T3 fold9   3626459 ns   Q4_K(int8)  11515523 ns   ternary is 3.18x
+    threads=2   T3 fold9   1616393 ns   Q4_K(int8)   5756221 ns   ternary is 3.56x
+    threads=4   T3 fold9    611085 ns   Q4_K(int8)   2888600 ns   ternary is 4.73x
+

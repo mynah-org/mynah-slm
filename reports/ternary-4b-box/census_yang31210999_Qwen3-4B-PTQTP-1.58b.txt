@@ -1,0 +1,22 @@
+# Phase 0 census — models-local/yang31210999_Qwen3-4B-PTQTP-1.58b
+
+distinct parameters : 4,022,468,096
+stored parameters   : 4,022,468,096
+tie check           : no lm_head tensor: the checkpoint stores the tied weight once
+
+family       tensors         params  % model  shape
+down_proj         36    896,532,480   22.29%  [2560, 9728]
+gate_proj         36    896,532,480   22.29%  [9728, 2560]
+up_proj           36    896,532,480   22.29%  [9728, 2560]
+embedding          1    388,956,160    9.67%  [151936, 2560]
+o_proj            36    377,487,360    9.38%  [2560, 4096]
+q_proj            36    377,487,360    9.38%  [4096, 2560]
+k_proj            36     94,371,840    2.35%  [1024, 2560]
+v_proj            36     94,371,840    2.35%  [1024, 2560]
+norm             145        196,096    0.00%  [128] / [2560]
+
+transformer_linears     3,633,315,840   90.33%
+attention_linears         943,718,400   23.46%  (26.0% of linears)
+mlp_linears             2,689,597,440   66.86%  (74.0% of linears)
+embedding                 388,956,160    9.67%
+norms                         196,096    0.00%

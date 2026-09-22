@@ -279,3 +279,353 @@ lm_head,151936,1024,threads2-Q6_K-real,6.5625,12702308,0,10.05
 lm_head,151936,1024,threads2-fold9,4.1250,1903933,0,42.13
 lm_head,151936,1024,threads4-Q6_K-real,6.5625,6902125,0,18.49
 lm_head,151936,1024,threads4-fold9,4.1250,1452442,0,55.23
+gate/up_proj,3072,1024,Q4_K-real-actf32,4.5000,298931,1.69,5.92
+gate/up_proj,3072,1024,Q4_K-real-actint8,4.5000,522889,1.69,3.38
+gate/up_proj,3072,1024,T3 fold9 K=2-vs-real,4.1250,74910,1.55,21.65
+gate/up_proj,3072,1024,T1 2-bit-vs-real,2.1250,422124,0.80,1.98
+gate/up_proj,3072,1024,threads1-Q4_K-real,4.5000,807522,0,2.19
+gate/up_proj,3072,1024,threads1-fold9,4.1250,86450,0,18.76
+gate/up_proj,3072,1024,threads2-Q4_K-real,4.5000,160489,0,11.03
+gate/up_proj,3072,1024,threads2-fold9,4.1250,61055,0,26.57
+gate/up_proj,3072,1024,threads4-Q4_K-real,4.5000,165430,0,10.70
+gate/up_proj,3072,1024,threads4-fold9,4.1250,52649,0,30.81
+down_proj,1024,3072,Q6_K-real-actf32,6.5625,436492,2.46,5.91
+down_proj,1024,3072,Q6_K-real-actint8,6.5625,992174,2.46,2.60
+down_proj,1024,3072,T3 fold9 K=2-vs-real,4.1250,79186,1.55,20.48
+down_proj,1024,3072,T1 2-bit-vs-real,2.1250,62287,0.80,13.41
+down_proj,1024,3072,threads1-Q6_K-real,6.5625,768416,0,3.36
+down_proj,1024,3072,threads1-fold9,4.1250,374709,0,4.33
+down_proj,1024,3072,threads2-Q6_K-real,6.5625,2198377,0,1.17
+down_proj,1024,3072,threads2-fold9,4.1250,233409,0,6.95
+down_proj,1024,3072,threads4-Q6_K-real,6.5625,765472,0,3.37
+down_proj,1024,3072,threads4-fold9,4.1250,62100,0,26.12
+q_proj,2048,1024,Q4_K-real-actf32,4.5000,1065681,1.12,1.11
+q_proj,2048,1024,Q4_K-real-actint8,4.5000,166551,1.12,7.08
+q_proj,2048,1024,T3 fold9 K=2-vs-real,4.1250,83890,1.03,12.89
+q_proj,2048,1024,T1 2-bit-vs-real,2.1250,66738,0.53,8.35
+q_proj,2048,1024,threads1-Q4_K-real,4.5000,193158,0,6.11
+q_proj,2048,1024,threads1-fold9,4.1250,75287,0,14.36
+q_proj,2048,1024,threads2-Q4_K-real,4.5000,117511,0,10.04
+q_proj,2048,1024,threads2-fold9,4.1250,45602,0,23.71
+q_proj,2048,1024,threads4-Q4_K-real,4.5000,92529,0,12.75
+q_proj,2048,1024,threads4-fold9,4.1250,59780,0,18.09
+o_proj,1024,2048,Q4_K-real-actf32,4.5000,196349,1.12,6.01
+o_proj,1024,2048,Q4_K-real-actint8,4.5000,179481,1.12,6.57
+o_proj,1024,2048,T3 fold9 K=2-vs-real,4.1250,62424,1.03,17.32
+o_proj,1024,2048,T1 2-bit-vs-real,2.1250,44200,0.53,12.60
+o_proj,1024,2048,threads1-Q4_K-real,4.5000,168514,0,7.00
+o_proj,1024,2048,threads1-fold9,4.1250,45926,0,23.55
+o_proj,1024,2048,threads2-Q4_K-real,4.5000,91294,0,12.92
+o_proj,1024,2048,threads2-fold9,4.1250,30436,0,35.53
+o_proj,1024,2048,threads4-Q4_K-real,4.5000,70486,0,16.74
+o_proj,1024,2048,threads4-fold9,4.1250,73171,0,14.78
+k_proj,1024,1024,Q4_K-real-actf32,4.5000,98412,0.56,5.99
+k_proj,1024,1024,Q4_K-real-actint8,4.5000,86717,0.56,6.80
+k_proj,1024,1024,T3 fold9 K=2-vs-real,4.1250,28803,0.52,18.77
+k_proj,1024,1024,T1 2-bit-vs-real,2.1250,28266,0.27,9.85
+k_proj,1024,1024,threads1-Q4_K-real,4.5000,88019,0,6.70
+k_proj,1024,1024,threads1-fold9,4.1250,27321,0,19.79
+k_proj,1024,1024,threads2-Q4_K-real,4.5000,54803,0,10.76
+k_proj,1024,1024,threads2-fold9,4.1250,32986,0,16.39
+k_proj,1024,1024,threads4-Q4_K-real,4.5000,44731,0,13.19
+k_proj,1024,1024,threads4-fold9,4.1250,25675,0,21.06
+v_proj,1024,1024,Q6_K-real-actf32,6.5625,147763,0.82,5.82
+v_proj,1024,1024,Q6_K-real-actint8,6.5625,146514,0.82,5.87
+v_proj,1024,1024,T3 fold9 K=2-vs-real,4.1250,26453,0.52,20.44
+v_proj,1024,1024,T1 2-bit-vs-real,2.1250,45465,0.27,6.13
+v_proj,1024,1024,threads1-Q6_K-real,6.5625,167753,0,5.13
+v_proj,1024,1024,threads1-fold9,4.1250,39243,0,13.78
+v_proj,1024,1024,threads2-Q6_K-real,6.5625,95361,0,9.02
+v_proj,1024,1024,threads2-fold9,4.1250,65048,0,8.31
+v_proj,1024,1024,threads4-Q6_K-real,6.5625,90677,0,9.49
+v_proj,1024,1024,threads4-fold9,4.1250,44474,0,12.16
+lm_head,151936,1024,Q6_K-real-actf32,6.5625,23509240,121.71,5.43
+lm_head,151936,1024,Q6_K-real-actint8,6.5625,20775838,121.71,6.14
+lm_head,151936,1024,T3 fold9 K=2-vs-real,4.1250,4417235,76.51,18.16
+lm_head,151936,1024,T1 2-bit-vs-real,2.1250,2949460,39.41,14.01
+lm_head,151936,1024,threads1-Q6_K-real,6.5625,22735729,0,5.61
+lm_head,151936,1024,threads1-fold9,4.1250,5153529,0,15.57
+lm_head,151936,1024,threads2-Q6_K-real,6.5625,10501402,0,12.15
+lm_head,151936,1024,threads2-fold9,4.1250,2294325,0,34.97
+lm_head,151936,1024,threads4-Q6_K-real,6.5625,5891363,0,21.66
+lm_head,151936,1024,threads4-fold9,4.1250,2486228,0,32.27
+gate/up_proj,3072,1024,Q4_K-real-actf32,4.5000,312846,1.69,5.66
+gate/up_proj,3072,1024,Q4_K-real-actint8,4.5000,259682,1.69,6.81
+gate/up_proj,3072,1024,T3 fold9 K=2-vs-real,4.1250,843286,1.55,1.92
+gate/up_proj,3072,1024,T1 2-bit-vs-real,2.1250,79413,0.80,10.52
+gate/up_proj,3072,1024,threads1-Q4_K-real,4.5000,268248,0,6.60
+gate/up_proj,3072,1024,threads1-fold9,4.1250,74472,0,21.78
+gate/up_proj,3072,1024,threads2-Q4_K-real,4.5000,178693,0,9.90
+gate/up_proj,3072,1024,threads2-fold9,4.1250,49525,0,32.75
+gate/up_proj,3072,1024,threads4-Q4_K-real,4.5000,590618,0,3.00
+gate/up_proj,3072,1024,threads4-fold9,4.1250,50753,0,31.96
+down_proj,1024,3072,Q6_K-real-actf32,6.5625,463159,2.46,5.57
+down_proj,1024,3072,Q6_K-real-actint8,6.5625,461253,2.46,5.59
+down_proj,1024,3072,T3 fold9 K=2-vs-real,4.1250,88707,1.55,18.29
+down_proj,1024,3072,T1 2-bit-vs-real,2.1250,70389,0.80,11.87
+down_proj,1024,3072,threads1-Q6_K-real,6.5625,424450,0,6.08
+down_proj,1024,3072,threads1-fold9,4.1250,60398,0,26.86
+down_proj,1024,3072,threads2-Q6_K-real,6.5625,219334,0,11.77
+down_proj,1024,3072,threads2-fold9,4.1250,39877,0,40.68
+down_proj,1024,3072,threads4-Q6_K-real,6.5625,227517,0,11.34
+down_proj,1024,3072,threads4-fold9,4.1250,57457,0,28.23
+q_proj,2048,1024,Q4_K-real-actf32,4.5000,180603,1.12,6.53
+q_proj,2048,1024,Q4_K-real-actint8,4.5000,162796,1.12,7.25
+q_proj,2048,1024,T3 fold9 K=2-vs-real,4.1250,44854,1.03,24.11
+q_proj,2048,1024,T1 2-bit-vs-real,2.1250,41055,0.53,13.57
+q_proj,2048,1024,threads1-Q4_K-real,4.5000,168197,0,7.01
+q_proj,2048,1024,threads1-fold9,4.1250,42688,0,25.33
+q_proj,2048,1024,threads2-Q4_K-real,4.5000,95407,0,12.36
+q_proj,2048,1024,threads2-fold9,4.1250,29928,0,36.13
+q_proj,2048,1024,threads4-Q4_K-real,4.5000,94302,0,12.51
+q_proj,2048,1024,threads4-fold9,4.1250,45989,0,23.51
+o_proj,1024,2048,Q4_K-real-actf32,4.5000,178052,1.12,6.63
+o_proj,1024,2048,Q4_K-real-actint8,4.5000,168484,1.12,7.00
+o_proj,1024,2048,T3 fold9 K=2-vs-real,4.1250,1008595,1.03,1.07
+o_proj,1024,2048,T1 2-bit-vs-real,2.1250,48677,0.53,11.44
+o_proj,1024,2048,threads1-Q4_K-real,4.5000,168057,0,7.02
+o_proj,1024,2048,threads1-fold9,4.1250,43252,0,25.00
+o_proj,1024,2048,threads2-Q4_K-real,4.5000,190908,0,6.18
+o_proj,1024,2048,threads2-fold9,4.1250,33818,0,31.98
+o_proj,1024,2048,threads4-Q4_K-real,4.5000,339602,0,3.47
+o_proj,1024,2048,threads4-fold9,4.1250,39627,0,27.29
+k_proj,1024,1024,Q4_K-real-actf32,4.5000,98255,0.56,6.00
+k_proj,1024,1024,Q4_K-real-actint8,4.5000,91505,0.56,6.45
+k_proj,1024,1024,T3 fold9 K=2-vs-real,4.1250,42641,0.52,12.68
+k_proj,1024,1024,T1 2-bit-vs-real,2.1250,27495,0.27,10.13
+k_proj,1024,1024,threads1-Q4_K-real,4.5000,92136,0,6.40
+k_proj,1024,1024,threads1-fold9,4.1250,29832,0,18.12
+k_proj,1024,1024,threads2-Q4_K-real,4.5000,61449,0,9.60
+k_proj,1024,1024,threads2-fold9,4.1250,24076,0,22.46
+k_proj,1024,1024,threads4-Q4_K-real,4.5000,56171,0,10.50
+k_proj,1024,1024,threads4-fold9,4.1250,30403,0,17.78
+v_proj,1024,1024,Q6_K-real-actf32,6.5625,161791,0.82,5.32
+v_proj,1024,1024,Q6_K-real-actint8,6.5625,176032,0.82,4.89
+v_proj,1024,1024,T3 fold9 K=2-vs-real,4.1250,38749,0.52,13.95
+v_proj,1024,1024,T1 2-bit-vs-real,2.1250,43819,0.27,6.36
+v_proj,1024,1024,threads1-Q6_K-real,6.5625,195829,0,4.39
+v_proj,1024,1024,threads1-fold9,4.1250,45692,0,11.83
+v_proj,1024,1024,threads2-Q6_K-real,6.5625,116005,0,7.41
+v_proj,1024,1024,threads2-fold9,4.1250,40785,0,13.26
+v_proj,1024,1024,threads4-Q6_K-real,6.5625,79977,0,10.76
+v_proj,1024,1024,threads4-fold9,4.1250,34145,0,15.83
+lm_head,151936,1024,Q6_K-real-actf32,6.5625,23548858,121.71,5.42
+lm_head,151936,1024,Q6_K-real-actint8,6.5625,22309087,121.71,5.72
+lm_head,151936,1024,T3 fold9 K=2-vs-real,4.1250,5420319,76.51,14.80
+lm_head,151936,1024,T1 2-bit-vs-real,2.1250,3390606,39.41,12.19
+lm_head,151936,1024,threads1-Q6_K-real,6.5625,21055419,0,6.06
+lm_head,151936,1024,threads1-fold9,4.1250,4880368,0,16.44
+lm_head,151936,1024,threads2-Q6_K-real,6.5625,12255957,0,10.41
+lm_head,151936,1024,threads2-fold9,4.1250,2792163,0,28.73
+lm_head,151936,1024,threads4-Q6_K-real,6.5625,15300144,0,8.34
+lm_head,151936,1024,threads4-fold9,4.1250,1125462,0,71.28
+gate/up_proj,3072,1024,Q4_K-real-actf32,4.5000,258700,1.69,6.84
+gate/up_proj,3072,1024,Q4_K-real-actint8,4.5000,228185,1.69,7.75
+gate/up_proj,3072,1024,T3 fold9 K=2-vs-real,4.1250,47574,1.55,34.09
+gate/up_proj,3072,1024,T1 2-bit-vs-real,2.1250,44410,0.80,18.82
+gate/up_proj,3072,1024,threads1-Q4_K-real,4.5000,228567,0,7.74
+gate/up_proj,3072,1024,threads1-fold9,4.1250,48267,0,33.61
+gate/up_proj,3072,1024,threads2-Q4_K-real,4.5000,114743,0,15.42
+gate/up_proj,3072,1024,threads2-fold9,4.1250,24200,0,67.03
+gate/up_proj,3072,1024,threads4-Q4_K-real,4.5000,58439,0,30.28
+gate/up_proj,3072,1024,threads4-fold9,4.1250,12695,0,127.77
+down_proj,1024,3072,Q6_K-real-actf32,6.5625,390449,2.46,6.61
+down_proj,1024,3072,Q6_K-real-actint8,6.5625,390580,2.46,6.61
+down_proj,1024,3072,T3 fold9 K=2-vs-real,4.1250,46592,1.55,34.81
+down_proj,1024,3072,T1 2-bit-vs-real,2.1250,43464,0.80,19.22
+down_proj,1024,3072,threads1-Q6_K-real,6.5625,390523,0,6.61
+down_proj,1024,3072,threads1-fold9,4.1250,46720,0,34.72
+down_proj,1024,3072,threads2-Q6_K-real,6.5625,197026,0,13.10
+down_proj,1024,3072,threads2-fold9,4.1250,25958,0,62.49
+down_proj,1024,3072,threads4-Q6_K-real,6.5625,99677,0,25.89
+down_proj,1024,3072,threads4-fold9,4.1250,13439,0,120.70
+q_proj,2048,1024,Q4_K-real-actf32,4.5000,166446,1.12,7.09
+q_proj,2048,1024,Q4_K-real-actint8,4.5000,152494,1.12,7.74
+q_proj,2048,1024,T3 fold9 K=2-vs-real,4.1250,33278,1.03,32.49
+q_proj,2048,1024,T1 2-bit-vs-real,2.1250,30255,0.53,18.41
+q_proj,2048,1024,threads1-Q4_K-real,4.5000,152116,0,7.75
+q_proj,2048,1024,threads1-fold9,4.1250,32793,0,32.97
+q_proj,2048,1024,threads2-Q4_K-real,4.5000,76249,0,15.47
+q_proj,2048,1024,threads2-fold9,4.1250,16514,0,65.48
+q_proj,2048,1024,threads4-Q4_K-real,4.5000,38702,0,30.48
+q_proj,2048,1024,threads4-fold9,4.1250,9189,0,117.68
+o_proj,1024,2048,Q4_K-real-actf32,4.5000,161980,1.12,7.28
+o_proj,1024,2048,Q4_K-real-actint8,4.5000,151944,1.12,7.76
+o_proj,1024,2048,T3 fold9 K=2-vs-real,4.1250,31836,1.03,33.97
+o_proj,1024,2048,T1 2-bit-vs-real,2.1250,29886,0.53,18.64
+o_proj,1024,2048,threads1-Q4_K-real,4.5000,151344,0,7.79
+o_proj,1024,2048,threads1-fold9,4.1250,31411,0,34.43
+o_proj,1024,2048,threads2-Q4_K-real,4.5000,75852,0,15.55
+o_proj,1024,2048,threads2-fold9,4.1250,16182,0,66.82
+o_proj,1024,2048,threads4-Q4_K-real,4.5000,39075,0,30.19
+o_proj,1024,2048,threads4-fold9,4.1250,9576,0,112.93
+k_proj,1024,1024,Q4_K-real-actf32,4.5000,83630,0.56,7.05
+k_proj,1024,1024,Q4_K-real-actint8,4.5000,76523,0.56,7.71
+k_proj,1024,1024,T3 fold9 K=2-vs-real,4.1250,16003,0.52,33.79
+k_proj,1024,1024,T1 2-bit-vs-real,2.1250,14808,0.27,18.81
+k_proj,1024,1024,threads1-Q4_K-real,4.5000,76276,0,7.73
+k_proj,1024,1024,threads1-fold9,4.1250,15726,0,34.38
+k_proj,1024,1024,threads2-Q4_K-real,4.5000,38623,0,15.27
+k_proj,1024,1024,threads2-fold9,4.1250,8188,0,66.03
+k_proj,1024,1024,threads4-Q4_K-real,4.5000,19812,0,29.77
+k_proj,1024,1024,threads4-fold9,4.1250,4542,0,119.03
+v_proj,1024,1024,Q6_K-real-actf32,6.5625,130602,0.82,6.59
+v_proj,1024,1024,Q6_K-real-actint8,6.5625,130377,0.82,6.60
+v_proj,1024,1024,T3 fold9 K=2-vs-real,4.1250,16036,0.52,33.72
+v_proj,1024,1024,T1 2-bit-vs-real,2.1250,14874,0.27,18.73
+v_proj,1024,1024,threads1-Q6_K-real,6.5625,130642,0,6.58
+v_proj,1024,1024,threads1-fold9,4.1250,16356,0,33.06
+v_proj,1024,1024,threads2-Q6_K-real,6.5625,66525,0,12.93
+v_proj,1024,1024,threads2-fold9,4.1250,8369,0,64.61
+v_proj,1024,1024,threads4-Q6_K-real,6.5625,34676,0,24.81
+v_proj,1024,1024,threads4-fold9,4.1250,4713,0,114.72
+lm_head,151936,1024,Q6_K-real-actf32,6.5625,19363103,121.71,6.59
+lm_head,151936,1024,Q6_K-real-actint8,6.5625,19365283,121.71,6.59
+lm_head,151936,1024,T3 fold9 K=2-vs-real,4.1250,3638244,76.51,22.05
+lm_head,151936,1024,T1 2-bit-vs-real,2.1250,2271218,39.41,18.20
+lm_head,151936,1024,threads1-Q6_K-real,6.5625,19384027,0,6.58
+lm_head,151936,1024,threads1-fold9,4.1250,3567997,0,22.48
+lm_head,151936,1024,threads2-Q6_K-real,6.5625,9682417,0,13.18
+lm_head,151936,1024,threads2-fold9,4.1250,1629240,0,49.24
+lm_head,151936,1024,threads4-Q6_K-real,6.5625,4889810,0,26.10
+lm_head,151936,1024,threads4-fold9,4.1250,623442,0,128.68
+gate/up_proj,3072,1024,Q3_K-real-actf32,3.4375,602897,1.29,2.24
+gate/up_proj,3072,1024,Q3_K-real-actint8,3.4375,592743,1.29,2.28
+gate/up_proj,3072,1024,T3 fold9 K=2-vs-real,4.1250,53289,1.55,30.44
+gate/up_proj,3072,1024,T1 2-bit-vs-real,2.1250,44174,0.80,18.92
+gate/up_proj,3072,1024,threads1-Q3_K-real,3.4375,591635,0,2.28
+gate/up_proj,3072,1024,threads1-fold9,4.1250,53413,0,30.37
+gate/up_proj,3072,1024,threads2-Q3_K-real,3.4375,301649,0,4.48
+gate/up_proj,3072,1024,threads2-fold9,4.1250,27045,0,59.98
+gate/up_proj,3072,1024,threads4-Q3_K-real,3.4375,151068,0,8.95
+gate/up_proj,3072,1024,threads4-fold9,4.1250,13787,0,117.64
+down_proj,1024,3072,Q4_K-real-actf32,4.5000,243200,1.69,7.28
+down_proj,1024,3072,Q4_K-real-actint8,4.5000,229041,1.69,7.73
+down_proj,1024,3072,T3 fold9 K=2-vs-real,4.1250,51570,1.55,31.45
+down_proj,1024,3072,T1 2-bit-vs-real,2.1250,42654,0.80,19.59
+down_proj,1024,3072,threads1-Q4_K-real,4.5000,227809,0,7.77
+down_proj,1024,3072,threads1-fold9,4.1250,50990,0,31.81
+down_proj,1024,3072,threads2-Q4_K-real,4.5000,113578,0,15.58
+down_proj,1024,3072,threads2-fold9,4.1250,25816,0,62.83
+down_proj,1024,3072,threads4-Q4_K-real,4.5000,57308,0,30.88
+down_proj,1024,3072,threads4-fold9,4.1250,13507,0,120.08
+q_proj,2048,1024,Q3_K-real-actf32,3.4375,391931,0.86,2.30
+q_proj,2048,1024,Q3_K-real-actint8,3.4375,390826,0.86,2.31
+q_proj,2048,1024,T3 fold9 K=2-vs-real,4.1250,35682,1.03,30.31
+q_proj,2048,1024,T1 2-bit-vs-real,2.1250,28952,0.53,19.24
+q_proj,2048,1024,threads1-Q3_K-real,3.4375,393099,0,2.29
+q_proj,2048,1024,threads1-fold9,4.1250,35836,0,30.17
+q_proj,2048,1024,threads2-Q3_K-real,3.4375,198157,0,4.55
+q_proj,2048,1024,threads2-fold9,4.1250,18162,0,59.54
+q_proj,2048,1024,threads4-Q3_K-real,3.4375,101906,0,8.84
+q_proj,2048,1024,threads4-fold9,4.1250,10439,0,103.58
+o_proj,1024,2048,Q4_K-real-actf32,4.5000,161225,1.12,7.32
+o_proj,1024,2048,Q4_K-real-actint8,4.5000,151883,1.12,7.77
+o_proj,1024,2048,T3 fold9 K=2-vs-real,4.1250,32675,1.03,33.09
+o_proj,1024,2048,T1 2-bit-vs-real,2.1250,28544,0.53,19.52
+o_proj,1024,2048,threads1-Q4_K-real,4.5000,151187,0,7.80
+o_proj,1024,2048,threads1-fold9,4.1250,32064,0,33.72
+o_proj,1024,2048,threads2-Q4_K-real,4.5000,75933,0,15.54
+o_proj,1024,2048,threads2-fold9,4.1250,17289,0,62.54
+o_proj,1024,2048,threads4-Q4_K-real,4.5000,38481,0,30.66
+o_proj,1024,2048,threads4-fold9,4.1250,9855,0,109.73
+k_proj,1024,1024,Q3_K-real-actf32,3.4375,197816,0.43,2.28
+k_proj,1024,1024,Q3_K-real-actint8,3.4375,195845,0.43,2.30
+k_proj,1024,1024,T3 fold9 K=2-vs-real,4.1250,17742,0.52,30.47
+k_proj,1024,1024,T1 2-bit-vs-real,2.1250,14694,0.27,18.95
+k_proj,1024,1024,threads1-Q3_K-real,3.4375,196334,0,2.29
+k_proj,1024,1024,threads1-fold9,4.1250,17235,0,31.37
+k_proj,1024,1024,threads2-Q3_K-real,3.4375,100175,0,4.50
+k_proj,1024,1024,threads2-fold9,4.1250,8984,0,60.18
+k_proj,1024,1024,threads4-Q3_K-real,3.4375,50931,0,8.85
+k_proj,1024,1024,threads4-fold9,4.1250,5068,0,106.67
+v_proj,1024,1024,Q4_K-real-actf32,4.5000,82866,0.56,7.12
+v_proj,1024,1024,Q4_K-real-actint8,4.5000,76502,0.56,7.71
+v_proj,1024,1024,T3 fold9 K=2-vs-real,4.1250,17689,0.52,30.57
+v_proj,1024,1024,T1 2-bit-vs-real,2.1250,14439,0.27,19.29
+v_proj,1024,1024,threads1-Q4_K-real,4.5000,76525,0,7.71
+v_proj,1024,1024,threads1-fold9,4.1250,17484,0,30.92
+v_proj,1024,1024,threads2-Q4_K-real,4.5000,38255,0,15.42
+v_proj,1024,1024,threads2-fold9,4.1250,9113,0,59.33
+v_proj,1024,1024,threads4-Q4_K-real,4.5000,19784,0,29.81
+v_proj,1024,1024,threads4-fold9,4.1250,5219,0,103.59
+lm_head,151936,1024,Q6_K-real-actf32,6.5625,19341812,121.71,6.60
+lm_head,151936,1024,Q6_K-real-actint8,6.5625,19340498,121.71,6.60
+lm_head,151936,1024,T3 fold9 K=2-vs-real,4.1250,3894195,76.51,20.60
+lm_head,151936,1024,T1 2-bit-vs-real,2.1250,2173571,39.41,19.01
+lm_head,151936,1024,threads1-Q6_K-real,6.5625,19329647,0,6.60
+lm_head,151936,1024,threads1-fold9,4.1250,3888784,0,20.63
+lm_head,151936,1024,threads2-Q6_K-real,6.5625,9674647,0,13.19
+lm_head,151936,1024,threads2-fold9,4.1250,1758195,0,45.63
+lm_head,151936,1024,threads4-Q6_K-real,6.5625,4880836,0,26.15
+lm_head,151936,1024,threads4-fold9,4.1250,681021,0,117.80
+gate/up_proj,3072,1024,Q4_K-real-actf32,4.5000,258124,1.69,6.86
+gate/up_proj,3072,1024,Q4_K-real-actint8,4.5000,229124,1.69,7.72
+gate/up_proj,3072,1024,T3 fold9 K=2-vs-real,4.1250,47494,1.55,34.15
+gate/up_proj,3072,1024,T1 2-bit-vs-real,2.1250,43811,0.80,19.07
+gate/up_proj,3072,1024,threads1-Q4_K-real,4.5000,229312,0,7.72
+gate/up_proj,3072,1024,threads1-fold9,4.1250,48373,0,33.53
+gate/up_proj,3072,1024,threads2-Q4_K-real,4.5000,115303,0,15.35
+gate/up_proj,3072,1024,threads2-fold9,4.1250,24295,0,66.76
+gate/up_proj,3072,1024,threads4-Q4_K-real,4.5000,58358,0,30.32
+gate/up_proj,3072,1024,threads4-fold9,4.1250,12589,0,128.85
+down_proj,1024,3072,Q6_K-real-actf32,6.5625,390434,2.46,6.61
+down_proj,1024,3072,Q6_K-real-actint8,6.5625,390012,2.46,6.62
+down_proj,1024,3072,T3 fold9 K=2-vs-real,4.1250,47187,1.55,34.37
+down_proj,1024,3072,T1 2-bit-vs-real,2.1250,43224,0.80,19.33
+down_proj,1024,3072,threads1-Q6_K-real,6.5625,390583,0,6.61
+down_proj,1024,3072,threads1-fold9,4.1250,47025,0,34.49
+down_proj,1024,3072,threads2-Q6_K-real,6.5625,196893,0,13.11
+down_proj,1024,3072,threads2-fold9,4.1250,23504,0,69.01
+down_proj,1024,3072,threads4-Q6_K-real,6.5625,99629,0,25.90
+down_proj,1024,3072,threads4-fold9,4.1250,12330,0,131.55
+q_proj,2048,1024,Q4_K-real-actf32,4.5000,166822,1.12,7.07
+q_proj,2048,1024,Q4_K-real-actint8,4.5000,152573,1.12,7.73
+q_proj,2048,1024,T3 fold9 K=2-vs-real,4.1250,32836,1.03,32.93
+q_proj,2048,1024,T1 2-bit-vs-real,2.1250,29562,0.53,18.84
+q_proj,2048,1024,threads1-Q4_K-real,4.5000,152270,0,7.75
+q_proj,2048,1024,threads1-fold9,4.1250,32544,0,33.23
+q_proj,2048,1024,threads2-Q4_K-real,4.5000,76465,0,15.43
+q_proj,2048,1024,threads2-fold9,4.1250,16674,0,64.85
+q_proj,2048,1024,threads4-Q4_K-real,4.5000,38845,0,30.37
+q_proj,2048,1024,threads4-fold9,4.1250,8852,0,122.15
+o_proj,1024,2048,Q4_K-real-actf32,4.5000,162051,1.12,7.28
+o_proj,1024,2048,Q4_K-real-actint8,4.5000,151752,1.12,7.77
+o_proj,1024,2048,T3 fold9 K=2-vs-real,4.1250,30966,1.03,34.92
+o_proj,1024,2048,T1 2-bit-vs-real,2.1250,29789,0.53,18.70
+o_proj,1024,2048,threads1-Q4_K-real,4.5000,151689,0,7.78
+o_proj,1024,2048,threads1-fold9,4.1250,31573,0,34.25
+o_proj,1024,2048,threads2-Q4_K-real,4.5000,76678,0,15.38
+o_proj,1024,2048,threads2-fold9,4.1250,15840,0,68.27
+o_proj,1024,2048,threads4-Q4_K-real,4.5000,38540,0,30.61
+o_proj,1024,2048,threads4-fold9,4.1250,8448,0,128.00
+k_proj,1024,1024,Q4_K-real-actf32,4.5000,83533,0.56,7.06
+k_proj,1024,1024,Q4_K-real-actint8,4.5000,76384,0.56,7.72
+k_proj,1024,1024,T3 fold9 K=2-vs-real,4.1250,16078,0.52,33.63
+k_proj,1024,1024,T1 2-bit-vs-real,2.1250,14847,0.27,18.76
+k_proj,1024,1024,threads1-Q4_K-real,4.5000,76208,0,7.74
+k_proj,1024,1024,threads1-fold9,4.1250,15876,0,34.06
+k_proj,1024,1024,threads2-Q4_K-real,4.5000,38313,0,15.39
+k_proj,1024,1024,threads2-fold9,4.1250,8313,0,65.04
+k_proj,1024,1024,threads4-Q4_K-real,4.5000,19689,0,29.96
+k_proj,1024,1024,threads4-fold9,4.1250,4732,0,114.26
+v_proj,1024,1024,Q6_K-real-actf32,6.5625,130448,0.82,6.59
+v_proj,1024,1024,Q6_K-real-actint8,6.5625,130967,0.82,6.57
+v_proj,1024,1024,T3 fold9 K=2-vs-real,4.1250,16407,0.52,32.95
+v_proj,1024,1024,T1 2-bit-vs-real,2.1250,14930,0.27,18.66
+v_proj,1024,1024,threads1-Q6_K-real,6.5625,130474,0,6.59
+v_proj,1024,1024,threads1-fold9,4.1250,16239,0,33.30
+v_proj,1024,1024,threads2-Q6_K-real,6.5625,66452,0,12.94
+v_proj,1024,1024,threads2-fold9,4.1250,8361,0,64.67
+v_proj,1024,1024,threads4-Q6_K-real,6.5625,34619,0,24.85
+v_proj,1024,1024,threads4-fold9,4.1250,4854,0,111.38
+lm_head,151936,1024,Q6_K-real-actf32,6.5625,19385235,121.71,6.58
+lm_head,151936,1024,Q6_K-real-actint8,6.5625,19357960,121.71,6.59
+lm_head,151936,1024,T3 fold9 K=2-vs-real,4.1250,3599326,76.51,22.29
+lm_head,151936,1024,T1 2-bit-vs-real,2.1250,2279379,39.41,18.13
+lm_head,151936,1024,threads1-Q6_K-real,6.5625,19364384,0,6.59
+lm_head,151936,1024,threads1-fold9,4.1250,3619358,0,22.16
+lm_head,151936,1024,threads2-Q6_K-real,6.5625,9683051,0,13.18
+lm_head,151936,1024,threads2-fold9,4.1250,1648926,0,48.65
+lm_head,151936,1024,threads4-Q6_K-real,6.5625,4886988,0,26.12
+lm_head,151936,1024,threads4-fold9,4.1250,622862,0,128.80

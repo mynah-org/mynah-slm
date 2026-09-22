@@ -1,0 +1,31 @@
+{
+  "label": "yang31210999_Qwen3-4B-PTQTP-1.58b",
+  "model": "models-local/yang31210999_Qwen3-4B-PTQTP-1.58b",
+  "gguf": null,
+  "revision": null,
+  "seq_len": 2048,
+  "windows": 146,
+  "tokens_scored": 298862,
+  "total_tokens": 299078,
+  "nll_per_token": 2.796085025978738,
+  "perplexity": 16.380392265628366,
+  "dtype": "torch.float32",
+  "logit_chunk": 256,
+  "seed": 0,
+  "dataset": "Salesforce/wikitext",
+  "config": "wikitext-2-raw-v1",
+  "split": "test",
+  "join": "\"\n\n\".join(rows)",
+  "protocol": "non-overlapping windows, score positions 1..L-1",
+  "environment": {
+    "python": "3.12.3",
+    "platform": "Linux-6.17.0-23-generic-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "device": "cpu",
+    "torch": "2.14.0+cpu",
+    "transformers": "5.17.0",
+    "datasets": "5.0.1",
+    "numpy": "2.5.3",
+    "safetensors": "0.8.0"
+  }
+}

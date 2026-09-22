@@ -1,0 +1,26 @@
+TG=32      T0 int8       9.000 bpw  scalar    283396 ns   vnni256      150615 ns    23.5 GB/s
+TG=32      T3 fold9 K=2  5.000 bpw  scalar   2060462 ns
+TG=32      Q8_0          8.500 bpw  BASELINE [ingot-simd    act=f32 ]    243564 ns     3.2 MiB    13.7 GB/s
+TG=32      Q8_0          8.500 bpw  BASELINE [ingot-simd    act=int8]    243715 ns     3.2 MiB    13.7 GB/s
+TG=32      Q4_K          4.500 bpw  BASELINE [mynah         act=f32 ]    254532 ns     1.7 MiB     7.0 GB/s
+TG=32      Q4_K          4.500 bpw  BASELINE [mynah         act=int8]    232787 ns     1.7 MiB     7.6 GB/s
+TG=64      T0 int8       8.500 bpw  scalar    224686 ns   avx512-vnni    101740 ns     3.2 MiB    32.9 GB/s   vnni256       88018 ns    38.0 GB/s
+TG=64      T3 fold9 K=2  4.500 bpw  scalar   1768344 ns   vnni256      102794 ns    17.2 GB/s
+TG=64      Q8_0          8.500 bpw  BASELINE [ingot-simd    act=f32 ]    329571 ns     3.2 MiB    10.1 GB/s
+TG=64      Q8_0          8.500 bpw  BASELINE [ingot-simd    act=int8]    313545 ns     3.2 MiB    10.7 GB/s
+TG=64      Q4_K          4.500 bpw  BASELINE [mynah         act=f32 ]    252656 ns     1.7 MiB     7.0 GB/s
+TG=64      Q4_K          4.500 bpw  BASELINE [mynah         act=int8]    232307 ns     1.7 MiB     7.6 GB/s
+TG=128      T0 int8       8.250 bpw  scalar    189007 ns   avx512-vnni     67463 ns     3.1 MiB    48.1 GB/s   vnni256       60696 ns    53.4 GB/s
+TG=128      T3 fold9 K=2  4.250 bpw  scalar   1815598 ns   avx512-vnni     68553 ns     1.6 MiB    24.4 GB/s   vnni256       72493 ns    23.1 GB/s
+TG=128      Q8_0          8.500 bpw  BASELINE [ingot-simd    act=f32 ]    242630 ns     3.2 MiB    13.8 GB/s
+TG=128      Q8_0          8.500 bpw  BASELINE [ingot-simd    act=int8]    242591 ns     3.2 MiB    13.8 GB/s
+TG=128      Q4_K          4.500 bpw  BASELINE [mynah         act=f32 ]    253509 ns     1.7 MiB     7.0 GB/s
+TG=128      Q4_K          4.500 bpw  BASELINE [mynah         act=int8]    232506 ns     1.7 MiB     7.6 GB/s
+TG=256      T0 int8       8.125 bpw  scalar    168735 ns   avx512-vnni     51430 ns     3.0 MiB    62.1 GB/s   vnni256       48801 ns    65.5 GB/s
+TG=256      T3 fold9 K=2  4.125 bpw  scalar   1985602 ns   avx512-vnni     46950 ns     1.5 MiB    34.5 GB/s   vnni256       49724 ns    32.6 GB/s
+TG=256      Q8_0          8.500 bpw  BASELINE [ingot-simd    act=f32 ]    221945 ns     3.2 MiB    15.1 GB/s
+TG=256      Q8_0          8.500 bpw  BASELINE [ingot-simd    act=int8]    221561 ns     3.2 MiB    15.1 GB/s
+TG=256      Q4_K          4.500 bpw  BASELINE [mynah         act=f32 ]    252663 ns     1.7 MiB     7.0 GB/s
+TG=256      Q4_K          4.500 bpw  BASELINE [mynah         act=int8]    232010 ns     1.7 MiB     7.6 GB/s
+
+[exited with code 0]

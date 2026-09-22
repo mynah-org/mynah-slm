@@ -1,0 +1,85 @@
+
+# cpu=AMD EPYC 9254 24-Core Processor
+# neon=0 dotprod=0 i8mm=0 avx2=1 avx512vnni=1  -> vector arm: avx512-vnni
+
+# ===== REAL GGUF: models-local/q-Q3_K_M.gguf =====
+# arch=qwen3  gguf v3  311 tensors
+# type census: F32 x113 (0.2 MiB, 32.000 bpw)  Q3_K x113 (172.0 MiB, 3.438 bpw)  Q4_K x81 (91.7 MiB, 4.500 bpw)  Q5_K x3 (3.4 MiB, 5.500 bpw)  Q6_K x1 (121.7 MiB, 6.562 bpw)  
+
+## gate/up_proj blk.5.ffn_gate.weight    [3072 x 1024]  Q3_K   3.4375 bpw  1.3 MiB
+    Q3_K       [ingot-simd    act=f32 ]     602897 ns     2.2 GB/s  sum|y|=0.4945
+    Q3_K       [ingot-simd    act=int8]     592743 ns     2.3 GB/s  sum|y|=0.4945
+    T3 fold9 K=2  4.125 bpw                 53289 ns    30.4 GB/s  11.12x the real Q3_K(int8)
+    T1 2-bit    2.125 bpw                 44174 ns    18.9 GB/s  13.42x the real Q3_K(int8)
+    T3 pair layout validated (sum|y|=0.3467)
+    T3 pair     REFUSED: this CPU has no FEAT_I8MM (layout is validated, kernel is not measured)
+    threads=1  Q3_K       591635 ns (  2.3 GB/s)   T3 fold9      53413 ns ( 30.4 GB/s)   ternary 11.08x
+    threads=2  Q3_K       301649 ns (  4.5 GB/s)   T3 fold9      27045 ns ( 60.0 GB/s)   ternary 11.15x
+    threads=4  Q3_K       151068 ns (  8.9 GB/s)   T3 fold9      13787 ns (117.6 GB/s)   ternary 10.96x
+
+## down_proj    blk.5.ffn_down.weight    [1024 x 3072]  Q4_K   4.5000 bpw  1.7 MiB
+    Q4_K       [mynah         act=f32 ]     243200 ns     7.3 GB/s  sum|y|=0.6177
+    Q4_K       [mynah         act=int8]     229041 ns     7.7 GB/s  sum|y|=0.6179
+    T3 fold9 K=2  4.125 bpw                 51570 ns    31.5 GB/s  4.44x the real Q4_K(int8)
+    T1 2-bit    2.125 bpw                 42654 ns    19.6 GB/s  5.37x the real Q4_K(int8)
+    T3 pair layout validated (sum|y|=0.6)
+    T3 pair     REFUSED: this CPU has no FEAT_I8MM (layout is validated, kernel is not measured)
+    threads=1  Q4_K       227809 ns (  7.8 GB/s)   T3 fold9      50990 ns ( 31.8 GB/s)   ternary 4.47x
+    threads=2  Q4_K       113578 ns ( 15.6 GB/s)   T3 fold9      25816 ns ( 62.8 GB/s)   ternary 4.40x
+    threads=4  Q4_K        57308 ns ( 30.9 GB/s)   T3 fold9      13507 ns (120.1 GB/s)   ternary 4.24x
+
+## q_proj       blk.5.attn_q.weight      [2048 x 1024]  Q3_K   3.4375 bpw  0.9 MiB
+    Q3_K       [ingot-simd    act=f32 ]     391931 ns     2.3 GB/s  sum|y|=0.4235
+    Q3_K       [ingot-simd    act=int8]     390826 ns     2.3 GB/s  sum|y|=0.4235
+    T3 fold9 K=2  4.125 bpw                 35682 ns    30.3 GB/s  10.95x the real Q3_K(int8)
+    T1 2-bit    2.125 bpw                 28952 ns    19.2 GB/s  13.50x the real Q3_K(int8)
+    T3 pair layout validated (sum|y|=0.3419)
+    T3 pair     REFUSED: this CPU has no FEAT_I8MM (layout is validated, kernel is not measured)
+    threads=1  Q3_K       393099 ns (  2.3 GB/s)   T3 fold9      35836 ns ( 30.2 GB/s)   ternary 10.97x
+    threads=2  Q3_K       198157 ns (  4.5 GB/s)   T3 fold9      18162 ns ( 59.5 GB/s)   ternary 10.91x
+    threads=4  Q3_K       101906 ns (  8.8 GB/s)   T3 fold9      10439 ns (103.6 GB/s)   ternary 9.76x
+
+## o_proj       blk.5.attn_output.weight [1024 x 2048]  Q4_K   4.5000 bpw  1.1 MiB
+    Q4_K       [mynah         act=f32 ]     161225 ns     7.3 GB/s  sum|y|=0.5681
+    Q4_K       [mynah         act=int8]     151883 ns     7.8 GB/s  sum|y|=0.5679
+    T3 fold9 K=2  4.125 bpw                 32675 ns    33.1 GB/s  4.65x the real Q4_K(int8)
+    T1 2-bit    2.125 bpw                 28544 ns    19.5 GB/s  5.32x the real Q4_K(int8)
+    T3 pair layout validated (sum|y|=0.4896)
+    T3 pair     REFUSED: this CPU has no FEAT_I8MM (layout is validated, kernel is not measured)
+    threads=1  Q4_K       151187 ns (  7.8 GB/s)   T3 fold9      32064 ns ( 33.7 GB/s)   ternary 4.72x
+    threads=2  Q4_K        75933 ns ( 15.5 GB/s)   T3 fold9      17289 ns ( 62.5 GB/s)   ternary 4.39x
+    threads=4  Q4_K        38481 ns ( 30.7 GB/s)   T3 fold9       9855 ns (109.7 GB/s)   ternary 3.90x
+
+## k_proj       blk.5.attn_k.weight      [1024 x 1024]  Q3_K   3.4375 bpw  0.4 MiB
+    Q3_K       [ingot-simd    act=f32 ]     197816 ns     2.3 GB/s  sum|y|=0.3724
+    Q3_K       [ingot-simd    act=int8]     195845 ns     2.3 GB/s  sum|y|=0.3724
+    T3 fold9 K=2  4.125 bpw                 17742 ns    30.5 GB/s  11.04x the real Q3_K(int8)
+    T1 2-bit    2.125 bpw                 14694 ns    19.0 GB/s  13.33x the real Q3_K(int8)
+    T3 pair layout validated (sum|y|=0.3387)
+    T3 pair     REFUSED: this CPU has no FEAT_I8MM (layout is validated, kernel is not measured)
+    threads=1  Q3_K       196334 ns (  2.3 GB/s)   T3 fold9      17235 ns ( 31.4 GB/s)   ternary 11.39x
+    threads=2  Q3_K       100175 ns (  4.5 GB/s)   T3 fold9       8984 ns ( 60.2 GB/s)   ternary 11.15x
+    threads=4  Q3_K        50931 ns (  8.8 GB/s)   T3 fold9       5068 ns (106.7 GB/s)   ternary 10.05x
+
+## v_proj       blk.5.attn_v.weight      [1024 x 1024]  Q4_K   4.5000 bpw  0.6 MiB
+    Q4_K       [mynah         act=f32 ]      82866 ns     7.1 GB/s  sum|y|=0.4133
+    Q4_K       [mynah         act=int8]      76502 ns     7.7 GB/s  sum|y|=0.4132
+    T3 fold9 K=2  4.125 bpw                 17689 ns    30.6 GB/s  4.32x the real Q4_K(int8)
+    T1 2-bit    2.125 bpw                 14439 ns    19.3 GB/s  5.30x the real Q4_K(int8)
+    T3 pair layout validated (sum|y|=0.3425)
+    T3 pair     REFUSED: this CPU has no FEAT_I8MM (layout is validated, kernel is not measured)
+    threads=1  Q4_K        76525 ns (  7.7 GB/s)   T3 fold9      17484 ns ( 30.9 GB/s)   ternary 4.38x
+    threads=2  Q4_K        38255 ns ( 15.4 GB/s)   T3 fold9       9113 ns ( 59.3 GB/s)   ternary 4.20x
+    threads=4  Q4_K        19784 ns ( 29.8 GB/s)   T3 fold9       5219 ns (103.6 GB/s)   ternary 3.79x
+
+## lm_head      output.weight            [151936 x 1024]  Q6_K   6.5625 bpw  121.7 MiB
+    Q6_K       [ingot-simd    act=f32 ]   19341812 ns     6.6 GB/s  sum|y|=0.5059
+    Q6_K       [ingot-simd    act=int8]   19340498 ns     6.6 GB/s  sum|y|=0.5059
+    T3 fold9 K=2  4.125 bpw               3894195 ns    20.6 GB/s  4.97x the real Q6_K(int8)
+    T1 2-bit    2.125 bpw               2173571 ns    19.0 GB/s  8.90x the real Q6_K(int8)
+    T3 pair layout validated (sum|y|=0.3415)
+    T3 pair     REFUSED: this CPU has no FEAT_I8MM (layout is validated, kernel is not measured)
+    threads=1  Q6_K     19329647 ns (  6.6 GB/s)   T3 fold9    3888784 ns ( 20.6 GB/s)   ternary 4.97x
+    threads=2  Q6_K      9674647 ns ( 13.2 GB/s)   T3 fold9    1758195 ns ( 45.6 GB/s)   ternary 5.50x
+    threads=4  Q6_K      4880836 ns ( 26.1 GB/s)   T3 fold9     681021 ns (117.8 GB/s)   ternary 7.17x
+

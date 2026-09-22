@@ -433,3 +433,121 @@ Q4_K and 7.7–9.0× against Q6_K on every shape at every thread count. The
 cores** and these threads carry no affinity, so at `nt=4` some land on E-cores.
 **The 1- and 2-thread columns are the reliable ones**; 4-thread absolutes are
 quoted only where the ratio is what matters.
+
+---
+
+# x86: two of my own hypotheses, falsified by measurement
+
+Machine: **AMD EPYC 9254 (Zen 4)**, 24 cores, 377 GB, `avx512_vnni` + `avx512_bf16`
++ `avx512vbmi`. Raw output in `reports/ternary-kernel/box_*.txt`. **This is not
+Axion** — it is x86, so it tests the *other* and stronger prediction in the
+literature (`[PAPER]` "~4.8x on x86-VNNI") and leaves `i8mm` still untested.
+
+## The naive reading, and why it is wrong
+
+`[MEASURED]` `gate/up_proj [3072 × 1024]`, 1 thread, 120 reps, idle box:
+
+| kernel | bpw | ns | GB/s |
+|---|---|---|---|
+| T1 2-bit, avx512-vnni | 2.125 | 42,906 | 19.5 |
+| **T3 fold9, avx512-vnni** | 4.125 | **46,787** | **34.7** |
+| T0 int8 (oracle, **no ternary**) | 8.125 | 48,801 | 65.5 |
+| **Q4_K, ours, int8** | 4.5 | **232,010** | **7.6** |
+| Q8_0, ingot | 8.5 | 221,561 | 15.1 |
+| Q6_K, ingot | 6.5625 | 390,995 | 6.6 |
+
+Read naively that is **4.74× the production `Q4_K` path**, against 2.2× on the
+M1 — apparent confirmation of the paper. It is not. Three controls take it
+apart, and **all three contradicted a hypothesis I had already written down.**
+
+## Control 1 — the ISA. HYPOTHESIS FALSIFIED  `[MEASURED]`
+
+My claim was: *our `Q4_K` is slow on x86 because every production kernel we own
+is AVX2 with the pre-VNNI `maddubs + madd` pair.* `grep -c _mm512` returned **0**
+in `src/qmat.c` and **0** in `third_party/ingot/src/kernels.c`, so the claim was
+at least well-founded. I ported the AVX-512 VNNI path from qwen-tts and A/B'd it
+on one machine, changing only the library's flags:
+
+| | `objdump \| grep -c vpdpbusd` | `Q4_K` int8 |
+|---|---|---|
+| `-march=native` | **1** | 228,185 ns |
+| `-mno-avx512f -mno-avx512bw -mno-avx512vnni -mno-avx512vl` | **0** | 229,124 ns |
+
+**0.4%, inside the noise**, with `objdump` proving the kernel really changed.
+
+`[DERIVED]` Why, counted afterwards: per 64 elements the kernel does **one**
+`dpbusd` against **two `hsum256i`** (≈6 ops each) and **six float scale
+operations**. The multiply-accumulate is about **1/20 of the work**. Replacing
+4 instructions with 1 could never have bought more than ~12%, and bought 0.4%.
+**The MAC instruction was never the bottleneck.**
+
+## Control 2 — the register width. HYPOTHESIS FALSIFIED  `[MEASURED]`
+
+My second claim was that 512-bit ternary against 256-bit `Q4_K` was 4× of unearned
+width. The `vnni256` arm runs the identical algorithm at 256 bits:
+
+| format | 512-bit | 256-bit | |
+|---|---|---|---|
+| T0 int8 | 51,430 | **48,801** | 256-bit is **faster** |
+| T3 fold9 | 46,950 | 49,724 | 512-bit +5.9% |
+| T3 K=3 | 85,369 | 89,370 | +4.7% |
+| T1 2-bit | 42,906 | 51,180 | +19% |
+
+**Register width is worth single-digit percent here, not 4×.**
+
+## Control 3 — the scale granularity. THIS is the cause  `[MEASURED]`
+
+What was left: ggml's K-quants carry an f32 scale **every 32 weights**, so a
+256-weight superblock pays **8 horizontal reductions and 8 float epilogues**.
+Our ternary block carries **one scale per 256** — and therefore **one**. So
+`TG` was made settable from the build and swept, changing nothing else:
+
+**T0 int8 — plain int8 weights, not a trit in sight:**
+
+| TG | bpw | ns | GB/s |
+|---|---|---|---|
+| **32** (ggml's granularity) | 9.000 | **150,615** | 23.5 |
+| 64 | 8.500 | 88,018 | 38.0 |
+| 128 | 8.250 | 60,696 | 53.4 |
+| **256** | 8.125 | **48,801** | 65.5 |
+
+**`[MEASURED]` 3.09× from scale granularity alone.** Same bit width, same
+kernel, same weights, same machine. T3 fold9 shows the same shape: 102,794 ns at
+TG=64 → 46,787 at TG=256, **2.20×**.
+
+### The bpw-matched comparison, which is the one that counts
+
+At TG=64 the ternary format costs **exactly 4.5 bpw — the same as `Q4_K`**:
+
+| | bpw | ns | |
+|---|---|---|---|
+| T3 fold9, TG=64 | **4.500** | 102,794 | |
+| `Q4_K`, ours, int8 | **4.500** | 232,307 | **2.26×** |
+
+**So of the headline 4.74×, roughly half was scale granularity and not the
+representation at all.** And the bpw-matched x86 figure, **2.26×**, lands on top
+of the M1's **2.2×**, where both sides were already our own `sdot` kernels.
+
+`[MEASURED]` **The honest, ISA-independent, bpw-matched ternary advantage is
+~2.2× on both architectures measured so far.** The 4.7× was an artifact of
+comparing formats at different scale granularities.
+
+### What this hands the engine, independently of ternary
+
+`[DERIVED]` A coarser scale group is worth up to **3.09×** on an int8 GEMV and
+costs bits: a scale every 32 weights is **1.000 bpw**, every 256 is **0.125**.
+That trade is available to *any* format, including the ones we already ship, and
+it is a quality question — coarser scales mean a wider dynamic range per group —
+which Gate A has never measured. `[UNKNOWN]` where that curve turns.
+
+### Limitations, stated
+
+- `[MEASURED, limitation]` **T3 fold9 has no vector kernel at TG=32**: the AVX-512
+  unpack consumes 128 codes per iteration and the 2-bit one 256, both larger than
+  the group. Only the scalar reference ran there, so the T3 row at ggml's own
+  granularity is missing and the bpw-matched comparison uses TG=64.
+- `[MEASURED, limitation]` `Q8_0`'s baseline moved between runs (221,561 /
+  243,715 / 313,545 ns) although `TG` cannot affect it. `Q4_K` was stable within
+  0.3% across every run, so `Q4_K` is the baseline quoted; the `Q8_0` spread is
+  recorded rather than averaged away.
+- `[UNKNOWN]` **`i8mm` on Neoverse V2 is still untested.** Nothing here touches it.

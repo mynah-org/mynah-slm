@@ -1693,3 +1693,60 @@ by up to 49%. The 4B measurement is therefore *more* important after Phase F,
 not less: it is the only way to tell whether there is a real non-monotonic
 pattern (0.6B < 1.7B > 4B) or whether the paper's larger-model numbers are as
 unreliable as its 1.7B one.
+
+
+---
+
+# PHASE G — Qwen3-4B closes the quality series, and reverses it  `[MEASURED]`
+
+Run on an AMD EPYC 9254 (377 GB), not the Mac: a 4B fp16 eval needs 8 GB of
+weights and the Mac harness peaked at 2x that until `device_map` was fixed.
+Same locked protocol: 146 non-overlapping 2048-token windows, WikiText-2-raw
+test, positions 1..L-1, 298,862 tokens scored.
+
+## The harness validates itself across two machines
+
+`[MEASURED]` Qwen3-4B BF16, same protocol, everything else different:
+
+| | ppl |
+|---|---|
+| Mac, **fp16 / MPS**, torch 2.13, transformers 5.14 | **13.6382** |
+| Box, **fp32 / CPU**, torch 2.14, transformers 5.17 | **13.6377** |
+
+**Agreement to 0.004%.** Different device, different dtype, different library
+versions. The protocol is not a property of the machine, so the 0.6B, 1.7B and
+4B numbers are comparable with each other.
+
+## The series
+
+| model | BF16 | PTQTP artifact | **ratio ours** | ratio `[PAPER]` |
+|---|---|---|---|---|
+| Qwen3-0.6B | 20.9541 | 35.2560 | 1.683 | 1.819 |
+| Qwen3-1.7B | 16.6676 | 48.2450 | **2.894** | 1.944 |
+| **Qwen3-4B** | **13.6377** | **16.3804** | **1.201** | 1.338 |
+
+`[MEASURED]` **At 4B, ternarization costs +20% perplexity** — against +68% at
+0.6B and +189% at 1.7B.
+
+## Three consequences
+
+1. **The non-monotone pattern is real and independently reproduced.** Ours
+   1.683 → 2.894 → 1.201; the paper's 1.819 → 1.944 → 1.338. Same shape, **1.7B
+   the worst case in both**. Phase F falsified "small models are fragile" from
+   below; Phase G confirms it from above.
+2. **The paper's magnitudes stay unreliable, and not by a constant.** The
+   artifact is 7% better than the paper at 0.6B, **49% worse** at 1.7B, 10%
+   better at 4B. No correction factor maps one population onto the other, and
+   the sign does not even hold. They must keep being reported separately.
+3. **It moves the target.** Every conclusion in this study was drawn at 0.6B,
+   where ternary costs +68% and is not a candidate. At 4B it costs +20% — close
+   to what `Q3_K_M` costs *at 0.6B* (+17.6%, 24.6408 vs 20.9541). `[HYPOTHESIS]`
+   the interesting target for a ternary format is not the 0.6B model this repo
+   ships. `[UNKNOWN]` whether the trend continues at 8B and beyond; the paper
+   claims it does (1.215 at 8B, 1.164 at 32B) and the paper has been wrong by
+   49% once already.
+
+`[UNKNOWN]` **Gate A is still not closed.** Perplexity is a proxy; no
+behavioural or tool-call evaluation has been run on any ternary checkpoint at
+any size, and this study has already documented that reconstruction error does
+not predict sensitivity.
