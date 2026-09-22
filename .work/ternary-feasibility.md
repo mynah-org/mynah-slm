@@ -1750,3 +1750,36 @@ versions. The protocol is not a property of the machine, so the 0.6B, 1.7B and
 behavioural or tool-call evaluation has been run on any ternary checkpoint at
 any size, and this study has already documented that reconstruction error does
 not predict sensitivity.
+
+---
+
+# CORRECTION — the Q3_K_M size that beat PTQTP was a BUDGET number, not a file
+
+`[MEASURED]` Checking the real containers while writing the recap:
+
+| file | size | tensors | `output.weight` |
+|---|---|---|---|
+| `Qwen3-0.6B-Q4_K_M.gguf` (community) | **378.3 MiB** | 310 | **ABSENT — tied** |
+| `q-Q4_K_M.gguf` (ours) | **461.8 MiB** | 311 | **Q6_K** |
+| `q-Q3_K_M.gguf` (ours) | **394.8 MiB** | 311 | **Q6_K** |
+
+**The GGUFs we quantized here store the tied lm_head TWICE** — `token_embd` plus
+a separate `output.weight` — while the community build stores it once and lets
+the lm_head read the embedding. `[DERIVED]` That duplicate `output.weight` is
+**121.7 MiB**, and `token_embd` + `output` are **47.0%** of our Q3_K_M file.
+
+Consequences for claims already made in this note:
+
+- `[CORRECTED]` **"Q3_K_M is 302.4 MiB"** is a **budget-model prediction**
+  (§Phase 0 table), not a measured file. The file we actually built and
+  perplexity-scored is **394.8 MiB**. The budget model was validated against the
+  *community* Q4_K_M, which is tied — so it models the tied layout, and our own
+  quantizer does not produce it.
+- `[MEASURED]` **The direction of "Q3_K_M beats PTQTP on both axes" survives**,
+  because PTQTP-as-implemented is 369.4 MiB and a *tied* Q3_K_M is ~273 MiB. But
+  **the specific pair of numbers quoted earlier compared a budget estimate with
+  a measured artifact**, which is not a comparison. Any size claim from here on
+  states which of the three it is: budget, our file, or a tied file.
+- `[UNKNOWN]` Why our conversion untied the output tensor. It is worth fixing
+  regardless of ternary: it is **121.7 MiB of pure duplication in every quant we
+  build**, and it is the single largest tensor in the model.
