@@ -110,6 +110,9 @@ per commit, listed in the matrix note.
 - [~] **G1** — CUDA backend foundation for Qwen3 (GQA, head_dim 128, NeoX RoPE,
       RMSNorm / QK-norm): vtable + CPU backend + kernels compiled for sm_80/89/90,
       never run on a GPU; forward pass not wired yet → [`.work/cuda-backend.md`](.work/cuda-backend.md)
+- [~] **G2** — backend-driven forward (decode, prefill, multi-sequence over
+      slots) and `run --device cpu|cuda`; memcmp-equal to the CPU path on the
+      CPU backend, never run on a GPU; server not wired yet → [`.work/cuda-backend.md`](.work/cuda-backend.md)
 
 ### R — research items
 
