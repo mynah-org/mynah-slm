@@ -58,6 +58,7 @@ typedef struct {
     int    header_sent;     /* the SSE header went out (at admission) */
     int    client_gone;
     int    shutdown;        /* cancelled because the server is stopping */
+    int    stop;            /* mynah_slm_stop: why the generation ended */
     char   error[192];      /* why it was refused or failed */
 } slots_result;
 

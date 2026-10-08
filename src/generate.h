@@ -72,6 +72,16 @@ typedef struct {
      * else waits. NULL = never cancelled (the CLI). */
     int  (*cancel)(void *ctx);
     void  *cancel_ctx;
+
+    /* Positions the sequence's cache holds. A generation that reaches it
+     * stops as LENGTH before stepping — a full context ends an answer the
+     * same way max_new does, it is not a failed forward pass. 0 = no limit
+     * known here (generate() fills it from the state it is given). */
+    uint32_t n_ctx;
+
+    /* Optional: receives why the generation stopped (generate() only; a
+     * caller driving mynah_slm_gen reads gen.stop). */
+    int  *stop_out;
 } mynah_slm_gen_params;
 
 /* Zero the params and DISABLE both channel splits.
@@ -186,8 +196,9 @@ long mynah_slm_generate_driver(const mynah_slm_gen_driver *d, const mynah_slm_to
 /* Prompt tokens still to prefill. */
 size_t mynah_slm_gen_prefill_left(const mynah_slm_gen *g);
 
-/* Does this generation want a decode step: prefill done, not stopped, and
- * fewer than max_new steps taken. */
+/* Does this generation want a decode step: prefill done, not stopped,
+ * fewer than max_new steps taken, and room in the context (n_ctx). When it
+ * stops wanting one for either limit, stop = LENGTH. */
 int  mynah_slm_gen_wants_step(const mynah_slm_gen *g);
 
 /* The token the next decode step must feed to the forward pass. */

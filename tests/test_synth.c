@@ -189,6 +189,35 @@ static void check_generate(mynah_slm_model_t *m, mynah_slm_tokenizer *tok) {
         mynah_slm_sampler_free(s3);
     }
 
+    /* A full context is a LENGTH stop, not a failed step: a cache of
+     * n_prompt + 3 positions holds 4 decode steps (the first writes
+     * position n_prompt - 1), then the generation ends cleanly. */
+    {
+        mynah_slm_state small;
+        if (mynah_slm_state_init_kv(&small, m, (uint32_t)n_prompt + 3, MYNAH_SLM_KV_F32,
+                                    MYNAH_SLM_KV_F32, err, sizeof err) == 0) {
+            mynah_slm_gen_params g3 = gp;
+            collect c3;
+            memset(&c3, 0, sizeof c3);
+            g3.cb_ctx = &c3;
+            g3.n_eos = 0;                     /* only the context can stop it */
+            int stop = -1;
+            g3.stop_out = &stop;
+            mynah_slm_sampler *s4 = mynah_slm_sampler_new(&sp, vocab);
+            const long n = mynah_slm_generate(&small, tok, s4, &g3, NULL);
+            snprintf(detail, sizeof detail, "%ld tokens (want 4), stop %d (want LENGTH %d), "
+                     "n_past %u of %u", n, stop, (int)MYNAH_SLM_STOP_LENGTH, small.own.n_past,
+                     small.own.n_ctx);
+            check("a full context ends the generation as LENGTH, every position used",
+                  n == 4 && stop == MYNAH_SLM_STOP_LENGTH && small.own.n_past == small.own.n_ctx,
+                  detail);
+            mynah_slm_sampler_free(s4);
+            mynah_slm_state_free(&small);
+        } else {
+            check("a small state", 0, err);
+        }
+    }
+
     /* The same generation driven by hand the way a scheduler drives it: a
      * workspace with no sequence of its own, a separate sequence, the prompt
      * in slices of 5, then one accept_logits per forward. */

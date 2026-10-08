@@ -35,6 +35,12 @@ int mynah_slm_gen_start(mynah_slm_gen *g, const mynah_slm_tokenizer *tok,
     return 0;
 }
 
+/* The next decode step writes position (n_prompt - 1) + step: it needs
+ * that position to exist in the cache. */
+static int out_of_room(const mynah_slm_gen *g) {
+    return g->p.n_ctx && (uint64_t)(g->p.n_prompt - 1) + g->step >= g->p.n_ctx;
+}
+
 size_t mynah_slm_gen_prefill_left(const mynah_slm_gen *g) {
     return g->decoding ? 0 : (g->p.n_prompt - 1) - g->prefilled;
 }
@@ -101,11 +107,14 @@ int mynah_slm_gen_prefill_driver(mynah_slm_gen *g, const mynah_slm_gen_driver *d
     g->next = g->p.prompt[g->p.n_prompt - 1];
     if (g->sam) mynah_slm_sampler_accept(g->sam, g->next);
     g->decoding = 1;
+    if (!out_of_room(g) && g->step < g->p.max_new) return 1;
+    g->stop = MYNAH_SLM_STOP_LENGTH;      /* no step fits: done, not failed */
     return 1;
 }
 
 int mynah_slm_gen_wants_step(const mynah_slm_gen *g) {
-    return g->decoding && g->stop == MYNAH_SLM_STOP_NONE && g->step < g->p.max_new;
+    return g->decoding && g->stop == MYNAH_SLM_STOP_NONE && g->step < g->p.max_new &&
+           !out_of_room(g);
 }
 
 uint32_t mynah_slm_gen_next_token(const mynah_slm_gen *g) { return g->next; }
@@ -174,13 +183,16 @@ int mynah_slm_gen_accept_logits(mynah_slm_gen *g, float *logits) {
     g->next = id;
 
 out:
-    if (g->step >= p->max_new) { g->stop = MYNAH_SLM_STOP_LENGTH; return 0; }
+    if (g->step >= p->max_new || out_of_room(g)) { g->stop = MYNAH_SLM_STOP_LENGTH; return 0; }
     return 1;
 }
 
 void mynah_slm_gen_finish(mynah_slm_gen *g) {
     if (g->finished) return;
     g->finished = 1;
+    /* A generation that ran out of steps (max_new 0) without saying so. */
+    if (g->decoding && g->stop == MYNAH_SLM_STOP_NONE && !mynah_slm_gen_wants_step(g))
+        g->stop = MYNAH_SLM_STOP_LENGTH;
     if (g->t) mynah_slm_timing_end_decode(g->t);
 
     const mynah_slm_token_cb cb[CH_N] = { g->p.cb, g->p.cb_think, g->p.cb_tool };
@@ -195,10 +207,12 @@ void mynah_slm_gen_finish(mynah_slm_gen *g) {
 long mynah_slm_generate(mynah_slm_state *st, const mynah_slm_tokenizer *tok,
                         mynah_slm_sampler *sam, const mynah_slm_gen_params *p,
                         mynah_slm_timing *t) {
-    if (!st) return -1;
+    if (!st || !p) return -1;
     ref_driver r = { st, &st->own };
     const mynah_slm_gen_driver d = { ref_prefill, ref_step, mynah_slm_batch_max(st), &r };
-    return mynah_slm_generate_driver(&d, tok, sam, p, t);
+    mynah_slm_gen_params q = *p;
+    if (q.n_ctx == 0) q.n_ctx = st->own.n_ctx;     /* the cache it runs on */
+    return mynah_slm_generate_driver(&d, tok, sam, &q, t);
 }
 
 long mynah_slm_generate_driver(const mynah_slm_gen_driver *d, const mynah_slm_tokenizer *tok,
@@ -207,8 +221,10 @@ long mynah_slm_generate_driver(const mynah_slm_gen_driver *d, const mynah_slm_to
     if (!d || !p || p->n_prompt == 0) return -1;
 
     mynah_slm_gen g;
+    if (p->stop_out) *p->stop_out = MYNAH_SLM_STOP_ERROR;
     if (mynah_slm_gen_start(&g, tok, sam, p, t) != 0) return -1;
     if (mynah_slm_gen_prefill_driver(&g, d, 0) != 1) {
+        if (p->stop_out) *p->stop_out = (int)g.stop;
         if (g.stop != MYNAH_SLM_STOP_CANCELLED) return -1;
         mynah_slm_gen_finish(&g);
         return 0;                    /* cancelled during the prompt: nothing generated */
@@ -227,5 +243,6 @@ long mynah_slm_generate_driver(const mynah_slm_gen_driver *d, const mynah_slm_to
         mynah_slm_gen_accept_logits(&g, logits);
     }
     mynah_slm_gen_finish(&g);
+    if (p->stop_out) *p->stop_out = (int)g.stop;
     return g.produced;
 }

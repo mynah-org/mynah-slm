@@ -243,7 +243,7 @@ static int answer_cb(void *ctx, uint32_t id, const char *text, size_t len) {
  * parsed out of its channel, the finish reason, and the final SSE frames or the
  * whole JSON response. `buf` is the answer text (non-stream; may be NULL) and
  * is trimmed in place; `usage` is the rendered "usage":{...} member. */
-static void send_completion(http_conn *conn, int stream, const char *req_id,
+static void send_completion(http_conn *conn, int stream, int stop, const char *req_id,
                             const char *model_json, char *buf, size_t used,
                             const char *tool, size_t tool_used, const char *usage) {
     /* A function call is data, not prose: it leaves the answer channel empty
@@ -264,7 +264,10 @@ static void send_completion(http_conn *conn, int stream, const char *req_id,
             if (calls_json) mynah_slm_tool_calls_to_json(parsed, n_parsed, calls_json, nj);
         }
     }
-    const char *finish = calls_json ? "tool_calls" : "stop";
+    /* "length" when max_tokens or the context ended the answer — a client
+     * must be able to tell a truncated answer from a finished one. */
+    const char *finish = calls_json ? "tool_calls"
+                       : stop == MYNAH_SLM_STOP_LENGTH ? "length" : "stop";
 
     /* The newline the template puts between an answer and a call is glue, not
      * content. Only trimmed when a call actually followed. */
@@ -505,7 +508,7 @@ static void chat_slots(server_ctx *c, http_conn *conn, const uint32_t *ids, size
             r.tm.load_s * 1000.0, r.tm.ttft_s * 1000.0,
             mynah_slm_prefill_tok_s(&r.tm), mynah_slm_decode_tok_s(&r.tm), r.tm.n_threads,
             r.queue_ms, c->slots);
-        send_completion(conn, stream, req_id, model_json, r.content, r.content_used,
+        send_completion(conn, stream, r.stop, req_id, model_json, r.content, r.content_used,
                         r.tool, r.tool_used, usage);
     }
     free(r.content);
@@ -741,6 +744,10 @@ static void handle_chat(server_ctx *c, http_conn *conn,
     }
     cancel_ctx cc = { .conn = conn, .answer = &e };
     gp.cancel = chat_cancel; gp.cancel_ctx = &cc;
+    /* n_ctx left 0: generate() takes the cache's own size, so a full
+     * context is a LENGTH stop, not a failed step. */
+    int stop_reason = MYNAH_SLM_STOP_NONE;
+    gp.stop_out = &stop_reason;
     mynah_slm_generate(&st, c->tok, sam, &gp, &tm);
 
     mynah_slm_sampler_free(sam);
@@ -789,7 +796,7 @@ static void handle_chat(server_ctx *c, http_conn *conn,
         tm.load_s * 1000.0, tm.ttft_s * 1000.0,
         mynah_slm_prefill_tok_s(&tm), mynah_slm_decode_tok_s(&tm), tm.n_threads);
 
-    send_completion(conn, stream, req_id, model_json, e.buf, e.used,
+    send_completion(conn, stream, stop_reason, req_id, model_json, e.buf, e.used,
                     e_tool.buf, e_tool.used, usage);
     free(e_tool.buf);
     free(e.buf);

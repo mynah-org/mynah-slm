@@ -110,7 +110,7 @@ for line in open(sys.argv[1],'rb').read().decode('utf-8','replace').splitlines()
 print(repr(''.join(out)))" "$TMP/stream0")
 [ "$STREAMED" = "$(cat "$TMP/ref0")" ] && ok "a stream batched with them reassembles to the same text" \
     || bad "streamed == reference" "stream=$STREAMED ref=$(cat "$TMP/ref0")"
-grep -q '"finish_reason":"stop"' "$TMP/stream0" && grep -q 'queue_ms' "$TMP/stream0" \
+grep -q '"finish_reason":"length"' "$TMP/stream0" && grep -q 'queue_ms' "$TMP/stream0" \
     && ok "the stream's final event carries finish_reason and queue_ms" \
     || bad "final SSE event" "$(tail -c 400 "$TMP/stream0")"
 
@@ -345,6 +345,60 @@ grep -q "^fifth_final HTTP/1.1 200" "$TMP/ghost.out" && ok "... and served once 
     || bad "the live client is served" "$(grep fifth "$TMP/ghost.out")"
 fi
 
+if want 10; then
+# ── 10. the context ends an answer as "length", in both modes ────────────────
+# Review B3: in --slots mode a request whose max_tokens ran past the context
+# failed its step at the full cache and got a 500 with its text lost; neither
+# mode ever said finish_reason "length" (not for max_tokens either).
+for MODE in 1 2; do
+    start "$TMP/ctx$MODE.log" --slots $MODE --ctx 96
+    python3 - "$PORT" > "$TMP/ctx$MODE.out" 2>&1 <<'PY'
+import json, socket, sys
+port = int(sys.argv[1])
+def post(n, stream):
+    b = json.dumps({'messages': [{'role': 'user', 'content': 'Hello there'}], 'max_tokens': n,
+                    'stream': stream, 'temperature': 0}).encode()
+    s = socket.create_connection(('127.0.0.1', port)); s.settimeout(120)
+    s.sendall(b'POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n' % len(b) + b)
+    r = b''
+    while True:
+        c = s.recv(65536)
+        if not c: break
+        r += c
+    return r
+r = post(400, False)
+st = r.split(b'\r\n')[0].decode()
+try:
+    d = json.loads(r.split(b'\r\n\r\n', 1)[1].decode('utf-8', 'replace'))
+    u = d['usage']
+    print('json', st, d['choices'][0]['finish_reason'], u['prompt_tokens'] + u['completion_tokens'],
+          len(d['choices'][0]['message']['content']) > 0)
+except Exception as e:
+    print('json', st, 'unparsable', r[-160:])
+r = post(400, True)
+fr = [json.loads(l[6:])['choices'][0]['finish_reason'] for l in r.decode('utf-8', 'replace').splitlines()
+      if l.startswith('data: {') and '"choices"' in l]
+print('stream', 'error' if b'"error"' in r else 'noerror', fr[-1] if fr else None, r.endswith(b'data: [DONE]\n\n'))
+d = json.loads(post(3, False).split(b'\r\n\r\n', 1)[1].decode('utf-8', 'replace'))
+print('short', d['choices'][0]['finish_reason'], d['usage']['completion_tokens'])
+PY
+    stop
+    J=$(grep '^json' "$TMP/ctx$MODE.out")
+    [ "$J" = "json HTTP/1.1 200 OK length 97 True" ] \
+        && ok "--slots $MODE: max_tokens past a 96-token context: 200, finish_reason length, every position used" \
+        || bad "--slots $MODE: a full context is a length stop" "$J (want: 200 length 97 True)"
+    S2=$(grep '^stream' "$TMP/ctx$MODE.out")
+    [ "$S2" = "stream noerror length True" ] && ok "--slots $MODE: ... streamed too (final frame says length)" \
+        || bad "--slots $MODE: a full context ends a stream with length" "$S2"
+    SH=$(grep '^short' "$TMP/ctx$MODE.out")
+    [ "$SH" = "short length 3" ] && ok "--slots $MODE: max_tokens 3 says length" \
+        || bad "--slots $MODE: max_tokens ends as length" "$SH"
+done
+fi
+
+if grep -l "Sanitizer" "$TMP"/*.log >/dev/null 2>&1; then
+    bad "no sanitizer report in any server log" "$(grep -h -A3 Sanitizer "$TMP"/*.log | head -12)"
+fi
 echo
 [ $fail -eq 0 ] && echo "PASS" || { echo "FAILED ($fail)"; tail -n 20 "$TMP"/*.log; }
 exit $fail

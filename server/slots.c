@@ -228,6 +228,9 @@ static int e_admit(void *ud, void *job, uint32_t slot) {
     r->gp.prompt = r->p.ids;
     r->gp.n_prompt = r->p.n_prompt;
     r->gp.max_new = r->p.max_new;
+    /* The slot's cache may be smaller than prompt + max_new (capped by the
+     * context): reaching its end is a LENGTH stop, never a failed step. */
+    r->gp.n_ctx = S.seqs[slot].n_ctx;
     r->gp.eos = r->p.eos;
     r->gp.n_eos = r->p.n_eos;
     r->gp.cb = answer_cb;
@@ -514,6 +517,7 @@ static int run_entered(http_conn *conn, const slots_params *p, slots_result *out
     out->queue_ms = r->admitted_at > 0.0 ? (r->admitted_at - r->created) * 1000.0 : 0.0;
     out->client_gone = atomic_load(&r->gone);
     out->shutdown = atomic_load(&r->shutdown);
+    out->stop = r->started ? (int)r->gen.stop : MYNAH_SLM_STOP_NONE;
     if (r->oom && out->outcome == MYNAH_SLM_JOB_DONE) out->outcome = MYNAH_SLM_JOB_FAILED;
     snprintf(out->error, sizeof out->error, "%s", r->error);
     pthread_mutex_unlock(&r->mu);
