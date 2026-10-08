@@ -478,6 +478,71 @@ sync, vocab x 4 bytes — 0.6 MB at 151936) because the sampler owns the pick;
 sampler is pure greedy. The host logits buffer is pageable; pinned memory
 needs a backend op that does not exist yet.
 
+### G2-c — `mynah_slm_bfwd_multi`: one decode step over slot-pool rows
+
+- n different sequences, one token each, `forward_multi`'s shape: the
+  per-row table (row → KV handle, position) is rebuilt from the arguments
+  on EVERY step, so a dropped row (finished, failed, cancelled) is just not
+  passed; rows validated before anything is queued (full row, id past the
+  vocabulary, a sequence or a cache named twice → the whole step refused,
+  nobody moves); `n_past` moves only after the whole step. One d2h of the
+  `[n][vocab]` logits = the step's one wait. `n == 1` is `bfwd_step`.
+- Projections per row (n matvecs: each row is its solo step's arithmetic)
+  or one matmat over the n rows (`mynah_slm_bfwd_set_multi_product`); the
+  default follows the reference's `MYNAH_SLM_DECODE_PRODUCT` on the CPU
+  backend and is the matmat on a device (one launch; the CUDA matmat runs
+  the GEMV kernel per row, so per-row arithmetic is the same either way).
+  Attention per sequence (n_q = 1 at its own position).
+- Sequences are `bseq_bind`-ed to the KV of a `mynah_slm_bslots` slot
+  (`mynah_slm_bfwd_kv_desc` gives the pool's description). Release never
+  waits (fence recorded, slot parked); the next step simply excludes the
+  row. On a single stream a released slot's late work is ordered before
+  anything the next request queues; the fence additionally keeps it out of
+  `acquire` until that work has passed.
+
+Evidence (`tests/test_forward_backend.c`, 4 fixtures × KV f32/bf16 × both
+products = 16 runs, 4 rows over a 4-slot pool, 8 steps, prompts of
+different lengths so rows sit at different positions):
+
+- every row of every step `memcmp`-identical to `mynah_slm_forward_multi`
+  on the reference with the same live set and the same product;
+- matvec product: every row `memcmp`-identical to the same request stepped
+  ALONE through the backend (solo == batched, worst rel 0); matmat: worst
+  rel 2.3e-7 … 7.9e-7 vs solo, same argmax (the sgemm reorder, gate 1e-4);
+- at step 3 row 1's slot is released and the row dropped; the others keep
+  matching; at step 5 a new request acquires the same slot index with a
+  newer generation, its inherited (uncleared) KV is invisible: its rows
+  match the reference too;
+- a step with a full row, or a sequence twice, fails and moves nobody.
+- **Mutation checks**: row 2 roped/appended at pos + 1 → 33 FAIL; row 1
+  pointed at row 0's cache → 33 FAIL. Reverted, re-passed.
+
+**Server: not wired, by design of this step.** `server/` defaults are
+untouched. The integration point, for whoever adds `--device` there
+(`server/slots.c`, the `S` engine):
+1. `slots_start`: open the backend, `mynah_slm_bfwd_create(be, m,
+   {ctx_cap, batch_max, dec_max = n_slots, bf16, bf16})`, a pool via
+   `mynah_slm_backend_slots_create` with `mynah_slm_bfwd_kv_desc(f,
+   ctx_cap)`, and one `mynah_slm_bseq` + `mynah_slm_bfwd_run` per slot
+   bound to the slot's KV (the scheduler's slot index = the pool's, so
+   either acquire in `e_admit` or bind slot i once at start);
+2. `e_admit`: `mynah_slm_bseq_reset` instead of `mynah_slm_seq_reserve`
+   (the KV is pooled at ctx_cap);
+3. `e_prefill`: `mynah_slm_gen_prefill_driver(&r->gen, &drv[slot], budget)`
+   with `mynah_slm_bfwd_driver`;
+4. `e_step`: `mynah_slm_bfwd_multi(f, bseqs, toks, m, hostlogits)` and hand
+   row k (`hostlogits + k * vocab`) to `mynah_slm_gen_accept_logits`;
+5. `e_retire`: `mynah_slm_backend_slot_release` if the pool is acquired
+   per request; after a failed step, `mynah_slm_backend_recover` on the
+   scheduler thread decides between retiring that request and reopening;
+6. the serialized path (`server/main.c`, no `--slots`) uses
+   `mynah_slm_generate_driver` exactly as the CLI does; `/health` and the
+   per-request timings carry `timing.device`.
+Not done here because it touches both server files, `/health`, the
+serialized path and the server's own tests — a change with its own gate
+(`make test-server-slots` with `--device cpu-backend` byte-equal to the
+default), not a footnote to this one.
+
 ## Conclusion
 
 G1-a: **KEEP** — the boundary exists, the CPU side of it is the engine's own

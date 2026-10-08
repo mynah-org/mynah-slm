@@ -22,6 +22,20 @@
  *   - refusals touch nothing: a full sequence, a token past the vocabulary,
  *     a prefill wider than the forward was sized for.
  *
+ * And the slot-scheduler step (mynah_slm_bfwd_multi), per fixture, KV and
+ * product (n matvecs / one matmat), over sequences held in a
+ * mynah_slm_bslots pool:
+ *   - every row of every step memcmp-identical to mynah_slm_forward_multi on
+ *     the reference with the same live set (same product selected there);
+ *   - with the matvec product every row also memcmp-identical to that
+ *     sequence stepped ALONE through the backend (solo == batched); with
+ *     matmat, within 1e-4 relative and the same argmax (a sgemm reorder);
+ *   - a row cancelled mid-generation (slot released, row left out of the
+ *     next step) changes nobody else's bits, and the slot it frees serves a
+ *     NEW request whose rows again match the reference;
+ *   - a step with a full sequence, or one sequence named twice, fails and
+ *     moves nobody.
+ *
  * SPDX-License-Identifier: MIT */
 #include "arch_qwen3.h"
 #include "backend.h"
@@ -34,6 +48,7 @@
 #include "threads.h"
 #include "tokenizer.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -311,6 +326,222 @@ static void check_driver(const fx *x, mynah_slm_backend *b, const mynah_slm_toke
     printf("     %s\n", detail);
 }
 
+/* ── several sequences per step, over a slot pool ─────────────────────── */
+
+#define MROWS  4
+#define MSTEPS 8
+
+static double rel_diff(const float *a, const float *b, size_t n) {
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        const double d = fabs((double)a[i] - (double)b[i]);
+        if (d > num) num = d;
+        if (fabs((double)a[i]) > den) den = fabs((double)a[i]);
+    }
+    return den > 0.0 ? num / den : num;
+}
+
+/* Request r's prompt: a different slice and length per request, so rows sit
+ * at different positions. */
+static void prompt_of(const fx *x, uint32_t r, const uint32_t **p, uint32_t *len) {
+    const long off = (long)(r * 5) % (x->n_tok / 2);
+    long l = 4 + 11 * (long)r;
+    if (off + l > x->n_tok) l = x->n_tok - off;
+    *p = x->ids + off;
+    *len = (uint32_t)l;
+}
+
+static int ref_prefill(mynah_slm_state *ws, mynah_slm_seq *q, const uint32_t *p, uint32_t len) {
+    mynah_slm_seq_reset(q);
+    for (uint32_t i = 0; i + 1 < len; i += 11) {
+        uint32_t t = (len - 1) - i;
+        if (t > 11) t = 11;
+        if (mynah_slm_seq_forward_batch(ws, q, p + i, t, NULL) != 0) return -1;
+    }
+    return 0;
+}
+
+static int b_prefill(mynah_slm_bfwd *f, mynah_slm_bseq *q, const uint32_t *p, uint32_t len,
+                     char *err, size_t errsz) {
+    mynah_slm_bseq_reset(q);
+    for (uint32_t i = 0; i + 1 < len; i += 11) {
+        uint32_t t = (len - 1) - i;
+        if (t > 11) t = 11;
+        if (mynah_slm_bfwd_prefill(f, q, p + i, t, NULL, err, errsz) != 0) return -1;
+    }
+    return 0;
+}
+
+typedef struct {
+    int      live;
+    uint32_t slot, req;
+    uint64_t gen;
+    uint32_t next;
+    mynah_slm_seq  ref;     /* the reference sequence */
+    mynah_slm_bseq bs;      /* borrowed: the slot's KV */
+    mynah_slm_bseq solo;    /* owned: the same request stepped alone */
+} mrow;
+
+static void check_multi(const fx *x, mynah_slm_backend *b, mynah_slm_kv_type kt,
+                        int matmat, const char *label) {
+    char err[256] = "", what[192], detail[256];
+    const size_t V = x->vocab;
+    mynah_slm_state ws;
+    mynah_slm_bfwd *f = NULL;
+    mynah_slm_bslots *pool = NULL;
+    mrow R[MROWS];
+    memset(R, 0, sizeof R);
+    memset(&ws, 0, sizeof ws);
+    float *glog = malloc((size_t)MROWS * V * sizeof(float));
+    float *solo = malloc(V * sizeof(float));
+    mynah_slm_decode_product_set(matmat);
+
+    mynah_slm_bfwd_desc d = { .ctx_cap = 256, .batch_max = 16, .dec_max = MROWS,
+                              .kv_k = kt, .kv_v = kt };
+    int ok = mynah_slm_state_init_workspace(&ws, x->m, 256, err, sizeof err) == 0 &&
+             mynah_slm_state_init_decode(&ws, MROWS, err, sizeof err) == 0 &&
+             mynah_slm_bfwd_create(b, x->m, &d, &f, err, sizeof err) == 0;
+    if (ok) {
+        mynah_slm_bfwd_set_multi_product(f, matmat);
+        mynah_slm_bslots_desc pd;
+        memset(&pd, 0, sizeof pd);
+        mynah_slm_bfwd_kv_desc(f, 160, &pd.kv);
+        pd.n_slots = MROWS;
+        ok = mynah_slm_backend_slots_create(b, &pd, &pool, err, sizeof err) == 0;
+    }
+    snprintf(what, sizeof what, "[%s/%s/%s] reference workspace, backend forward, %d-slot pool",
+             label, mynah_slm_kv_type_name(kt), matmat ? "matmat" : "matvec", MROWS);
+    if (!ok) { check(what, 0, err); goto out; }
+
+    /* Admit: acquire a slot, bind the sequence to its KV, prefill. */
+    uint32_t next_req = 0;
+#define ADMIT(i) do {                                                                   \
+        mrow *a = &R[i];                                                                \
+        const uint32_t *p; uint32_t len;                                                \
+        a->req = next_req++;                                                            \
+        prompt_of(x, a->req, &p, &len);                                                 \
+        ok = ok && mynah_slm_backend_slot_acquire(b, pool, &a->slot, &a->gen, err,      \
+                                                  sizeof err) == 0 &&                   \
+             mynah_slm_bseq_bind(f, &a->bs, mynah_slm_backend_slot_kv(pool, a->slot),   \
+                                 err, sizeof err) == 0 &&                               \
+             mynah_slm_seq_reserve(&a->ref, x->m, 160, kt, kt, err, sizeof err) == 0 && \
+             (a->solo.kv || mynah_slm_bseq_init(f, &a->solo, 160, err, sizeof err) == 0) && \
+             ref_prefill(&ws, &a->ref, p, len) == 0 &&                                  \
+             b_prefill(f, &a->bs, p, len, err, sizeof err) == 0 &&                      \
+             b_prefill(f, &a->solo, p, len, err, sizeof err) == 0;                      \
+        a->next = p[len - 1];                                                           \
+        a->live = 1;                                                                    \
+    } while (0)
+    for (uint32_t i = 0; i < MROWS; i++) ADMIT(i);
+    check(what, ok, err);
+    if (!ok) goto out;
+
+    int ref_same = 1, solo_same = 1, argmax_same = 1, rc_ok = 1, reused_ok = 1;
+    double worst_solo = 0.0;
+    uint32_t cancelled_slot = 0;
+    uint64_t cancelled_gen = 0;
+    for (int step = 0; step < MSTEPS && rc_ok; step++) {
+        /* Step 3: the client of row 1 leaves. Its slot is released (never
+         * waits) and the row is simply not in the next step's table. */
+        if (step == 3) {
+            cancelled_slot = R[1].slot;
+            cancelled_gen = R[1].gen;
+            if (mynah_slm_backend_slot_release(b, pool, R[1].slot, err, sizeof err) != 0) {
+                rc_ok = 0;
+                break;
+            }
+            R[1].live = 0;
+        }
+        /* Step 5: a new request takes the freed slot — the lowest free
+         * index, with a newer generation — and the KV it inherits is NOT
+         * cleared: attention must read only what the new request wrote. */
+        if (step == 5) {
+            ADMIT(1);
+            reused_ok = ok && R[1].slot == cancelled_slot && R[1].gen > cancelled_gen;
+            if (!ok) { rc_ok = 0; break; }
+        }
+
+        mynah_slm_seq *rs[MROWS];
+        mynah_slm_bseq *bs[MROWS];
+        uint32_t tok[MROWS], idx[MROWS], n = 0;
+        for (uint32_t i = 0; i < MROWS; i++) {
+            if (!R[i].live) continue;
+            rs[n] = &R[i].ref;
+            bs[n] = &R[i].bs;
+            tok[n] = R[i].next;
+            idx[n] = i;
+            n++;
+        }
+        float *rl[MROWS];
+        if (mynah_slm_forward_multi(&ws, rs, tok, n, rl) != 0 ||
+            mynah_slm_bfwd_multi(f, bs, tok, n, glog, err, sizeof err) != 0) {
+            rc_ok = 0;
+            break;
+        }
+        for (uint32_t r = 0; r < n; r++) {
+            mrow *a = &R[idx[r]];
+            const float *g = glog + (size_t)r * V;
+            if (memcmp(rl[r], g, V * sizeof(float)) != 0) ref_same = 0;
+            if (mynah_slm_bfwd_step(f, &a->solo, tok[r], solo, err, sizeof err) != 0) {
+                rc_ok = 0;
+                break;
+            }
+            if (memcmp(solo, g, V * sizeof(float)) != 0) solo_same = 0;
+            const double rel = rel_diff(solo, g, V);
+            if (rel > worst_solo) worst_solo = rel;
+            if (argmax(solo, V) != argmax(g, V)) argmax_same = 0;
+            if (a->bs.n_past != a->ref.n_past || a->bs.n_past != a->solo.n_past) rc_ok = 0;
+            a->next = argmax(rl[r], V);
+        }
+    }
+
+    snprintf(what, sizeof what,
+             "[%s/%s/%s] multi step == forward_multi, every row, %d steps (memcmp)", label,
+             mynah_slm_kv_type_name(kt), matmat ? "matmat" : "matvec", MSTEPS);
+    check(what, rc_ok && ref_same, rc_ok ? "a row's logits differ" : err);
+    snprintf(what, sizeof what, "[%s/%s/%s] multi step == each sequence alone %s", label,
+             mynah_slm_kv_type_name(kt), matmat ? "matmat" : "matvec",
+             matmat ? "(1e-4, same argmax)" : "(memcmp)");
+    snprintf(detail, sizeof detail, "worst rel %.2e, bit-identical %s, argmax %s", worst_solo,
+             solo_same ? "yes" : "no", argmax_same ? "same" : "DIFFERS");
+    check(what, rc_ok && argmax_same && worst_solo < 1e-4 && (matmat || solo_same), detail);
+    printf("     %s\n", detail);
+    snprintf(what, sizeof what, "[%s/%s/%s] a cancelled row's slot is released, re-acquired "
+             "with a newer generation, and serves a new request", label,
+             mynah_slm_kv_type_name(kt), matmat ? "matmat" : "matvec");
+    check(what, rc_ok && reused_ok, "slot or generation not as expected");
+
+    /* Isolation: a full row, or a sequence twice, fails the step whole. */
+    {
+        mynah_slm_bseq *bs[3] = { &R[0].bs, &R[1].bs, &R[2].bs };
+        const uint32_t tok[3] = { 1, 2, 3 };
+        const uint32_t p0 = R[0].bs.n_past, p2 = R[2].bs.n_past, saved = R[1].bs.n_past;
+        R[1].bs.n_past = R[1].bs.n_ctx;
+        const int full = mynah_slm_bfwd_multi(f, bs, tok, 3, glog, err, sizeof err) == -1;
+        R[1].bs.n_past = saved;
+        bs[1] = &R[0].bs;
+        const int twice = mynah_slm_bfwd_multi(f, bs, tok, 3, glog, err, sizeof err) == -1;
+        snprintf(what, sizeof what, "[%s/%s/%s] a step with a full row or a row twice fails "
+                 "and moves nobody", label, mynah_slm_kv_type_name(kt), matmat ? "matmat" : "matvec");
+        check(what, full && twice && R[0].bs.n_past == p0 && R[2].bs.n_past == p2 &&
+              R[1].bs.n_past == saved, "it ran or moved");
+    }
+#undef ADMIT
+
+out:
+    for (uint32_t i = 0; i < MROWS; i++) {
+        mynah_slm_seq_free(&R[i].ref);
+        mynah_slm_bseq_free(f, &R[i].solo);
+        mynah_slm_bseq_free(f, &R[i].bs);
+    }
+    mynah_slm_backend_slots_destroy(b, pool);
+    mynah_slm_bfwd_free(f);
+    mynah_slm_state_free(&ws);
+    mynah_slm_decode_product_set(-1);
+    free(glog);
+    free(solo);
+}
+
 static void run(const char *label, int quant) {
     printf("\n-- %s fixture --\n", label);
     fixture_spec spec;
@@ -344,6 +575,10 @@ static void run(const char *label, int quant) {
             check_parity(&x, b, MYNAH_SLM_KV_F32, lab);
             check_parity(&x, b, MYNAH_SLM_KV_BF16, lab);
             check_driver(&x, b, tok, lab);
+            for (int mm = 0; mm < 2; mm++) {
+                check_multi(&x, b, MYNAH_SLM_KV_F32, mm, lab);
+                check_multi(&x, b, MYNAH_SLM_KV_BF16, mm, lab);
+            }
         }
         mynah_slm_backend_close(b);
         free(ids);

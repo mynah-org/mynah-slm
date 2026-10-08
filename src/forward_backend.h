@@ -101,6 +101,34 @@ int  mynah_slm_bfwd_step_argmax(mynah_slm_bfwd *f, mynah_slm_bseq *q, uint32_t t
 int  mynah_slm_bfwd_prefill(mynah_slm_bfwd *f, mynah_slm_bseq *q, const uint32_t *tokens,
                             uint32_t n, float *logits, char *err, size_t errsz);
 
+/* ── one decode step for several sequences ─────────────────────────────────
+ * mynah_slm_forward_multi on the backend: n DIFFERENT sequences (n <=
+ * dec_max) advance one token each, tokens[i] fed to seqs[i] at its own
+ * position. The per-row table (row -> KV, position) is rebuilt from the
+ * arguments on EVERY call: a row the scheduler dropped — finished, failed,
+ * cancelled, its slot released — is simply not passed, and nothing of it
+ * survives in the step. Projections are per row (n matvecs: each row is
+ * bit-identical to its solo step) or one matmat over the n rows (weights
+ * read once), see set_multi_product; attention runs per sequence over its
+ * own cache. `logits` (HOST, [n][vocab]) receives every row in ONE copy —
+ * the step's one wait. n == 1 is mynah_slm_bfwd_step verbatim.
+ *
+ * Step isolation, as forward_multi: every row validated before anything is
+ * queued (a full sequence, a token past the vocabulary, a sequence named
+ * twice refuse the whole step), and no n_past moves unless the whole step
+ * succeeded. Returns 0, or -1 with `err`. */
+int  mynah_slm_bfwd_multi(mynah_slm_bfwd *f, mynah_slm_bseq *const *seqs,
+                          const uint32_t *tokens, uint32_t n, float *logits,
+                          char *err, size_t errsz);
+
+/* 0: n matvecs per weight; 1: one matmat over the n rows. The default
+ * follows the device: on the CPU backend the reference's own choice
+ * (mynah_slm_decode_product_name(), so the two stay comparable), on a
+ * device the matmat — one launch, and the CUDA matmat runs the matvec
+ * kernel per row, so it is the same arithmetic either way. */
+void mynah_slm_bfwd_set_multi_product(mynah_slm_bfwd *f, int matmat);
+const char *mynah_slm_bfwd_multi_product(const mynah_slm_bfwd *f);
+
 /* ── as a generation driver (generate.h) ───────────────────────────────────
  * Lets generate.c's one token loop run on this forward: prefill in slices of
  * batch_max, then one step per token whose logits row lands in a host buffer

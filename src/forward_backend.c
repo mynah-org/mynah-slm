@@ -10,6 +10,8 @@
  * SPDX-License-Identifier: MIT */
 #include "forward_backend.h"
 
+#include "arch_qwen3.h"     /* mynah_slm_decode_product_name */
+
 #include "backend_ops.h"   /* kv->desc */
 
 #include "kernels.h"       /* mynah_slm_aligned_alloc */
@@ -41,6 +43,12 @@ struct mynah_slm_bfwd {
     float *x, *h, *q, *k, *v, *attn, *proj, *gate, *up;
     float *logits;     /* [max(1, dec_max)][vocab] */
     float *hlogits;    /* the same, in HOST memory: what a driver hands out */
+
+    /* mynah_slm_bfwd_multi: the per-row table, rebuilt from the arguments
+     * every step (host memory, dec_max rows), and the product it uses. */
+    mynah_slm_bkv **row_kv;
+    uint32_t       *row_pos;
+    int             multi_matmat;
 };
 
 static void set_err(char *err, size_t errsz, const char *msg) {
@@ -210,9 +218,16 @@ int mynah_slm_bfwd_create(mynah_slm_backend *b, const mynah_slm_model_t *m,
         f->up    = buf(f, R * c->d_ff, &ok, err, errsz);
         f->logits = buf(f, (size_t)f->dec_max * f->vocab, &ok, err, errsz);
         f->hlogits = mynah_slm_aligned_alloc((size_t)f->dec_max * f->vocab * sizeof(float));
-        if (ok && !f->hlogits) { set_err(err, errsz, "out of memory for host logits"); ok = 0; }
+        f->row_kv  = calloc(f->dec_max, sizeof *f->row_kv);
+        f->row_pos = calloc(f->dec_max, sizeof *f->row_pos);
+        if (ok && (!f->hlogits || !f->row_kv || !f->row_pos)) {
+            set_err(err, errsz, "out of memory for host logits");
+            ok = 0;
+        }
         if (!ok) { rc = -1; goto fail; }
     }
+    f->multi_matmat = mynah_slm_backend_device(b) != MYNAH_SLM_DEVICE_CPU ||
+                      strcmp(mynah_slm_decode_product_name(), "matmat") == 0;
     *out = f;
     return 0;
 
@@ -230,6 +245,8 @@ void mynah_slm_bfwd_free(mynah_slm_bfwd *f) {
     for (size_t i = 0; i < sizeof bufs / sizeof *bufs; i++) mynah_slm_backend_free(f->b, bufs[i]);
     mynah_slm_backend_rope_free(f->b, f->rope);
     mynah_slm_aligned_free(f->hlogits);
+    free(f->row_kv);
+    free(f->row_pos);
     /* Weight handles belong to the backend (freed at its close or flush). */
     free(f->L);
     free(f);
@@ -448,6 +465,136 @@ int mynah_slm_bfwd_prefill(mynah_slm_bfwd *f, mynah_slm_bseq *q, const uint32_t 
         op(f, mynah_slm_backend_d2h(f->b, logits, f->logits, f->vocab, err, errsz),
            "d2h", err, errsz)) return -1;
     q->n_past += n;
+    return 0;
+}
+
+/* ── one decode step for several sequences ──────────────────────────────── */
+
+void mynah_slm_bfwd_set_multi_product(mynah_slm_bfwd *f, int matmat) {
+    if (f) f->multi_matmat = matmat ? 1 : 0;
+}
+
+const char *mynah_slm_bfwd_multi_product(const mynah_slm_bfwd *f) {
+    return (f && f->multi_matmat) ? "matmat" : "matvec";
+}
+
+/* out[n][rows] = in[n][cols] * W^T for n rows of n DIFFERENT sequences. */
+static int project_multi(mynah_slm_bfwd *f, const mynah_slm_bweight *w, const float *in,
+                         float *out, uint32_t n, char *err, size_t errsz) {
+    if (f->multi_matmat) return project(f, w, in, out, n, err, errsz);
+    const size_t cols = mynah_slm_bweight_cols(w), rows = mynah_slm_bweight_rows(w);
+    for (uint32_t r = 0; r < n; r++)
+        if (project(f, w, in + (size_t)r * cols, out + (size_t)r * rows, 1, err, errsz))
+            return -1;
+    return 0;
+}
+
+/* arch_qwen3.c: mynah_slm_forward_multi, with the attention per sequence
+ * (n_q = 1 at its own position) instead of attention_multi's one region —
+ * the same arithmetic per (sequence, head), which is what makes a row of
+ * the matvec product bit-identical to its solo step. */
+static int run_multi(mynah_slm_bfwd *f, const uint32_t *tokens, uint32_t n,
+                     char *err, size_t errsz) {
+    mynah_slm_backend *b = f->b;
+    const mynah_slm_config *c = f->c;
+    const float eps = c->rms_eps;
+
+    if (op(f, mynah_slm_backend_embed(b, f->embed, tokens, n, f->x, err, errsz),
+           "embed", err, errsz)) return -1;
+
+    for (uint32_t l = 0; l < c->n_layers; l++) {
+        const bf_layer *w = &f->L[l];
+        const uint32_t kvl = c->op_slot[l];
+
+        if (op(f, mynah_slm_backend_rms_norm(b, f->h, f->x, w->attn_norm, n, c->d_model, eps,
+                                             err, errsz), "rms_norm", err, errsz) ||
+            project_multi(f, w->wq, f->h, f->q, n, err, errsz) ||
+            project_multi(f, w->wk, f->h, f->k, n, err, errsz) ||
+            project_multi(f, w->wv, f->h, f->v, n, err, errsz))
+            return -1;
+        if (w->q_norm &&
+            op(f, mynah_slm_backend_rms_norm_heads(b, f->q, w->q_norm, (size_t)n * c->n_heads,
+                                                   c->head_dim, eps, err, errsz),
+               "rms_norm_heads", err, errsz)) return -1;
+        if (w->k_norm &&
+            op(f, mynah_slm_backend_rms_norm_heads(b, f->k, w->k_norm, (size_t)n * c->n_kv_heads,
+                                                   c->head_dim, eps, err, errsz),
+               "rms_norm_heads", err, errsz)) return -1;
+
+        /* Each row at its OWN position, into its OWN cache: the table. */
+        for (uint32_t r = 0; r < n; r++) {
+            float *qr = f->q + (size_t)r * c->q_dim;
+            float *kr = f->k + (size_t)r * c->kv_dim;
+            const float *vr = f->v + (size_t)r * c->kv_dim;
+            const uint32_t pos = f->row_pos[r];
+            if (op(f, mynah_slm_backend_rope(b, f->rope, qr, 1, c->n_heads, pos, err, errsz),
+                   "rope", err, errsz) ||
+                op(f, mynah_slm_backend_rope(b, f->rope, kr, 1, c->n_kv_heads, pos, err, errsz),
+                   "rope", err, errsz) ||
+                op(f, mynah_slm_backend_kv_append(b, f->row_kv[r], kvl, pos, 1, kr, vr,
+                                                  err, errsz), "kv_append", err, errsz) ||
+                op(f, mynah_slm_backend_attention(b, f->row_kv[r], kvl, qr,
+                                                  f->attn + (size_t)r * c->q_dim, pos, 1,
+                                                  c->attn_scale, err, errsz),
+                   "attention", err, errsz))
+                return -1;
+        }
+
+        if (project_multi(f, w->wo, f->attn, f->proj, n, err, errsz) ||
+            residual(f, n, err, errsz) ||
+            op(f, mynah_slm_backend_rms_norm(b, f->h, f->x, w->ffn_norm, n, c->d_model, eps,
+                                             err, errsz), "rms_norm", err, errsz) ||
+            project_multi(f, w->gate, f->h, f->gate, n, err, errsz) ||
+            project_multi(f, w->up, f->h, f->up, n, err, errsz) ||
+            op(f, mynah_slm_backend_swiglu(b, f->gate, f->up, (size_t)n * c->d_ff, err, errsz),
+               "swiglu", err, errsz) ||
+            project_multi(f, w->down, f->gate, f->proj, n, err, errsz) ||
+            residual(f, n, err, errsz))
+            return -1;
+    }
+
+    /* Every row samples, so the head runs on every row. */
+    if (op(f, mynah_slm_backend_rms_norm(b, f->h, f->x, f->out_norm, n, c->d_model, eps,
+                                         err, errsz), "rms_norm", err, errsz) ||
+        project_multi(f, f->head, f->h, f->logits, n, err, errsz))
+        return -1;
+    return 0;
+}
+
+int mynah_slm_bfwd_multi(mynah_slm_bfwd *f, mynah_slm_bseq *const *seqs,
+                         const uint32_t *tokens, uint32_t n, float *logits,
+                         char *err, size_t errsz) {
+    if (!f || !seqs || !tokens || n == 0) { set_err(err, errsz, "invalid multi step"); return -1; }
+    if (n == 1) return mynah_slm_bfwd_step(f, seqs[0], tokens[0], logits, err, errsz);
+    if (n > f->dec_max) {
+        set_err(err, errsz, "more sequences than the forward was sized for (dec_max)");
+        return -1;
+    }
+    /* Validate EVERY row, then build the table: a refused step queues
+     * nothing and moves nobody. */
+    for (uint32_t r = 0; r < n; r++) {
+        const mynah_slm_bseq *q = seqs[r];
+        if (!q || !q->kv || q->n_ctx > f->ctx_cap || q->n_past >= q->n_ctx ||
+            tokens[r] >= f->vocab) {
+            set_err(err, errsz, "a row cannot step (full, out of vocabulary, or no cache)");
+            return -1;
+        }
+        for (uint32_t j = 0; j < r; j++)
+            if (seqs[j] == q || seqs[j]->kv == q->kv) {
+                set_err(err, errsz, "a sequence (or a cache) is named twice in one step");
+                return -1;
+            }
+    }
+    for (uint32_t r = 0; r < n; r++) {
+        f->row_kv[r] = seqs[r]->kv;
+        f->row_pos[r] = seqs[r]->n_past;
+    }
+    if (run_multi(f, tokens, n, err, errsz) != 0) return -1;
+    if (logits &&
+        op(f, mynah_slm_backend_d2h(f->b, logits, f->logits, (size_t)n * f->vocab, err, errsz),
+           "d2h", err, errsz)) return -1;
+    /* Only now, with the whole step done, does any sequence move. */
+    for (uint32_t r = 0; r < n; r++) seqs[r]->n_past++;
     return 0;
 }
 
