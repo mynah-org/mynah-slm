@@ -9,7 +9,10 @@
  *
  * The pool is persistent. A decode step dispatches ~200 parallel regions (7
  * projections x 28 layers, plus attention), so spawning threads per region
- * would cost more than the work.
+ * would cost more than the work — and for the same reason idle workers spin
+ * for a bounded time before parking: a condvar wake per region is tens of
+ * microseconds, against regions that are often not much longer
+ * (.work/thread-pool-spin.md).
  *
  * SPDX-License-Identifier: MIT */
 #ifndef MYNAH_SLM_THREADS_H
@@ -17,8 +20,8 @@
 
 #include <stddef.h>
 
-/* Online cores, minus nothing: this is a single-inference CLI. A server that
- * runs several at once must lower it, the way mynah-asr does. */
+/* Cores this process may run on: the affinity mask on Linux (taskset, a
+ * cgroup cpuset, a pinned prefork worker), the online count elsewhere. */
 int mynah_slm_num_cpus(void);
 
 /* n <= 0 means "use every core". Safe to call more than once; the second call
@@ -31,5 +34,13 @@ int mynah_slm_threads_count(void);
  * so a 4-way split uses 4 threads and not 5. With n <= 1 or a single thread it
  * runs inline with no synchronization at all. */
 void mynah_slm_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx);
+
+/* How long an idle worker spins before it parks, and how long the caller
+ * spins waiting for the last task, in microseconds. MYNAH_SLM_POOL_SPIN_US
+ * at init, 0 = park at once (the pre-2026-10 behaviour). -1 before init.
+ * The setter exists for the interleaved A/B in tests/test_threads.c; call it
+ * between regions, never from inside one. */
+long mynah_slm_threads_spin_us(void);
+void mynah_slm_threads_set_spin_us(long us);
 
 #endif /* MYNAH_SLM_THREADS_H */
