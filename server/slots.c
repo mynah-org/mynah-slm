@@ -71,6 +71,18 @@ static struct {
     uint32_t    capacity;
     pthread_t       thread;
     int             running;
+
+    /* Lifetime. Connection threads are detached, so at shutdown some may
+     * still be inside slots_run / slots_health — reading a request that
+     * arrived late, or asking for /health. `users` counts the threads
+     * inside; `stopping` makes every later entry refuse without touching
+     * the queue or the scheduler. Both under life_mu, which is static and
+     * never destroyed, so a thread arriving after slots_free still finds a
+     * valid lock and a "no". Nothing behind it is freed while users > 0. */
+    pthread_mutex_t life_mu;
+    pthread_cond_t  life_cv;
+    int             stopping;
+    unsigned        users;
     const char     *product;        /* resolved before the thread starts */
 
     /* step scratch, scheduler thread only */
@@ -88,6 +100,21 @@ static struct {
     unsigned agg_n[AGG_RING];
     unsigned agg_head, agg_count;
 } S;
+
+/* Enter / leave the engine from a connection thread. -1 = stopping. */
+static int life_enter(void) {
+    pthread_mutex_lock(&S.life_mu);
+    const int ok = !S.stopping;
+    if (ok) S.users++;
+    pthread_mutex_unlock(&S.life_mu);
+    return ok ? 0 : -1;
+}
+
+static void life_leave(void) {
+    pthread_mutex_lock(&S.life_mu);
+    if (--S.users == 0) pthread_cond_broadcast(&S.life_cv);
+    pthread_mutex_unlock(&S.life_mu);
+}
 
 static void stat_step(unsigned tokens) {
     pthread_mutex_lock(&S.stat_mu);
@@ -291,6 +318,8 @@ int slots_start(mynah_slm_model_t *m, const mynah_slm_tokenizer *tok,
                 uint32_t n_slots, uint32_t ctx_cap, uint32_t queue_cap,
                 char *err, size_t errsz) {
     memset(&S, 0, sizeof S);
+    pthread_mutex_init(&S.life_mu, NULL);
+    pthread_cond_init(&S.life_cv, NULL);
     S.model = m;
     S.tok = tok;
     S.n_slots = n_slots ? n_slots : 1;
@@ -339,22 +368,56 @@ int slots_start(mynah_slm_model_t *m, const mynah_slm_tokenizer *tok,
     return 0;
 }
 
-void slots_stop(void) {
+void slots_shutdown(void) {
+    pthread_mutex_lock(&S.life_mu);
+    S.stopping = 1;
+    pthread_mutex_unlock(&S.life_mu);
     if (!S.running) return;
+    /* The queue and the scheduler stay valid: a thread already inside
+     * slots_run may still push (refused: closed) or wait for its retire. */
     mynah_slm_jobq_close(S.q);
     pthread_join(S.thread, NULL);
     S.running = 0;
+}
+
+int slots_free(int wait_ms) {
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += wait_ms / 1000;
+    dl.tv_nsec += (long)(wait_ms % 1000) * 1000000L;
+    if (dl.tv_nsec >= 1000000000L) { dl.tv_nsec -= 1000000000L; dl.tv_sec++; }
+    pthread_mutex_lock(&S.life_mu);
+    S.stopping = 1;
+    while (S.users > 0)
+        if (pthread_cond_timedwait(&S.life_cv, &S.life_mu, &dl) != 0) break;
+    const unsigned users = S.users;
+    pthread_mutex_unlock(&S.life_mu);
+    if (users > 0 || S.running) return -1;
     mynah_slm_sched_free(S.sched);
     mynah_slm_jobq_free(S.q);
     for (uint32_t i = 0; i < S.n_slots; i++) mynah_slm_seq_free(&S.seqs[i]);
     free(S.seqs); free(S.step_seqs); free(S.step_tok); free(S.step_logits); free(S.step_pick);
     mynah_slm_state_free(&S.ws);
+    S.sched = NULL;
+    S.q = NULL;
+    S.seqs = NULL;
+    return 0;
 }
 
 /* ── the writer: the connection thread ────────────────────────────────────── */
 
+static int run_entered(http_conn *conn, const slots_params *p, slots_result *out);
+static int health_entered(char *buf, size_t n);
+
 int slots_run(http_conn *conn, const slots_params *p, slots_result *out) {
     memset(out, 0, sizeof *out);
+    if (life_enter() != 0) return SLOTS_STOPPING;
+    const int rc = run_entered(conn, p, out);
+    life_leave();
+    return rc;
+}
+
+static int run_entered(http_conn *conn, const slots_params *p, slots_result *out) {
     slots_req *r = calloc(1, sizeof *r);
     if (!r) { snprintf(out->error, sizeof out->error, "out of memory"); out->outcome = MYNAH_SLM_JOB_FAILED; return 0; }
     r->p = *p;
@@ -370,7 +433,11 @@ int slots_run(http_conn *conn, const slots_params *p, slots_result *out) {
         pthread_cond_destroy(&r->cv);
         pthread_mutex_destroy(&r->mu);
         free(r);
-        return -1;
+        /* A push refused because shutdown closed the queue is not "busy". */
+        pthread_mutex_lock(&S.life_mu);
+        const int stopping = S.stopping;
+        pthread_mutex_unlock(&S.life_mu);
+        return stopping ? SLOTS_STOPPING : SLOTS_BUSY;
     }
 
     char  *wbuf = NULL;
@@ -432,6 +499,13 @@ int slots_run(http_conn *conn, const slots_params *p, slots_result *out) {
 }
 
 int slots_health(char *buf, size_t n) {
+    if (life_enter() != 0) return -1;
+    const int rc = health_entered(buf, n);
+    life_leave();
+    return rc;
+}
+
+static int health_entered(char *buf, size_t n) {
     mynah_slm_sched_stats st;
     mynah_slm_sched_get_stats(S.sched, &st);
     pthread_mutex_lock(&S.stat_mu);

@@ -71,6 +71,11 @@ health() { curl -s "localhost:$PORT/health" | python3 -c "import json,sys; print
 
 PROMPTS=("Ciao! Come stai?" "Wie heisst du?" "The ledger for 1887 lists twelve names." "La contabilidad no cuadra.")
 
+# ONLY="7 8" runs just those self-contained sections (1-6 are one chain,
+# named "base"); unset runs everything.
+want() { [ -z "${ONLY:-}" ] || [[ " $ONLY " == *" $1 "* ]]; }
+
+if want base; then
 # ── 1. the reference: the serialized server ───────────────────────────────────
 start "$TMP/ref.log"
 for i in 0 1 2 3; do chat "$(body 24 0 "${PROMPTS[$i]}" $((100 + i)))" | content > "$TMP/ref$i"; done
@@ -178,7 +183,53 @@ fi
 C=$(health "['slot_cancelled']")
 [ "${C:-0}" -ge 6 ] && ok "/health counts the slot cancellations ($C)" || bad "slot_cancelled" "$C"
 stop
+fi
+
+if want 7; then
+# ── 7. shutdown with requests still being READ ───────────────────────────────
+# Connection threads are detached: one still reading its request when SIGTERM
+# arrives reaches the engine after the accept loop has returned. It must get
+# a 503 — not a push into a freed queue, not /health stats read from a freed
+# scheduler (review B1: a use-after-free under ASan) — and the server must
+# still exit cleanly. Run it with an ASan server (SERVER=...) to see the UAF.
+start "$TMP/down.log" --slots 2
+python3 - "$PORT" "$SRV" > "$TMP/down.out" 2>&1 <<'PY'
+import json, os, signal, socket, sys, time
+port, pid = int(sys.argv[1]), int(sys.argv[2])
+b = json.dumps({'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 4}).encode()
+chat = b'POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n' % len(b) + b
+health = b'GET /health HTTP/1.1\r\nHost: x\r\n\r\n'
+socks = []
+for data in (chat, health):
+    s = socket.create_connection(('127.0.0.1', port)); s.sendall(data[:10]); socks.append((s, data))
+time.sleep(0.3)
+os.kill(pid, signal.SIGTERM)
+time.sleep(2.5)            # the accept loop (1 s timeout) is gone by now
+for s, data in socks:
+    try:
+        s.sendall(data[10:]); s.settimeout(10)
+        r = b''
+        while True:
+            c = s.recv(4096)
+            if not c: break
+            r += c
+        print(r.split(b'\r\n')[0].decode('latin-1') or 'EMPTY')
+    except Exception as e:
+        print('ERROR', e)
+PY
+for _ in $(seq 150); do kill -0 $SRV 2>/dev/null || break; sleep 0.1; done
+if kill -0 $SRV 2>/dev/null; then RC=timeout; kill -9 $SRV; wait $SRV 2>/dev/null; else wait $SRV; RC=$?; fi
+SRV=""
+R1=$(sed -n 1p "$TMP/down.out"); R2=$(sed -n 2p "$TMP/down.out")
+echo "$R1" | grep -q " 503 " && ok "a request read after SIGTERM gets 503, not the freed engine ($R1)" \
+    || bad "a request read after SIGTERM gets 503" "$R1 | $(cat "$TMP/down.out")"
+echo "$R2" | grep -q " 503 " && ok "/health read after SIGTERM gets 503 ($R2)" \
+    || bad "/health read after SIGTERM gets 503" "$R2"
+[ "$RC" = 0 ] && ! grep -q "AddressSanitizer\|ThreadSanitizer" "$TMP/down.log" \
+    && ok "the server exited cleanly (rc $RC)" \
+    || bad "the server exits cleanly after a late request" "rc $RC; $(grep -A3 Sanitizer "$TMP/down.log" | head -8)"
+fi
 
 echo
-[ $fail -eq 0 ] && echo "PASS" || { echo "FAILED ($fail)"; tail -20 "$TMP/slots.log"; }
+[ $fail -eq 0 ] && echo "PASS" || { echo "FAILED ($fail)"; tail -n 20 "$TMP"/*.log; }
 exit $fail

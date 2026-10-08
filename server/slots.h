@@ -67,18 +67,35 @@ int  slots_start(mynah_slm_model_t *m, const mynah_slm_tokenizer *tok,
                  uint32_t n_slots, uint32_t ctx_cap, uint32_t queue_cap,
                  char *err, size_t errsz);
 
-/* Closes the queue, lets admitted requests finish, joins the thread. */
-void slots_stop(void);
+/* Shutdown, in two calls, because connection threads are detached and may
+ * still be inside slots_run / slots_health when the accept loop returns:
+ *
+ *   slots_shutdown  marks the engine STOPPING (every later slots_run and
+ *                   slots_health refuses, under a lock, without touching the
+ *                   queue or the scheduler), closes the queue and joins the
+ *                   scheduler thread. Nothing is freed.
+ *   slots_free      waits, at most `wait_ms`, for the last thread inside
+ *                   slots_run / slots_health to leave, then frees the queue,
+ *                   the scheduler, the slots and the workspace. Returns 0, or
+ *                   -1 when a thread is still inside: then NOTHING is freed
+ *                   (the process is exiting; a leak is safe, a free under a
+ *                   running thread is not). */
+void slots_shutdown(void);
+int  slots_free(int wait_ms);
 
 /* Runs one request on the calling connection thread: enqueue, then write
  * what the scheduler produces until it retires the request. Returns 0 with
- * `out` filled, or -1 when the queue is full (answer 503, nothing was
+ * `out` filled; -1 when the queue is full (answer 503, nothing was
+ * written); -2 when the server is shutting down (answer 503, nothing was
  * written). */
+#define SLOTS_BUSY     (-1)
+#define SLOTS_STOPPING (-2)
 int  slots_run(http_conn *conn, const slots_params *p, slots_result *out);
 
 /* JSON object members for /health (no braces): slots, live, queue depth,
  * steps, mean batch width, aggregate and per-stream recent decode t/s,
- * cancellations, the decode product. */
+ * cancellations, the decode product. -1 (nothing written) once the server
+ * is shutting down. */
 int  slots_health(char *buf, size_t n);
 
 #endif /* MYNAH_SLM_SERVER_SLOTS_H */

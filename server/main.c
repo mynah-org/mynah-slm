@@ -52,6 +52,7 @@
 
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -124,6 +125,11 @@ static void gate_leave(server_ctx *c) {
 
 static volatile sig_atomic_t g_stop;
 static void on_signal(int s) { (void)s; g_stop = 1; }
+
+/* Set by main once the accept loop has returned (g_stop is the signal
+ * handler's flag; this is the one other threads read). From then on new
+ * work and /health answer 503. */
+static atomic_int g_shutting_down;
 
 static void record_tok_s(server_ctx *c, double v) {
     pthread_mutex_lock(&c->stat_mu);
@@ -292,6 +298,10 @@ static void send_completion(http_conn *conn, int stream, const char *req_id,
 /* ── handlers ─────────────────────────────────────────────────────────────── */
 
 static void handle_health(server_ctx *c, http_conn *conn) {
+    if (atomic_load(&g_shutting_down)) {
+        http_busy(conn, "the server is shutting down", 1);
+        return;
+    }
     double avg = 0.0;
     pthread_mutex_lock(&c->stat_mu);
     for (unsigned i = 0; i < c->n_stat; i++) avg += c->recent_tok_s[i];
@@ -321,7 +331,14 @@ static void handle_health(server_ctx *c, http_conn *conn) {
         const unsigned long rq = c->rejected_queue;
         pthread_mutex_unlock(&c->stat_mu);
         len += snprintf(body + len, sizeof body - (size_t)len, ",\"rejected_queue\":%lu,", rq);
-        if ((size_t)len < sizeof body) len += slots_health(body + len, sizeof body - (size_t)len);
+        if ((size_t)len < sizeof body) {
+            const int k = slots_health(body + len, sizeof body - (size_t)len);
+            if (k < 0) {                 /* stopping: the scheduler is going away */
+                http_busy(conn, "the server is shutting down", 1);
+                return;
+            }
+            len += k;
+        }
         if ((size_t)len + 3 < sizeof body) len += snprintf(body + len, sizeof body - (size_t)len, "}\n");
     }
     if ((size_t)len >= sizeof body) len = (int)sizeof body - 1;
@@ -401,7 +418,12 @@ static void chat_slots(server_ctx *c, http_conn *conn, const uint32_t *ids, size
         return;
     }
     slots_result r;
-    if (slots_run(conn, &p, &r) != 0) {
+    const int run = slots_run(conn, &p, &r);
+    if (run == SLOTS_STOPPING) {
+        http_busy(conn, "the server is shutting down", 1);
+        return;
+    }
+    if (run != 0) {
         /* Every slot busy and the queue full: refuse NOW, visibly, rather
          * than park the client where no metric sees the wait. */
         pthread_mutex_lock(&c->stat_mu);
@@ -829,7 +851,13 @@ int main(int argc, char **argv) {
 
     const int rc = http_serve(host, port, on_request, &ctx, &limits, &g_stop, err, sizeof err);
     if (rc != 0) fprintf(stderr, "mynah-slm-server: %s\n", err);
-    if (ctx.slots > 1) slots_stop();
+    /* The listener is closed: no new connection. Connection threads already
+     * accepted are detached and may still be reading a request, so the
+     * engine is first marked stopping (later requests and /health answer
+     * 503 without touching it), then its scheduler is joined, and only once
+     * every connection has left is anything freed. */
+    atomic_store(&g_shutting_down, 1);
+    if (ctx.slots > 1) slots_shutdown();
 
     /* Connection threads are detached and use the model and the tokenizer:
      * freeing those under a live one is a use-after-free, and even after the
@@ -842,7 +870,7 @@ int main(int argc, char **argv) {
         struct timespec ts = { 0, 100 * 1000000L };
         nanosleep(&ts, NULL);
     }
-    if (http_live_connections() > 0) {
+    if (http_live_connections() > 0 || (ctx.slots > 1 && slots_free(1000) != 0)) {
         fprintf(stderr, "mynah-slm-server: %d connection(s) still running at exit; "
                         "not freeing the model under them\n", http_live_connections());
         return rc;
