@@ -118,6 +118,44 @@ static void test_narrowing(void) {
     mynah_slm_isa_narrow(NULL);
     check("narrow(NULL) restores the default ceiling",
           mynah_slm_isa_ceiling() == det || getenv("MYNAH_SLM_ISA") != NULL, NULL);
+
+    /* An unknown MYNAH_SLM_ISA fails CLOSED: scalar everywhere, flagged in
+     * the report (exit 1), never the widest level the CPU has. */
+    const char *had = getenv("MYNAH_SLM_ISA");
+    char saved[64] = "";
+    if (had) snprintf(saved, sizeof saved, "%s", had);
+    const char *bogus[] = { "avx1024",
+#if defined(__x86_64__)
+                            "dotprod",          /* a real level, of the other arch */
+#else
+                            "avx512vnni",
+#endif
+    };
+    for (size_t i = 0; i < sizeof bogus / sizeof *bogus; i++) {
+        setenv("MYNAH_SLM_ISA", bogus[i], 1);
+        const int got = mynah_slm_isa_narrow(NULL);
+        int flagged = 0;
+        FILE *f = tmpfile();
+        if (f) {
+            const int rc = mynah_slm_isa_report(f);
+            char buf[4096];
+            rewind(f);
+            const size_t n = fread(buf, 1, sizeof buf - 1, f);
+            buf[n] = '\0';
+            flagged = rc == 1 && strstr(buf, "fell back to SCALAR") != NULL;
+            fclose(f);
+        }
+        char what[128];
+        snprintf(what, sizeof what, "MYNAH_SLM_ISA=%s (unknown here) -> scalar, flagged", bogus[i]);
+        check(what, got == MYNAH_SLM_KERN_ID_SCALAR &&
+              mynah_slm_kern_qmat()->id == MYNAH_SLM_KERN_ID_SCALAR &&
+              mynah_slm_kern_attn()->id == MYNAH_SLM_KERN_ID_SCALAR &&
+              mynah_slm_kern_sgemm()->id == MYNAH_SLM_KERN_ID_SCALAR && flagged,
+              "an unknown request kept a vector table");
+    }
+    if (had) setenv("MYNAH_SLM_ISA", saved, 1);
+    else     unsetenv("MYNAH_SLM_ISA");
+    mynah_slm_isa_narrow(NULL);
 }
 
 /* ── the gate must have teeth ─────────────────────────────────────────────*/

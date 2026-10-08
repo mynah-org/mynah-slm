@@ -67,7 +67,7 @@ static void usage(FILE *f) {
         "  mynah-slm --version\n"
         "  mynah-slm --dispatch   which SIMD kernels resolved on this CPU, and why\n"
         "                         (MYNAH_SLM_ISA=scalar|avx2|avx512|avx512vnni|neon|dotprod\n"
-        "                         narrows it, never widens it)\n"
+        "                         narrows it, never widens it; an unknown value means scalar)\n"
         "\n"
         "No checkpoint yet? scripts/download_model.sh --list\n",
         mynah_slm_version());

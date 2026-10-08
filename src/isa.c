@@ -262,13 +262,28 @@ static void resolve_families(void) {
 }
 
 /* MYNAH_SLM_ISA narrows; it is clamped to the CPU and never raises the
- * ceiling. An unknown value is ignored and flagged rather than fatal: an
- * environment variable must not be able to stop the engine. */
+ * ceiling. An unknown value is not fatal — an environment variable must not
+ * be able to stop the engine — but it FAILS CLOSED: whoever set it wanted
+ * something narrower than the default (a typo of "avx2" on a machine where
+ * avx512vnni misbehaves, an arm level on x86), and the only direction that
+ * is safe without knowing what they meant is down. So: scalar, a one-time
+ * warning on stderr, and the flag in --dispatch. */
+static int g_env_warned = 0;
+
 static int ceiling_for(const char *req) {
     g_env_bad = g_env_clamped = 0;
     if (!req || !*req) return g_detected;
     const int id = mynah_slm_isa_parse(req);
-    if (id < 0) { g_env_bad = 1; return g_detected; }
+    if (id < 0) {
+        g_env_bad = 1;
+        if (!g_env_warned) {
+            g_env_warned = 1;
+            fprintf(stderr, "mynah-slm: MYNAH_SLM_ISA=%s is not a level on this "
+                            "architecture; running the SCALAR kernels "
+                            "(mynah-slm --dispatch lists the levels)\n", req);
+        }
+        return MYNAH_SLM_KERN_ID_SCALAR;
+    }
     if (rank(id) > rank(g_detected)) { g_env_clamped = 1; return g_detected; }
     return id;
 }
@@ -355,7 +370,7 @@ int mynah_slm_isa_report(FILE *f) {
     fprintf(f, "  level  detected=%s  MYNAH_SLM_ISA=%s  ceiling=%s",
             mynah_slm_isa_level_name(g_detected), g_env[0] ? g_env : "(unset)",
             mynah_slm_isa_level_name(g_ceiling));
-    if (g_env_bad)     { fprintf(f, "  <- UNKNOWN on this architecture, ignored"); bad = 1; }
+    if (g_env_bad)     { fprintf(f, "  <- UNKNOWN on this architecture: fell back to SCALAR"); bad = 1; }
     if (g_env_clamped) { fprintf(f, "  <- REQUEST ABOVE THE CPU, clamped down"); bad = 1; }
     fprintf(f, "\n");
 

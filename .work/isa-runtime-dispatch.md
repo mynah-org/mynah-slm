@@ -125,7 +125,7 @@ AVX512_BF16, no AMX), gcc 13.3 and clang, plus `qemu-aarch64` for arm64.
 | `make dist ARCH_FLAGS="-march=x86-64-v2 -mtune=generic"`, the unpacked tarball | same | avx512vnni | avx2 | avx512 | avx512-vnni | all off, flagged | 0 |
 | v2 binary, `MYNAH_SLM_ISA=avx2` | same | avx2 | avx2 | avx2 | avx2 | — | 0 |
 | v2 binary, `MYNAH_SLM_ISA=scalar MYNAH_SLM_INT8=1` | same | scalar | scalar | scalar | none, **"REQUESTED BUT UNAVAILABLE"** | — | 1 |
-| any x86 binary, `MYNAH_SLM_ISA=neon` | same | (unchanged) | | | | — | 1, "UNKNOWN on this architecture, ignored" |
+| any x86 binary, `MYNAH_SLM_ISA=neon` | same | **scalar** (was: unchanged = the widest level — failed OPEN; review R3) | scalar | scalar | none | — | 1, "UNKNOWN on this architecture: fell back to SCALAR" + one stderr warning |
 | aarch64 `-march=armv8-a` (cross) | qemu `-cpu max` | **neon_dotprod** | neon | neon | neon-dotprod | dotprod off, flagged | 0 |
 | same binary | qemu `-cpu cortex-a53` | **neon** | neon | neon | none | — | 0 |
 | same, `MYNAH_SLM_INT8=1` | cortex-a53 | neon | | | "REQUESTED BUT UNAVAILABLE" | — | 1 |
