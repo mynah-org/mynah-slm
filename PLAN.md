@@ -101,12 +101,15 @@ per commit, listed in the matrix note.
 - [~] **K5** — runtime ISA dispatch for our kernels (qmat, attention, sgemm),
       `mynah-slm --dispatch`, verify-on-first-use; ingot itself still
       compile-time → [`.work/isa-runtime-dispatch.md`](.work/isa-runtime-dispatch.md)
+- [x] **K7** — weight-stationary batched decode kernel (`ws`, now the
+      `forward_multi` default): every sequence byte-identical to solo, 1.2-2.5x
+      over `matvec` at B >= 2 here, real weights unmeasured → [`.work/batched-decode-kernel.md`](.work/batched-decode-kernel.md)
 - [-] **K6** — native BF16 weight matvec: REJECTED, ingot already at
       0.87-0.94x of the read roof → [`.work/bf16-native-matvec.md`](.work/bf16-native-matvec.md)
 - [~] **S1** — serving foundation: synthetic fixture, per-sequence state,
       batched decode, client-disconnect cancellation, scheduler, `--slots N`
       (default serialized). Correct here; no throughput win yet — needs a
-      weight-stationary batched kernel → [`.work/serving-continuous-batching.md`](.work/serving-continuous-batching.md)
+      weight-stationary batched kernel (K7, now landed) → [`.work/serving-continuous-batching.md`](.work/serving-continuous-batching.md)
 - [~] **G1** — CUDA backend foundation for Qwen3 (GQA, head_dim 128, NeoX RoPE,
       RMSNorm / QK-norm): vtable + CPU backend + kernels compiled for sm_80/89/90,
       never run on a GPU; forward pass not wired yet → [`.work/cuda-backend.md`](.work/cuda-backend.md)
