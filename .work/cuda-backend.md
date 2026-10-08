@@ -361,6 +361,31 @@ linked and is the first thing to run on a GPU.
   and another slot's next op still runs.
 - `make cuda` sm_89 builds; `backend_cuda.cu` compiles under nvcc -Werror.
 
+### Review findings and fixes (2026-10-08, cloud VM, NO GPU)
+
+A review of G1-a/b/d with host reproducers (a warp-by-warp host emulator
+that `#include`s `kernels_cuda.cu`, an argmax transcription, a contraction
+probe). One commit per finding; every one passed `make clean && make all &&
+make test`, `make warnings` (gcc, clang), `check_plan`, `make cuda` sm_89
+(`BLAS=none`) and sm_80, `test_cuda` = 77 with no `FAIL`.
+
+| Finding | Fix | Commit |
+|---|---|---|
+| **B1** weight and RoPE uploads were plain `cudaMemcpy`: legacy default stream, unordered with the non-blocking kernel stream, and from pageable memory it returns once STAGED, before the DMA lands | `upload()`: `cudaMemcpyAsync` on `s->stream` + `cudaStreamSynchronize`; every other copy audited (already on `s->stream`); `h2d` documents the pinned-source caveat | `643b0b8` |
+| **R1** `cudaSetDevice` only in open; the current device is per host thread | `on_device()` at the start of every op (a `cudaGetDevice` read, a set only when it differs), `recover` and `close` included; `backend.h`: any thread may drive it, `recover()` on the thread that saw the error | `028763a` |
+| **R3/R4/R5** weights released before the stream was drained; frees relied on `cudaFree`'s implicit sync; cache keyed by host pointer with no lifetime rule; `recover()` 0 overstated | `mynah_slm_backend_weights_flush()` (sync, release all, empty the cache), used by close before anything is freed; explicit drain in every CUDA free; `backend.h` states "must not outlive the model" and the late-async-fault caveat; test: flush then re-upload gives the same product bits | `399beb5` |
+| **N2** the `.cu` host half was compiled with g++'s default `-ffp-contract=fast` (GCC turns it off only for ISO C), so on an FMA host the host check would compare a fused rounding | `-Xcompiler -ffp-contract=off` in the nvcc rule; comment corrected. With `-mfma`: 1 host `vfm*` before, 0 after | `965f02f` |
+| **N1** a NaN as a thread's first element hid that thread's stride: device 159 vs CPU 1029 on the reviewer's case | argmax over `__host__ __device__` scan/merge/final helpers with the CPU's NaN rule (x[0] NaN → 0, NaN never taken); host check runs the kernel's exact order on 6 cases vs the CPU backend; 2 NaN cases on the device; mutations fail (159, 318, 777); reviewer emulator re-run on the new file: 0 failures | `aa65407` |
+| **R2/N3/N4** no attention case with n < 4 warps, no ragged GEMV block, `MYNAH_SLM_INT8` could change the CPU reference, "bitwise" gated at 2^-22, GEMV gate 1e-4 | attention at pos0 0/1/2 and a batch from 0; 1026-row products for all 4 types; CPU pinned to f32 activations; decode and RoPE tol 0 on device and host (bf16 storage: bitwise on the host only, said so); GEMV gate 1e-6 · Σ\|wx\| (emulator worst ~5.5e-8 · Σ\|wx\|, ~18x headroom) | `d10fee8` |
+| **N5** the slot-reuse check attended at pos 0 after one row, so it could not see old history; the pool-refusal comment described a refusal but tested an invalid description | old request 8 rows, new request 3 then 4, attended at pos 2 and 3 vs a fresh cache; a control reads old row 4 bit for bit; mutation (2 rows) fails; refusal tested on the device (f32 KV pool → 1), CPU tests the invalid description (-1) | `118a7c7` |
+| **N7** CUDA CI job: apt could prompt; root over a runner-owned checkout breaks `git describe` | `DEBIAN_FRONTEND=noninteractive`; `safe.directory "$GITHUB_WORKSPACE"` | `c5f9a66` |
+
+Still unvalidated, all of it for want of a GPU: every device kernel, the
+stream ordering, the per-thread device selection, the drains. The tol-0
+device gates assume the CPU side is not FMA-contracted (gcc `-std=c11` is
+not; clang's default `-ffp-contract=on` with `-march=native` may be — then
+those checks fail, which is the honest outcome).
+
 ## Conclusion
 
 G1-a: **KEEP** — the boundary exists, the CPU side of it is the engine's own
