@@ -34,6 +34,14 @@ void  *mynah_slm_jobq_pop(mynah_slm_jobq *q, int block);
  * still handed out, so they can be answered. */
 void   mynah_slm_jobq_close(mynah_slm_jobq *q);
 
+/* Take every queued job for which pred(ud, job) is non-zero out of the
+ * queue, oldest first, at most `cap` of them into `out`; the others keep
+ * their order. Returns how many were taken. pred runs under the queue's
+ * lock: keep it cheap and never call back into the queue. This is how
+ * jobs whose client left while queued stop holding a place. */
+size_t mynah_slm_jobq_remove_if(mynah_slm_jobq *q, int (*pred)(void *ud, void *job),
+                                void *ud, void **out, size_t cap);
+
 size_t mynah_slm_jobq_depth(mynah_slm_jobq *q);
 size_t mynah_slm_jobq_cap(const mynah_slm_jobq *q);
 

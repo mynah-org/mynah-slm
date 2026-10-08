@@ -68,6 +68,22 @@ void mynah_slm_jobq_close(mynah_slm_jobq *q) {
     pthread_mutex_unlock(&q->mu);
 }
 
+size_t mynah_slm_jobq_remove_if(mynah_slm_jobq *q, int (*pred)(void *ud, void *job),
+                                void *ud, void **out, size_t cap) {
+    size_t taken = 0, kept = 0;
+    pthread_mutex_lock(&q->mu);
+    for (size_t i = 0; i < q->len; i++) {
+        void *job = q->ring[(q->head + i) % q->cap];
+        if (taken < cap && pred(ud, job)) { out[taken++] = job; continue; }
+        q->ring[(q->head + kept) % q->cap] = job;      /* compact in place */
+        kept++;
+    }
+    for (size_t i = kept; i < q->len; i++) q->ring[(q->head + i) % q->cap] = NULL;
+    q->len = kept;
+    pthread_mutex_unlock(&q->mu);
+    return taken;
+}
+
 size_t mynah_slm_jobq_depth(mynah_slm_jobq *q) {
     pthread_mutex_lock(&q->mu);
     const size_t n = q->len;

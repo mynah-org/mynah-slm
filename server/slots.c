@@ -491,6 +491,13 @@ static int run_entered(http_conn *conn, const slots_params *p, slots_result *out
             continue;
         }
         if (r->done) break;
+        /* Still queued: nobody else looks at this client until it is
+         * admitted, so probe it here. A client that left while queued is
+         * marked gone, and the scheduler takes it out of the queue at its
+         * next iteration — its place and its share of the capacity are
+         * given back then, not when a slot frees. */
+        if (!r->admitted && !atomic_load(&r->gone) && http_peer_gone(conn))
+            atomic_store(&r->gone, 1);
         struct timespec dl;
         clock_gettime(CLOCK_REALTIME, &dl);
         dl.tv_nsec += 50 * 1000000L;

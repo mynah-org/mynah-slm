@@ -11,8 +11,8 @@
  *   1. ADMIT   fill free slots from the pending queue, oldest first. Block
  *              for a job ONLY when no slot is live — otherwise an empty queue
  *              must not delay the step the live streams are waiting for.
- *   2. REAP    poll every live job's `cancelled` hook (client gone, write
- *              failed, deadline) and retire those at once: a disconnected
+ *   2. REAP    poll every live AND queued job's `cancelled` hook (client
+ *              gone, write failed, deadline) and retire those at once: a disconnected
  *              client never gets another slice or step, and its slot and KV
  *              are free for the next admission in this same iteration's
  *              future. No zombie work.
@@ -49,6 +49,8 @@
 
 #include "jobq.h"
 
+#define MYNAH_SLM_SCHED_NO_SLOT UINT32_MAX
+
 /* How a job left its slot. */
 typedef enum {
     MYNAH_SLM_JOB_DONE = 0,     /* finished normally (EOS, max_tokens, ...) */
@@ -72,11 +74,16 @@ typedef struct {
      * re-stepped alone (isolation). */
     int  (*step)(void *ud, void *const *jobs, const uint32_t *slots, uint32_t n,
                  int *status);
-    /* The job leaves its slot. Called exactly once per job popped from the
-     * queue, whatever happened to it. */
+    /* The job leaves its slot. Called exactly once per job taken from the
+     * queue, whatever happened to it. `slot` is MYNAH_SLM_SCHED_NO_SLOT for
+     * a job cancelled while still queued (it never held one). */
     void (*retire)(void *ud, void *job, uint32_t slot, mynah_slm_job_outcome how);
-    /* Non-zero when nobody wants the job any more. Polled before admission
-     * and once per iteration per live job. Optional (NULL = never). */
+    /* Non-zero when nobody wants the job any more. Polled once per
+     * iteration for every live job AND every queued one (a client that left
+     * while queued must not keep its place, or the capacity it is counted
+     * in, until a slot frees), and again at admission. Runs under the
+     * queue's lock for queued jobs: cheap, and never touching the queue.
+     * Optional (NULL = never). */
     int  (*cancelled)(void *ud, void *job);
     /* Monotonic seconds; a fake clock in tests. Optional (NULL = real). */
     double (*now)(void *ud);

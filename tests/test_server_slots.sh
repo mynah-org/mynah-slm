@@ -288,6 +288,63 @@ PY
 done
 fi
 
+if want 9; then
+# ── 9. clients that leave while QUEUED give their place back ──────────────────
+# Review B2: nobody probed a queued request, so two clients that gave up while
+# queued behind 2 busy slots kept the queue full and a live client got 503.
+start "$TMP/ghost.log" --slots 2 --queue 2
+python3 - "$PORT" > "$TMP/ghost.out" 2>&1 <<'PY'
+import json, socket, sys, time
+port = int(sys.argv[1])
+def req(n, stream):
+    b = json.dumps({'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': n,
+                    'stream': stream, 'temperature': 0}).encode()
+    return b'POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n' % len(b) + b
+def health():
+    s = socket.create_connection(('127.0.0.1', port)); s.sendall(b'GET /health HTTP/1.1\r\n\r\n')
+    r = b''
+    while True:
+        c = s.recv(65536)
+        if not c: break
+        r += c
+    return json.loads(r.split(b'\r\n\r\n', 1)[1])
+live = []
+for _ in range(2):
+    s = socket.create_connection(('127.0.0.1', port)); s.sendall(req(4000, True)); live.append(s)
+time.sleep(0.5)
+for _ in range(2):            # ghosts: queued, then they leave
+    g = socket.create_connection(('127.0.0.1', port)); g.sendall(req(8, False)); time.sleep(0.1); g.close()
+time.sleep(1.0)
+h = health()
+print('queued %d live %d cancelled %d' % (h['queued'], h['live'], h['slot_cancelled']))
+c = socket.create_connection(('127.0.0.1', port)); c.sendall(req(4, False)); c.settimeout(2.0)
+try:
+    first = c.recv(4096).split(b'\r\n')[0].decode()
+except socket.timeout:
+    first = 'waiting'          # queued behind the 2 live streams: right
+print('fifth', first)
+for s in live: s.close()
+c.settimeout(60)
+r = b''
+try:
+    while True:
+        k = c.recv(65536)
+        if not k: break
+        r += k
+except Exception:
+    pass
+print('fifth_final', r.split(b'\r\n')[0].decode() if r else first)
+PY
+stop
+Q=$(awk '/^queued/ {print $2}' "$TMP/ghost.out"); GC=$(awk '/^queued/ {print $6}' "$TMP/ghost.out")
+[ "${Q:-9}" -eq 0 ] && [ "${GC:-0}" -ge 2 ] && ok "2 clients that left while queued were taken out of the queue (queued $Q, cancelled $GC)" \
+    || bad "queued clients that left are taken out of the queue" "$(cat "$TMP/ghost.out")"
+grep -q "^fifth waiting" "$TMP/ghost.out" && ok "a live client after them is queued, not refused" \
+    || bad "a live client after the ghosts is not refused" "$(grep fifth "$TMP/ghost.out")"
+grep -q "^fifth_final HTTP/1.1 200" "$TMP/ghost.out" && ok "... and served once a slot frees" \
+    || bad "the live client is served" "$(grep fifth "$TMP/ghost.out")"
+fi
+
 echo
 [ $fail -eq 0 ] && echo "PASS" || { echo "FAILED ($fail)"; tail -n 20 "$TMP"/*.log; }
 exit $fail

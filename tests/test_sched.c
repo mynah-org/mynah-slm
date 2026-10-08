@@ -432,6 +432,60 @@ static void t_cancel_and_isolation(void) {
     mynah_slm_jobq_free(q);
 }
 
+/* A client that leaves while QUEUED behind busy slots. The review's ghosts:
+ * nobody polled a queued job until a slot freed, so it kept its place (and
+ * its share of the server's capacity) and live clients got 503 behind it.
+ * Now every iteration takes cancelled jobs out of the queue. */
+static void t_queued_ghosts(void) {
+    printf("\n-- a job cancelled while queued gives its place back at once --\n");
+    fake f = { .cost_token = 0.001, .cost_step = 0.01 };
+    mynah_slm_jobq *q = mynah_slm_jobq_new(4);
+    mynah_slm_sched_engine e = engine_for(&f);
+    mynah_slm_sched_cfg cfg = { 2, 16, 0.02 };
+    mynah_slm_sched *s = mynah_slm_sched_new(&cfg, &e, q);
+    job a, b, g1, g2, w;
+    job_init(&a, 0, 1, 1000);
+    job_init(&b, 1, 1, 1000);
+    job_init(&g1, 2, 5, 5);
+    job_init(&g2, 3, 5, 5);
+    job_init(&w, 4, 5, 5);
+    mynah_slm_jobq_push(q, &a);
+    mynah_slm_jobq_push(q, &b);
+    f.iter++; mynah_slm_sched_iterate(s, 0);      /* a and b hold both slots */
+    mynah_slm_jobq_push(q, &g1);
+    mynah_slm_jobq_push(q, &w);
+    mynah_slm_jobq_push(q, &g2);
+    f.iter++; mynah_slm_sched_iterate(s, 0);
+    atomic_store(&g1.cancel, 1);
+    atomic_store(&g2.cancel, 1);
+    f.iter++;
+    const long it = f.iter;
+    mynah_slm_sched_iterate(s, 0);
+    char d[200];
+    snprintf(d, sizeof d, "g1 retired %d (outcome %d, iter %ld), g2 retired %d, queue depth %zu, "
+             "a/b still live %d/%d", g1.retired, (int)g1.outcome, g1.retire_iter, g2.retired,
+             mynah_slm_jobq_depth(q), !a.retired, !b.retired);
+    check("queued jobs whose client left retire at the next iteration, slots still busy",
+          g1.retired == 1 && g2.retired == 1 && g1.outcome == MYNAH_SLM_JOB_CANCELLED &&
+          g2.outcome == MYNAH_SLM_JOB_CANCELLED && g1.retire_iter == it && !a.retired &&
+          !b.retired && index_of(&f, 'A', 2) < 0, d);
+    check("... the live waiter keeps its place, alone in the queue",
+          mynah_slm_jobq_depth(q) == 1 && !w.retired, d);
+    mynah_slm_sched_stats st;
+    mynah_slm_sched_get_stats(s, &st);
+    check("... and they are counted as cancelled", st.cancelled == 2, d);
+    atomic_store(&a.cancel, 1);
+    f.iter++; mynah_slm_sched_iterate(s, 0);     /* a reaped */
+    f.iter++; mynah_slm_sched_iterate(s, 0);     /* its slot admits w */
+    check("the waiter is admitted when a slot frees", w.admitted_slot == a.admitted_slot, d);
+    atomic_store(&b.cancel, 1);
+    atomic_store(&w.cancel, 1);
+    mynah_slm_jobq_close(q);
+    mynah_slm_sched_run(s);
+    mynah_slm_sched_free(s);
+    mynah_slm_jobq_free(q);
+}
+
 static void t_queue_bound(void) {
     printf("\n-- the pending queue --\n");
     mynah_slm_jobq *q = mynah_slm_jobq_new(2);
@@ -522,6 +576,7 @@ int main(void) {
     t_prefill_policy();
     t_prefill_turns_decoder();
     t_cancel_and_isolation();
+    t_queued_ghosts();
     t_queue_bound();
     t_threaded();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASS",

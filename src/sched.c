@@ -25,6 +25,8 @@ struct mynah_slm_sched {
 
     /* step scratch, allocated once */
     void     **jobs;
+    void     **purged;     /* [queue cap]: queued jobs taken out as cancelled */
+    size_t     purge_cap;
     uint32_t  *idx;
     int       *status;
 
@@ -66,7 +68,9 @@ mynah_slm_sched *mynah_slm_sched_new(const mynah_slm_sched_cfg *cfg,
     s->jobs   = calloc(cfg->slots, sizeof *s->jobs);
     s->idx    = calloc(cfg->slots, sizeof *s->idx);
     s->status = calloc(cfg->slots, sizeof *s->status);
-    if (!s->slots || !s->jobs || !s->idx || !s->status) {
+    s->purge_cap = mynah_slm_jobq_cap(queue);
+    s->purged = calloc(s->purge_cap ? s->purge_cap : 1, sizeof *s->purged);
+    if (!s->slots || !s->jobs || !s->idx || !s->status || !s->purged) {
         mynah_slm_sched_free(s);
         return NULL;
     }
@@ -81,6 +85,7 @@ void mynah_slm_sched_free(mynah_slm_sched *s) {
     free(s->jobs);
     free(s->idx);
     free(s->status);
+    free(s->purged);
     free(s);
 }
 
@@ -145,11 +150,25 @@ static int admit_pass(mynah_slm_sched *s, int block_when_idle) {
     }
 }
 
+static int queued_cancelled(void *ud, void *job) {
+    const mynah_slm_sched *s = ud;
+    return s->eng.cancelled(s->eng.ud, job);
+}
+
 static void reap_pass(mynah_slm_sched *s) {
     if (!s->eng.cancelled) return;
     for (uint32_t i = 0; i < s->cfg.slots; i++)
         if (s->slots[i].state != SLOT_FREE && is_cancelled(s, s->slots[i].job))
             retire(s, i, MYNAH_SLM_JOB_CANCELLED);
+    /* And the queue: a client that left while waiting gives its place
+     * back NOW, not when a slot frees and admission finally looks at it. */
+    const size_t n = mynah_slm_jobq_remove_if(s->q, queued_cancelled, s, s->purged,
+                                              s->purge_cap);
+    for (size_t k = 0; k < n; k++) {
+        s->eng.retire(s->eng.ud, s->purged[k], MYNAH_SLM_SCHED_NO_SLOT,
+                      MYNAH_SLM_JOB_CANCELLED);
+        count(s, &s->st.cancelled, 1);
+    }
 }
 
 static void prefill_pass(mynah_slm_sched *s) {
