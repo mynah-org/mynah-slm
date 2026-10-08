@@ -206,6 +206,47 @@ Written as the plan, because `arch_qwen3.c` is owned by another agent right now.
    then `mynah-slm ppl` at bf16 KV against the CPU at bf16 KV, then decode
    tok/s with the dispatch proven (`nsys` shows our kernels, no host fallback).
 
+## Plan — cancellation: a client that leaves must not keep the GPU busy
+
+Requirement (user, 2026-10-08): a disconnected client's request must not run
+to completion on the device. **The scheduler decides, at step boundaries**
+(the serving side polls a peer-gone probe every decode step and between
+prefill slices); the backend's job is to make acting on that decision cheap
+and safe. API in `src/backend.h` ("per-request state: a slot pool" and
+"errors that belong to one request"), implementation `src/backend_slots.c`.
+
+1. **Per-request device state lives in a slot pool**, allocated whole at
+   load (`slots_create`: KV + scratch + one fence per slot). Retiring a row —
+   finished, failed or cancelled — is `slot_release`: **no `cudaFree`, no
+   `cudaFreeHost`** (both synchronize the device, mynah-tts
+   `pocket-cuda-slot-pool.md`), no wait. Release records a fence (a CUDA
+   event) behind the work already queued and PARKS the slot; `slot_acquire`
+   polls parked fences (`cudaEventQuery`, never a wait) and hands a slot out
+   only once its fence has passed, else returns 1 = busy — the admission
+   ladder's fail-fast, not an error. The KV is not cleared on reuse:
+   attention reads only positions the new request appended.
+2. **At most the in-flight step finishes for a cancelled row**, because a
+   step already submitted to the stream cannot be recalled without a device
+   sync, and a sync per cancellation would stall every other row. Its outputs
+   are dropped: release bumps the slot's **generation**, and the scheduler
+   compares the generation a result was tagged with. The next step's batch
+   excludes the row; the per-row tables (slot → KV base, position, generation)
+   are host-pinned and **rebuilt every step** from the live set, as in
+   mynah-tts, so nothing of the row survives in them.
+3. **Inside a captured graph** (integration step 4): a cancelled row becomes
+   an **inert pad row** (its table entry points at a dummy slot whose output
+   nobody reads), or the batch is re-selected into a **smaller width bucket**
+   whose graph already exists. Never a re-capture on the hot path (mynah-tts
+   F5: re-recording on every membership change). Lowest-index-first slot
+   reuse keeps live rows dense, which is what lets a smaller bucket take them.
+4. **A device error on one request retires that request only.**
+   `mynah_slm_backend_recover()` clears a non-sticky record — allocation
+   failure, invalid launch configuration — the way mynah-tts `ce()` does, and
+   returns 0: release that request's slot, keep serving. A **sticky** error
+   (illegal address, launch failure) survives the read and poisons the whole
+   context; recover returns -1 with "reopen the backend". No API can do
+   better than that on CUDA, and it is said rather than hidden.
+
 ---
 
 ## Evidence
@@ -302,6 +343,23 @@ What did NOT run: **every device kernel**. The warp reductions, the online
 softmax and its merge, the launch geometry, the stream ordering and the
 `ce()` paths are compiled, not executed. The device self-test is written and
 linked and is the first thing to run on a GPU.
+
+### G1-d — slot pool, non-synchronizing release, per-request recovery
+
+- CPU (`tests/test_backend.c`, model-free): a pool of 3 at Qwen3's 16/8 x 128
+  bf16 shape — three acquires give slots 0,1,2; a fourth is BUSY (1); release
+  of a row with 5 positions written moves its generation; a double release is
+  -1; re-acquire returns the same slot with the new generation and the SAME
+  KV handle and scratch pointer (no allocation); the new request's attention
+  after one append equals a fresh cache that only saw that row, **bitwise** —
+  the cancelled request's history is invisible; `recover` is 0 on a
+  synchronous backend; an invalid KV description refuses the pool.
+- CUDA (`self_test.c` `check_slots`, compiled, **not run**): release right
+  after queuing an append + attention on the slot, re-acquire without a sync
+  must be 0 or 1 (never -1, never a wait), after a sync the slot returns with
+  a newer generation; a 2^44-float allocation fails, `recover` returns 0,
+  and another slot's next op still runs.
+- `make cuda` sm_89 builds; `backend_cuda.cu` compiles under nvcc -Werror.
 
 ## Conclusion
 

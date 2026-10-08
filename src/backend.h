@@ -195,4 +195,76 @@ int  mynah_slm_backend_attention(mynah_slm_backend *b, const mynah_slm_bkv *kv,
 int mynah_slm_backend_argmax(mynah_slm_backend *b, const float *x, size_t n,
                              uint32_t *idx, char *err, size_t errsz);
 
+/* ── per-request state: a slot pool ─────────────────────────────────────────
+ * Every request's device state — its KV cache and its scratch — lives in a
+ * SLOT, and every slot is allocated when the pool is created (model load),
+ * never on the request path. Admission takes a slot; retirement — finished,
+ * failed, or CANCELLED because the client went away — gives it back.
+ *
+ * WHY: cudaFree and cudaFreeHost synchronize the whole device. Freeing a
+ * request's memory at retirement stalls every other live request for that
+ * long, and allocating at admission costs 11-30 ms (mynah-tts
+ * pocket-cuda-slot-pool.md: 11-30 ms -> 0.05 ms with a pool).
+ *
+ * RELEASE NEVER WAITS. The device may still be running the step that was in
+ * flight when the scheduler decided to drop the row. Release records a fence
+ * on the stream behind that work and returns at once; the slot is PARKED,
+ * and acquire hands it out again only once its fence has passed (polled,
+ * never waited on). Until then acquire picks another slot, or returns 1 —
+ * the admission ladder's "busy", not an error.
+ *
+ * The contract for a cancelled row, which the scheduler (not the backend)
+ * enforces at step boundaries:
+ *   - at most the step already submitted finishes for it; its outputs are
+ *     dropped, recognised by the slot GENERATION, which release bumps — a
+ *     result tagged with an older generation belongs to a retired request;
+ *   - the next step's batch simply does not include it: per-row tables
+ *     (slot -> KV base, position) are rebuilt per step, so nothing about
+ *     the row survives in them;
+ *   - inside a captured graph the row becomes an inert pad row, or the
+ *     batch drops to a smaller width bucket — never a re-capture on the hot
+ *     path (.work/cuda-backend.md).
+ * A KV cache is not cleared on reuse: attention only reads positions the new
+ * request wrote (kv_append before attention, always). */
+typedef struct mynah_slm_bslots mynah_slm_bslots;
+
+typedef struct {
+    mynah_slm_bkv_desc kv;        /* every slot's cache */
+    size_t   scratch;             /* floats of per-slot scratch, may be 0 */
+    uint32_t n_slots;
+} mynah_slm_bslots_desc;
+
+/* Allocates every slot. The ONLY allocation the pool ever makes. */
+int  mynah_slm_backend_slots_create(mynah_slm_backend *b, const mynah_slm_bslots_desc *d,
+                                    mynah_slm_bslots **out, char *err, size_t errsz);
+/* Frees every slot; may synchronize. Shutdown only. */
+void mynah_slm_backend_slots_destroy(mynah_slm_backend *b, mynah_slm_bslots *p);
+
+/* 0 and a free, quiescent slot; 1 when none is (all busy, or parked behind a
+ * fence still in flight) — retry at a later step boundary; -1 on error.
+ * Never allocates, never waits. */
+int  mynah_slm_backend_slot_acquire(mynah_slm_backend *b, mynah_slm_bslots *p,
+                                    uint32_t *slot, uint64_t *generation,
+                                    char *err, size_t errsz);
+/* Park the slot behind a fence on the stream. Never frees, never waits.
+ * -1 for a slot that is not held (a double release is a scheduler bug). */
+int  mynah_slm_backend_slot_release(mynah_slm_backend *b, mynah_slm_bslots *p,
+                                    uint32_t slot, char *err, size_t errsz);
+
+mynah_slm_bkv *mynah_slm_backend_slot_kv(mynah_slm_bslots *p, uint32_t slot);
+float         *mynah_slm_backend_slot_scratch(mynah_slm_bslots *p, uint32_t slot);
+uint64_t       mynah_slm_backend_slot_generation(const mynah_slm_bslots *p, uint32_t slot);
+uint32_t       mynah_slm_backend_slots_held(const mynah_slm_bslots *p);
+
+/* ── errors that belong to one request ──────────────────────────────────────
+ * After an op on one request fails, ask whether the BACKEND survived:
+ *    0   recoverable — the error record is cleared (e.g. an allocation
+ *        failure, an invalid launch configuration); retire that request's
+ *        slot and keep serving the others;
+ *   -1   the device context is poisoned (a sticky error: illegal address,
+ *        launch failure). No read can clear it; every request on this
+ *        backend fails and the backend must be closed and reopened.
+ * A synchronous backend has nothing pending and always returns 0. */
+int mynah_slm_backend_recover(mynah_slm_backend *b, char *err, size_t errsz);
+
 #endif /* MYNAH_SLM_BACKEND_H */

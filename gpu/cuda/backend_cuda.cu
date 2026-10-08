@@ -326,6 +326,64 @@ int cuda_argmax(void *st, const float *x, size_t n, uint32_t *idx, char *e, size
     return 0;
 }
 
+/* ── slot-pool fences and per-request error recovery ───────────────────── */
+
+int cuda_fence_create(void *st, void **fence, char *e, size_t c) {
+    (void)st;
+    cudaEvent_t ev = nullptr;
+    /* Created once per slot at pool creation; timing off, it is only a marker. */
+    if (ce(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), e, c, "fence create")) return -1;
+    *fence = ev;
+    return 0;
+}
+
+void cuda_fence_destroy(void *st, void *fence) {
+    (void)st;
+    if (fence) cudaEventDestroy(static_cast<cudaEvent_t>(fence));
+}
+
+/* Behind everything queued so far: the step that was in flight for the row. */
+int cuda_fence_record(void *st, void *fence, char *e, size_t c) {
+    auto *s = static_cast<cuda_state *>(st);
+    return ce(cudaEventRecord(static_cast<cudaEvent_t>(fence), s->stream), e, c, "fence record");
+}
+
+/* Polled, never waited on. */
+int cuda_fence_query(void *st, void *fence, char *e, size_t c) {
+    (void)st;
+    const cudaError_t r = cudaEventQuery(static_cast<cudaEvent_t>(fence));
+    if (r == cudaSuccess) return 1;
+    if (r == cudaErrorNotReady) {
+        /* "Not yet" is an answer, not an error; never leave it as the
+         * thread's last error for an unrelated launch check to report. */
+        if (cudaPeekAtLastError() == cudaErrorNotReady) (void)cudaGetLastError();
+        return 0;
+    }
+    return ce(r, e, c, "fence query");
+}
+
+/* Called after one request's op failed. cudaGetLastError clears a
+ * non-sticky record (an allocation failure, a bad launch configuration);
+ * a sticky one (illegal address, launch failure) survives the read and also
+ * surfaces from the stream query — then the context is gone for everyone. */
+int cuda_recover(void *st, char *e, size_t c) {
+    auto *s = static_cast<cuda_state *>(st);
+    (void)cudaGetLastError();
+    cudaError_t r = cudaPeekAtLastError();
+    if (r == cudaSuccess) {
+        r = cudaStreamQuery(s->stream);
+        if (r == cudaErrorNotReady) {
+            if (cudaPeekAtLastError() == cudaErrorNotReady) (void)cudaGetLastError();
+            r = cudaSuccess;
+        }
+    }
+    if (r == cudaSuccess) return 0;
+    if (e && c > 0)
+        std::snprintf(e, c, "CUDA context lost (sticky error, reopen the backend): %s",
+                      cudaGetErrorString(r));
+    return -1;
+}
+
 /* Widest embed() call served without an allocation: a prefill batch. */
 constexpr size_t TOKENS_CAP = 4096;
 
@@ -409,6 +467,11 @@ extern "C" int mynah_slm_backend_cuda_open(mynah_slm_backend_ops *ops, void **st
     ops->kv_append      = cuda_kv_append;
     ops->attention      = cuda_attention;
     ops->argmax         = cuda_argmax;
+    ops->fence_create   = cuda_fence_create;
+    ops->fence_destroy  = cuda_fence_destroy;
+    ops->fence_record   = cuda_fence_record;
+    ops->fence_query    = cuda_fence_query;
+    ops->recover        = cuda_recover;
     *state = s;
     return 0;
 }

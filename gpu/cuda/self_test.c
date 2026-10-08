@@ -384,6 +384,53 @@ static void check_refusals(ctx *c) {
     report(c, "cuda refuses a Q5_K weight (returns 1)", r3 == 1 && !w, r3, 1);
 }
 
+/* Cancellation on the device: a slot released while its step may still be
+ * running is parked, never freed and never waited on; it comes back once its
+ * fence passes. And an error that belongs to one request (here: an
+ * allocation the device cannot satisfy) leaves the backend serving. */
+static void check_slots(ctx *c) {
+    mynah_slm_bslots_desc d = {
+        { MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_BF16, 1, 512, 16, 8, 128, 1 }, 4096, 2 };
+    mynah_slm_bslots *p = NULL;
+    uint32_t s0 = 9, s1 = 9, s2 = 9;
+    uint64_t g0 = 0, g1 = 0, g2 = 0;
+    if (mynah_slm_backend_slots_create(c->gpu, &d, &p, c->err, sizeof c->err) != 0 ||
+        mynah_slm_backend_slot_acquire(c->gpu, p, &s0, &g0, c->err, sizeof c->err) != 0 ||
+        mynah_slm_backend_slot_acquire(c->gpu, p, &s1, &g1, c->err, sizeof c->err) != 0) {
+        fail(c, "slot pool on the device");
+        mynah_slm_backend_slots_destroy(c->gpu, p);
+        return;
+    }
+    /* Queue real work on slot 0, then cancel it at once: no sync. */
+    float *scr = mynah_slm_backend_slot_scratch(p, s0);
+    mynah_slm_bkv *kv = mynah_slm_backend_slot_kv(p, s0);
+    int ok = mynah_slm_backend_kv_append(c->gpu, kv, 0, 0, 1, scr, scr + 1024, c->err, sizeof c->err) == 0 &&
+             mynah_slm_backend_attention(c->gpu, kv, 0, scr, scr + 2048, 0, 1, 0.088f, c->err, sizeof c->err) == 0 &&
+             mynah_slm_backend_slot_release(c->gpu, p, s0, c->err, sizeof c->err) == 0;
+    /* Right after release the fence may or may not have passed: either the
+     * slot comes back (0) or the pool is busy (1). Never an error, never a wait. */
+    const int early = ok ? mynah_slm_backend_slot_acquire(c->gpu, p, &s2, &g2, c->err, sizeof c->err) : -1;
+    if (early == 0) ok = ok && mynah_slm_backend_slot_release(c->gpu, p, s2, c->err, sizeof c->err) == 0;
+    ok = ok && (early == 0 || early == 1) &&
+         mynah_slm_backend_sync(c->gpu, c->err, sizeof c->err) == 0 &&
+         mynah_slm_backend_slot_acquire(c->gpu, p, &s2, &g2, c->err, sizeof c->err) == 0;
+    report(c, "cancelled slot parks behind a fence, comes back after it",
+           ok && s2 == s0 && g2 > g0, (double)early, 1);
+
+    /* A request whose allocation cannot be met: reported, cleared, and the
+     * next op of another request still runs. */
+    float *huge = mynah_slm_backend_alloc(c->gpu, (size_t)1 << 44, c->err, sizeof c->err);
+    const int rec = mynah_slm_backend_recover(c->gpu, c->err, sizeof c->err);
+    mynah_slm_bkv *kv1 = mynah_slm_backend_slot_kv(p, s1);
+    float *scr1 = mynah_slm_backend_slot_scratch(p, s1);
+    const int after = mynah_slm_backend_kv_append(c->gpu, kv1, 0, 0, 1, scr1, scr1 + 1024, c->err, sizeof c->err) == 0 &&
+                      mynah_slm_backend_sync(c->gpu, c->err, sizeof c->err) == 0;
+    report(c, "a failed allocation retires one request, not the backend",
+           huge == NULL && rec == 0 && after, rec, 0);
+    mynah_slm_backend_free(c->gpu, huge);
+    mynah_slm_backend_slots_destroy(c->gpu, p);
+}
+
 int mynah_slm_cuda_self_test(FILE *log) {
     ctx c;
     memset(&c, 0, sizeof c);
@@ -414,6 +461,7 @@ int mynah_slm_cuda_self_test(FILE *log) {
     check_attention(&c, 8, 2, 256);
     check_argmax(&c);
     check_refusals(&c);
+    check_slots(&c);
 
     mynah_slm_backend_close(c.gpu);
     mynah_slm_backend_close(c.cpu);

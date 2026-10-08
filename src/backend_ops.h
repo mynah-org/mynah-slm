@@ -92,7 +92,24 @@ typedef struct mynah_slm_backend_ops {
 
     int (*argmax)(void *st, const float *x, size_t n, uint32_t *idx,
                   char *err, size_t errsz);
+
+    /* Fences for the slot pool: created at pool creation, RECORDED behind the
+     * work queued so far at release, QUERIED (never waited on) at acquire:
+     * 1 passed, 0 still in flight, -1 error. All NULL on a synchronous
+     * backend, where every fence has passed by construction. */
+    int  (*fence_create)(void *st, void **fence, char *err, size_t errsz);
+    void (*fence_destroy)(void *st, void *fence);
+    int  (*fence_record)(void *st, void *fence, char *err, size_t errsz);
+    int  (*fence_query)(void *st, void *fence, char *err, size_t errsz);
+
+    /* See mynah_slm_backend_recover(). NULL = nothing can be pending. */
+    int (*recover)(void *st, char *err, size_t errsz);
 } mynah_slm_backend_ops;
+
+/* For modules layered on the table (backend_slots.c): the table and the
+ * state of an open backend. */
+const mynah_slm_backend_ops *mynah_slm_backend_ops_of(const mynah_slm_backend *b,
+                                                      void **state);
 
 /* Each backend's constructor: fill `ops` (pre-zeroed) and `*state`. */
 int mynah_slm_backend_cpu_open(mynah_slm_backend_ops *ops, void **state,

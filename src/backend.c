@@ -98,6 +98,19 @@ mynah_slm_device mynah_slm_backend_device(const mynah_slm_backend *b) {
     return b ? b->device : MYNAH_SLM_DEVICE_CPU;
 }
 
+const mynah_slm_backend_ops *mynah_slm_backend_ops_of(const mynah_slm_backend *b,
+                                                      void **state) {
+    if (!b) return NULL;
+    if (state) *state = b->state;
+    return &b->ops;
+}
+
+int mynah_slm_backend_recover(mynah_slm_backend *b, char *err, size_t errsz) {
+    if (!b) { set_err(err, errsz, "invalid backend"); return -1; }
+    if (!b->ops.recover) return 0;
+    return b->ops.recover(b->state, err, errsz);
+}
+
 int mynah_slm_backend_has(const mynah_slm_backend *b, mynah_slm_bop op) {
     if (!b) return 0;
     const mynah_slm_backend_ops *o = &b->ops;

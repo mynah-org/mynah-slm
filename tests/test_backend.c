@@ -319,6 +319,85 @@ static void test_attention(mynah_slm_backend *b, mynah_slm_kv_type kt) {
     mynah_slm_aligned_free(vg);
 }
 
+/* ── the slot pool: release and reuse, the cancellation path ───────────── */
+
+static void test_slots(mynah_slm_backend *b) {
+    enum { CTX = 32, NH = 16, NKV = 8, HD = 128, SCR = 256 };
+    const uint32_t kv_dim = NKV * HD, q_dim = NH * HD;
+    const float scale = 1.0f / sqrtf((float)HD);
+    mynah_slm_bslots_desc d = {
+        { MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_BF16, 1, CTX, NH, NKV, HD, 4 }, SCR, 3 };
+    mynah_slm_bslots *p = NULL;
+    int rc = mynah_slm_backend_slots_create(b, &d, &p, err, sizeof err);
+    check("slot pool of 3 is created up front", rc == 0 && p != NULL, err);
+    if (rc != 0) return;
+
+    uint32_t s[4] = { 9, 9, 9, 9 };
+    uint64_t g[4] = { 0 };
+    int ok = 1;
+    for (int i = 0; i < 3; i++)
+        ok = ok && mynah_slm_backend_slot_acquire(b, p, &s[i], &g[i], err, sizeof err) == 0;
+    check("three acquires give slots 0, 1, 2", ok && s[0] == 0 && s[1] == 1 && s[2] == 2, err);
+    check("a fourth acquire is BUSY (1), not an error and not an allocation",
+          mynah_slm_backend_slot_acquire(b, p, &s[3], &g[3], err, sizeof err) == 1, NULL);
+    check("held count is 3", mynah_slm_backend_slots_held(p) == 3, NULL);
+
+    /* Slot 1's request writes some history, then is cancelled mid-sequence. */
+    mynah_slm_bkv *kv_before = mynah_slm_backend_slot_kv(p, 1);
+    float *scr_before = mynah_slm_backend_slot_scratch(p, 1);
+    static float k[5 * NKV * HD], v[5 * NKV * HD], q[NH * HD], out[NH * HD], ref[NH * HD];
+    fill(k, sizeof k / sizeof k[0], 2.0f);
+    fill(v, sizeof v / sizeof v[0], 2.0f);
+    fill(q, sizeof q / sizeof q[0], 2.0f);
+    mynah_slm_backend_kv_append(b, kv_before, 0, 0, 5, k, v, err, sizeof err);
+
+    rc = mynah_slm_backend_slot_release(b, p, 1, err, sizeof err);
+    check("cancelling a row releases its slot at the step boundary", rc == 0, err);
+    check("the generation moves on release (stale outputs are recognisable)",
+          mynah_slm_backend_slot_generation(p, 1) == g[1] + 1, NULL);
+    check("a double release is refused (-1)",
+          mynah_slm_backend_slot_release(b, p, 1, err, sizeof err) == -1, NULL);
+
+    uint32_t again = 9;
+    uint64_t gen = 0;
+    rc = mynah_slm_backend_slot_acquire(b, p, &again, &gen, err, sizeof err);
+    check("the released slot is handed out again (lowest free index)",
+          rc == 0 && again == 1 && gen == g[1] + 1, err);
+    check("reuse makes no allocation: same KV handle, same scratch",
+          mynah_slm_backend_slot_kv(p, 1) == kv_before &&
+          mynah_slm_backend_slot_scratch(p, 1) == scr_before, NULL);
+
+    /* The new request writes position 0 and attends to it. The previous
+     * occupant's positions 1..4 are still in the cache and must be invisible:
+     * the answer equals a fresh cache that only ever saw the new row. */
+    const float *k_new = k + 2 * kv_dim, *v_new = v + 2 * kv_dim;
+    mynah_slm_backend_kv_append(b, kv_before, 0, 0, 1, k_new, v_new, err, sizeof err);
+    rc = mynah_slm_backend_attention(b, kv_before, 0, q, out, 0, 1, scale, err, sizeof err);
+    mynah_slm_kv fresh;
+    mynah_slm_kv_init(&fresh, MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_BF16, 1, CTX, NKV, HD);
+    mynah_slm_kv_put_k(&fresh, 0, 0, k_new);
+    mynah_slm_kv_put_v(&fresh, 0, 0, v_new);
+    float *scores = mynah_slm_aligned_alloc((size_t)NH * CTX * sizeof(float));
+    mynah_slm_attention_kv_mt(ref, q, &fresh, 0, 1, NH, NKV, HD, scale, scores);
+    check("a reused slot sees none of the cancelled request's history, bitwise",
+          rc == 0 && same(out, ref, q_dim), rc ? err : "bits differ");
+    mynah_slm_aligned_free(scores);
+    mynah_slm_kv_free(&fresh);
+
+    check("a synchronous backend always recovers (nothing pending)",
+          mynah_slm_backend_recover(b, err, sizeof err) == 0, err);
+
+    for (int i = 0; i < 3; i++) mynah_slm_backend_slot_release(b, p, (uint32_t)i, err, sizeof err);
+    check("all slots released", mynah_slm_backend_slots_held(p) == 0, NULL);
+    mynah_slm_backend_slots_destroy(b, p);
+
+    /* A KV precision the backend refuses makes the pool refuse too. */
+    d.kv.n_heads = 15;
+    p = NULL;
+    check("a pool over an invalid KV description is refused",
+          mynah_slm_backend_slots_create(b, &d, &p, err, sizeof err) != 0 && p == NULL, NULL);
+}
+
 int main(void) {
     /* Threaded: the matvec row split and the per-head attention tasks must
      * stay bit-identical with the pool actually running. */
@@ -336,6 +415,7 @@ int main(void) {
     test_attention(b, MYNAH_SLM_KV_F32);
     test_attention(b, MYNAH_SLM_KV_BF16);
     test_attention(b, MYNAH_SLM_KV_Q8);
+    test_slots(b);
     mynah_slm_backend_close(b);
     for (int i = 0; i < n_keep; i++) free(keep[i]);
     mynah_slm_threads_shutdown();
