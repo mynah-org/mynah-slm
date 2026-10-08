@@ -312,6 +312,10 @@ Reading it, with the control that would embarrass the explanation:
   share: one attention region per layer for all B and one step call; the
   weights are still read B times. Not the continuous-batching win — that
   needs the weights read once.
+- **Superseded by K7** ([`batched-decode-kernel.md`](batched-decode-kernel.md)):
+  the default is now `ws`, the weight-stationary product, still
+  bit-identical to solo and 1.17-1.46x faster than `matvec` at B = 2..8.
+  The original decision follows.
 - **Decision: the default product is `matvec`** (bit-identical to solo, never
   slower here); `matmat` stays behind `MYNAH_SLM_DECODE_PRODUCT=matmat` as
   the A/B arm. The weight-read-once win needs sibling-port-map row 6 — a

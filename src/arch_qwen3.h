@@ -238,18 +238,23 @@ int  mynah_slm_forward_multi(mynah_slm_state *s, mynah_slm_seq *const *seqs,
                              const uint32_t *tokens, uint32_t n, float **logits);
 
 /* Which product forward_multi uses per weight, from MYNAH_SLM_DECODE_PRODUCT:
- *   "matvec" (default)  n threaded matvecs, our fused kernels — weights read
+ *   "matvec"            n threaded matvecs, our fused kernels — weights read
  *                       n times, but bit-identical to each sequence's solo
  *                       step, and one attention region per layer for all n.
  *   "matmat"            one mynah_slm_qmatmat over the n rows — weights read
  *                       once, but each strip is dequantized to f32 first.
  *                       MEASURED 3-5x SLOWER than n solo steps at n = 2..8 on
  *                       the 0.6B geometry (bench_decode, S1-c). Opt-in.
- *   "ws"                one weight-stationary pass per weight (K7,
+ *   "ws" (default)      one weight-stationary pass per weight (K7,
  *                       mynah_slm_matvec_ws): weights read once for all n,
  *                       each weight unit decoded once, and STILL bit-identical
- *                       to each sequence's solo step. Where our kernels do
- *                       not take the tensor (ingot's types) it is "matvec".
+ *                       to each sequence's solo step. Where no ws kernel
+ *                       takes the tensor (ingot's types) the rows are walked
+ *                       in 16-row tiles, each tile multiplied by every
+ *                       sequence by the solo call, so the weight is still
+ *                       read from memory once. Measured 1.17-1.46x faster
+ *                       than "matvec" at n = 2..8 (.work/batched-decode-
+ *                       kernel.md); the default since K7.
  * The setter exists for an interleaved in-process A/B (a MYNAH_SLM_DECODE_*
  * value, or -1 back to the environment's choice); call it between steps. */
 #define MYNAH_SLM_DECODE_MATVEC 0

@@ -779,13 +779,14 @@ static int g_decode_product = -1;
 static int decode_product(void) {
     if (g_decode_product < 0) {
         const char *e = getenv("MYNAH_SLM_DECODE_PRODUCT");
-        /* matvec by default: measured, one qmatmat per weight lost 3-5x to
-         * B solo steps at B = 2..8 on the 0.6B geometry
-         * (.work/serving-continuous-batching.md S1-c). */
-        g_decode_product = !e                       ? MYNAH_SLM_DECODE_MATVEC :
+        /* ws by default: bit-identical to solo like matvec, and measured
+         * 1.17-1.46x faster than matvec at B = 2..8 (f32) and 1.7-2.5x with
+         * int8, 1 and 4 threads, 0.6B geometry (.work/batched-decode-
+         * kernel.md). matmat lost 3-5x to solo (S1-c) and stays opt-in. */
+        g_decode_product = !e                       ? MYNAH_SLM_DECODE_WS :
                            strcmp(e, "matmat") == 0 ? MYNAH_SLM_DECODE_MATMAT :
-                           strcmp(e, "ws") == 0     ? MYNAH_SLM_DECODE_WS :
-                                                      MYNAH_SLM_DECODE_MATVEC;
+                           strcmp(e, "matvec") == 0 ? MYNAH_SLM_DECODE_MATVEC :
+                                                      MYNAH_SLM_DECODE_WS;
     }
     return g_decode_product;
 }
