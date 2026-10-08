@@ -99,3 +99,53 @@ jobs:
           test -x staging/usr/bin/mynah-slm-server
           test -f staging/usr/lib/libmynah_slm.a
           test -f staging/usr/include/mynah_slm.h
+
+  # ------------------------------------------------------------------ GPU
+  #
+  # COMPILE ONLY. No GPU exists on these runners, and nothing here proves a
+  # kernel correct, fast, or even that it launches. It proves the CUDA sources
+  # still compile and the CUDA build still links — the thing that rots
+  # silently when nobody builds it (mynah-tts found a link error on this job's
+  # first run). Pattern from mynah-tts build.yml.
+  #
+  # It also runs the self-test binary, which must (1) pass its HOST half —
+  # the kernels' __host__ __device__ block decode, bf16 rounding and RoPE
+  # mapping executed on the CPU against ingot and src/ — and (2) report "no
+  # CUDA device" and exit 77 instead of crashing. Device parity is
+  # downstream, on a real GPU: `make cuda-test CUDA_ARCH=sm_89`.
+  cuda-compile:
+    name: "compile-only: CUDA ${{ matrix.arch }} (no GPU)"
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.6.2-devel-ubuntu24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Ampere (A100), Ada (L4 / L40S), Hopper. CUDA_ARCH must be named:
+        # the Makefile's default `native` asks the installed GPU, and there
+        # is none.
+        arch: [sm_80, sm_89, sm_90]
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential git ca-certificates
+          nvcc --version
+
+      - uses: actions/checkout@v7
+
+      # BLAS=none: no vendor package to install in the container, and the
+      # CUDA build does not care which CPU GEMM the reference path links.
+      - name: Compile and link the CUDA build
+        run: make cuda CUDA_ARCH=${{ matrix.arch }} BLAS=none
+
+      - name: Self-test binary runs its host half and refuses cleanly without a GPU
+        run: |
+          set +e
+          ./build/cuda/test_cuda > selftest.txt 2>&1
+          rc=$?
+          set -e
+          cat selftest.txt
+          if grep -q '^FAIL' selftest.txt; then echo 'a self-test check failed' >&2; exit 1; fi
+          grep -q 'no CUDA device' selftest.txt
+          test "$rc" -eq 77

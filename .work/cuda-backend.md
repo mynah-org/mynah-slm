@@ -292,6 +292,12 @@ What ran here:
   "SKIP cuda self-test: no CUDA device: no CUDA-capable device is detected",
   exit 77; `make cuda-test` reports SKIP and exits 0. No crash.
 
+CI: `.github/workflows/build.yml` job `cuda-compile`, a matrix over
+sm_80 / sm_89 / sm_90 in `nvidia/cuda:12.6.2-devel-ubuntu24.04` (mynah-tts's
+pattern): `make cuda BLAS=none`, then `build/cuda/test_cuda` must print no
+`FAIL`, say "no CUDA device" and exit 77. The YAML parses; the job itself has
+not run yet (it runs on the PR). Locally the same steps pass with CUDA 12.0.
+
 What did NOT run: **every device kernel**. The warp reductions, the online
 softmax and its merge, the launch geometry, the stream ordering and the
 `ce()` paths are compiled, not executed. The device self-test is written and
