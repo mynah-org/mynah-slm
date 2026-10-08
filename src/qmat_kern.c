@@ -733,7 +733,8 @@ Q4K_INLINE void q6k_i8_avx512(const unsigned char *row0, size_t row_bytes,
 #elif defined(MYNAH_SLM_K_AVX2)
 /* AVX2, no VNNI: llama.cpp's sign trick for a signed x signed int8 dot on
  * maddubs (u8 x s8): |w| is the unsigned operand and sign(xq, w) the signed
- * one. |xq| <= 127 (the quantizer never emits -128), so sign() cannot
+ * one. |xq| <= 127 (the quantizer clamps symmetrically and zeroes blocks
+ * too small to scale — src/qmat.c, tests/test_kernels.c), so sign() cannot
  * overflow, and a pair is at most 128*127*2 = 32512: inside int16. */
 Q4K_INLINE void q80_i8_avx2(const unsigned char *row0, size_t row_bytes,
                             const int nr, size_t nb, const int8_t *xq,

@@ -89,7 +89,7 @@ the shapes that matter, by enough to be worth a second quality trade inside
 | one-row calls == groups of four; 4 threads x ragged chunks (1/3/7/64) == 1 thread, memcmp | PASS both types | PASS | n/a | PASS | n/a |
 | twin vs ingot dequant x the int8 activations, double | Q8_0 9.3e-8..2.2e-7, Q6_K 1.0e-7..1.8e-7 rel | same | same | same | same |
 | twin vs ingot dequant x f32 activations (the int8 approximation) | Q8_0 5.0e-3..1.9e-2, Q6_K 6.0e-3..9.3e-3 rel (gate 3e-2) | same | same | same | same |
-| `xq` never -128 (AVX2's `sign(xq, w)` relies on it) | PASS | PASS | PASS | PASS | PASS |
+| `xq` never -128 (AVX2's `sign(xq, w)` relies on it) | PASS on the spike fixture only — **the claim was FALSE** for a block with amax < ~3.7e-37 (subnormal scale, inv = +inf, saturation to -128, 0*inf cast to int8): fixed and pinned, see "Correction (review B1)" below | | | | |
 | `MYNAH_SLM_INT8_TYPES` narrows per type, never widens | PASS | PASS | n/a | PASS | n/a |
 | with f32 activations we still DECLINE Q6_K and Q8_0 (ingot's kernels) | PASS | PASS | PASS | PASS | PASS |
 
@@ -167,6 +167,28 @@ What these support:
   where bandwidth binds.
 - Q6_K int8 is FASTER per element than Q4_K int8 on the same shape here
   (0.055 vs 0.082 ms on 1024x1024): no 6-bit scale unpack, no min term.
+
+### Correction (review B1, 2026-10-08)
+
+The "`xq` never -128" row above was proven on ONE fixture (a spike) and the
+general claim was false. The quantizer computed `scale = amax/127` and
+`inv = 1/scale`; for a block with `amax` below ~3.7e-37 the scale is
+subnormal and `inv` overflows to +inf, so every nonzero value saturated and
+the `[-128, 127]` clamp emitted **-128**, and a zero became `0 * inf = NaN`
+cast to int8 (UB). With `xq = -128`, AVX2's `sign(xq, w)` wraps and the AVX2
+Q8_0 kernel disagreed with its twin (reproduced by the review's corner
+fuzzer: twin 1.0e-37 vs avx2 -1.0e-37 on one block).
+
+Fix (`src/qmat.c`): `inv = 127/amax` directly; a block with `amax < 2^-120`
+(the smallest amax for which `127/amax` is finite — `FLT_MIN` is not enough,
+`127/FLT_MIN` overflows), NaN or a non-finite sum quantizes to zero with a
+zero scale; the clamp is symmetric `[-127, 127]`. Pinned in
+`tests/test_kernels.c` (tiny-amax, all-+-max and denormal blocks, and the
+same two hostile blocks inside every `int8_contract` fixture, so the memcmp
+against the twin covers them at every ISA level) and in
+`mynah_slm_isa_verify_qmat`'s fixtures. Activations that small do not occur
+in a normalized transformer; the fix is about the contract being true, not
+about a measured quality change.
 
 ## Conclusion
 

@@ -107,6 +107,10 @@ int mynah_slm_matvec_have(int type) {
            mynah_slm_matvec_int8_enabled() && int8_type_on(type);
 }
 
+/* The smallest block maximum the int8 quantizer scales: 127 / 2^-120 is
+ * ~1.7e38, still finite. FLT_MIN would not do — 127 / FLT_MIN overflows. */
+#define MYNAH_SLM_XQ_AMAX_MIN 0x1p-120f
+
 static void matvec_prepare(const float *input, size_t cols,
                            mynah_slm_matvec_in *prep, int want_int8) {
     if (!input || !prep) return;
@@ -123,14 +127,29 @@ static void matvec_prepare(const float *input, size_t cols,
         prep->xsum[s] = acc;
 
         if (prep->have_int8) {
-            const float scale = amax / 127.0f;
-            prep->xscale[s] = scale;
-            const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
             int8_t *q = prep->xq + s * 32;
+            /* A block that is all zeros, too small for 127/amax to be
+             * finite, or not finite at all quantizes to zero with a zero
+             * scale. The old form took inv = 1/(amax/127): for amax under
+             * ~3.7e-37 the scale went subnormal and inv +inf, every nonzero
+             * value saturated to -128/127 and 0*inf cast a NaN to int8 (UB).
+             * -128 then broke AVX2's sign(xq, w), which assumes |xq| <= 127.
+             * Such a block contributes < 1e-35 per unit weight: zero is the
+             * honest answer, and it is the same answer on every ISA. */
+            if (!(amax >= MYNAH_SLM_XQ_AMAX_MIN) || !isfinite(acc)) {
+                prep->xscale[s] = 0.0f;
+                memset(q, 0, 32);
+                continue;
+            }
+            prep->xscale[s] = amax / 127.0f;
+            const float inv = 127.0f / amax;      /* finite: amax >= 2^-120 */
             for (int i = 0; i < 32; i++) {
                 float v = nearbyintf(x[i] * inv);
+                /* |x * inv| <= 127 up to one rounding; clamp SYMMETRICALLY
+                 * so -128 can never be emitted (the AVX2 Q8_0 kernel and
+                 * the 128*127*2 int16 bound both rely on it). */
                 if (v >  127.0f) v =  127.0f;
-                if (v < -128.0f) v = -128.0f;
+                if (v < -127.0f) v = -127.0f;
                 q[i] = (int8_t)v;
             }
         }

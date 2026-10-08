@@ -474,6 +474,15 @@ static void int8_contract(const char *name, int type, int8_ref_fn ref,
     }
     qfx_fill(type, w, rows, cols, seed);
     qfx_activations(x, cols, seed);
+    /* Two hostile blocks in every fixture wide enough for them: one whose
+     * largest magnitude (2e-37) used to drive the quantizer's scale
+     * subnormal and its inverse to +inf — every value saturated to -128 and
+     * AVX2's sign(xq, w) disagreed with the twin — and one that is all
+     * +-max, where only the symmetric clamp keeps -128 out. */
+    if (cols >= 96) {
+        for (size_t i = 32; i < 64; i++) x[i] = (float)((int)(i % 5) - 2) * 1e-37f;
+        for (size_t i = 64; i < 96; i++) x[i] = (i & 1) ? -7.25f : 7.25f;
+    }
     mynah_slm_matvec_prepare_int8(x, cols, prep);
 
     if (ingot_dequant_matrix(type, w, rows, cols, deq) != 0) {
@@ -590,19 +599,29 @@ static void test_int8_contracts_here(void) {
     int8_contract("Q6_K", INGOT_TYPE_Q6_K, mynah_slm_q6k_int8_ref, 37, 256, 8);
     int8_contract("Q6_K", INGOT_TYPE_Q6_K, mynah_slm_q6k_int8_ref, 6, 3072, 9);
 
-    /* Q8_0 activations of -128 never occur (the quantizer clamps |xq| to 127
-     * by construction: scale = amax/127), which is what keeps AVX2's
-     * sign(xq, w) from overflowing. Pin that, since the kernel relies on it. */
-    float spike[64];
+    /* Q8_0 activations of -128 never occur, which is what keeps AVX2's
+     * sign(xq, w) from overflowing. Pin it on the inputs that used to break
+     * it: a spike, a block whose amax is too small for 127/amax to be
+     * finite (it must come out all zero with a zero scale, not saturated),
+     * a block of exact +-max, and denormals. */
+    float spike[160];
     for (int i = 0; i < 64; i++) spike[i] = (i % 7 == 0) ? -3.0f : 0.01f * (float)i;
+    for (int i = 64; i < 96; i++) spike[i] = (i % 3 == 0) ? -2e-37f : 1e-38f * (float)(i % 4);
+    for (int i = 96; i < 128; i++) spike[i] = (i & 1) ? -1.0f : 1.0f;
+    for (int i = 128; i < 160; i++) spike[i] = (i & 1) ? -1e-45f : 3e-45f;
     mynah_slm_matvec_in *pp = malloc(sizeof *pp);
     if (pp) {
-        mynah_slm_matvec_prepare_int8(spike, 64, pp);
-        int min = 0;
-        for (int i = 0; i < 64; i++) if (pp->xq[i] < min) min = pp->xq[i];
-        char d[64];
-        snprintf(d, sizeof d, "min xq %d", min);
-        check("int8 activations stay in [-127, 127]", min >= -127, d);
+        mynah_slm_matvec_prepare_int8(spike, 160, pp);
+        int min = 0, tiny_zero = 1;
+        for (int i = 0; i < 160; i++) if (pp->xq[i] < min) min = pp->xq[i];
+        for (int i = 64; i < 96; i++) if (pp->xq[i] != 0) tiny_zero = 0;
+        for (int i = 128; i < 160; i++) if (pp->xq[i] != 0) tiny_zero = 0;
+        char d[96];
+        snprintf(d, sizeof d, "min xq %d, xq[96] %d, xq[97] %d", min, pp->xq[96], pp->xq[97]);
+        check("int8 activations stay in [-127, 127]",
+              min >= -127 && pp->xq[96] == 127 && pp->xq[97] == -127, d);
+        check("a block too small to scale quantizes to zero with a zero scale",
+              tiny_zero && pp->xscale[2] == 0.0f && pp->xscale[4] == 0.0f, "saturated");
         free(pp);
     }
 

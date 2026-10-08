@@ -84,6 +84,13 @@ int mynah_slm_isa_verify_qmat(const mynah_slm_qmat_kern *k, char *why, size_t n)
     for (size_t i = 0; i < sizeof w8 / 34; i++)  put_f16(w8 + i * 34, 0.002f);
     for (int i = 0; i < C; i++)  x[i]  = vfrand(&s) * ((i % 37 == 0) ? 9.0f : 1.0f);
     for (int i = 0; i < C8; i++) x8[i] = vfrand(&s);
+    /* The quantizer's two edges in both fixtures: a block whose amax is too
+     * small to scale (it must quantize to zero, never saturate to -128), and
+     * a block of exact +-max. Either one broke AVX2's sign(xq, w) once. */
+    for (int i = 32; i < 64; i++) {
+        x[i] = x8[i] = (float)(i % 5 - 2) * 1e-37f;
+        x[i + 32] = x8[i + 32] = (i & 1) ? -3.5f : 3.5f;
+    }
     mynah_slm_matvec_prepare_int8(x, C, &p);
     mynah_slm_matvec_prepare_int8(x8, C8, &p8);
 
