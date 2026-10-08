@@ -7,8 +7,9 @@
  *
  * The STRUCTURE is mynah-tts's gpu/cuda/backend_cuda.cu, cut down to what a
  * Qwen3 decode step needs:
- *   - ONE stream. Every op is stream-ordered on it; only d2h, sync and argmax
- *     wait. One submitter (mynah-tts dropped a second stream after MPS showed
+ *   - ONE stream. Every op AND every copy is stream-ordered on it (no copy
+ *     runs on the legacy default stream); only d2h, sync, argmax and the
+ *     load-time uploads wait. One submitter (mynah-tts dropped a second stream after MPS showed
  *     no concurrency headroom, pocket-l40s-plateau L14-L16).
  *   - every runtime call goes through ce(), which reports the error AND
  *     clears a pending cudaErrorMemoryAllocation (see below);
@@ -104,6 +105,10 @@ void cuda_free(void *st, float *p) {
     cudaFree(p);
 }
 
+/* Stream-ordered on s->stream, so the next kernel on the stream sees the data.
+ * From pageable memory (every caller today) the call returns once the source
+ * has been staged, so `src` may be reused at once; from PINNED memory it
+ * returns before the DMA, and the source must stay untouched until a sync. */
 int cuda_h2d(void *st, float *dst, const float *src, size_t n, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
     return ce(cudaMemcpyAsync(dst, src, n * sizeof(float), cudaMemcpyHostToDevice, s->stream),
@@ -124,16 +129,31 @@ int cuda_sync(void *st, char *e, size_t c) {
     return ce(cudaStreamSynchronize(s->stream), e, c, "sync");
 }
 
+/* A load-time copy (weights, the RoPE table) that has fully landed when this
+ * returns. NOT plain cudaMemcpy: that runs on the legacy default stream, which
+ * does not order against our cudaStreamNonBlocking stream, and from pageable
+ * memory it returns once the source is STAGED, before the DMA has written the
+ * device buffer — so a kernel on s->stream could read it half-written. Here
+ * the copy is on s->stream (ordered before every later kernel) and the stream
+ * is drained before returning (load time: one sync per tensor is fine, and it
+ * makes a failed DMA fail the upload rather than some later launch). */
+int upload(cuda_state *s, void *dst, const void *src, size_t bytes, char *e, size_t c,
+           const char *what) {
+    if (ce(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, s->stream), e, c, what))
+        return -1;
+    return ce(cudaStreamSynchronize(s->stream), e, c, what);
+}
+
 /* ── weights ────────────────────────────────────────────────────────────── */
 
 int cuda_weight_upload(void *st, mynah_slm_bweight *w, char *e, size_t c) {
-    (void)st;
+    auto *s = static_cast<cuda_state *>(st);
     if (!mynah_cuda::type_supported(w->type)) return 1;
     const size_t bytes = w->rows * w->row_bytes;
     void *d = nullptr;
     if (ce(cudaMalloc(&d, bytes), e, c, "weight alloc")) return -1;
-    /* Synchronous on purpose: model load, and the source is pageable mmap. */
-    if (ce(cudaMemcpy(d, w->host, bytes, cudaMemcpyHostToDevice), e, c, "weight upload")) {
+    /* Model load, from pageable mmap: see upload() for why not cudaMemcpy. */
+    if (upload(s, d, w->host, bytes, e, c, "weight upload")) {
         cudaFree(d);
         return -1;
     }
@@ -215,7 +235,7 @@ int cuda_add_scaled(void *st, float *y, const float *x, float w, size_t n, char 
 /* ── RoPE: the CPU builds the table, the device keeps a copy ────────────── */
 
 int cuda_rope_create(void *st, mynah_slm_brope *r, char *e, size_t c) {
-    (void)st;
+    auto *s = static_cast<cuda_state *>(st);
     mynah_slm_rope host;
     if (mynah_slm_rope_init(&host, r->head_dim, r->max_pos, r->theta, r->interleaved) != 0) {
         set_err(e, c, "cannot build the rope table");
@@ -227,8 +247,8 @@ int cuda_rope_create(void *st, mynah_slm_brope *r, char *e, size_t c) {
     if (!t) set_err(e, c, "out of memory for the rope handle");
     if (rc == 0 && (ce(cudaMalloc(&t->cos_t, bytes), e, c, "rope alloc") ||
                     ce(cudaMalloc(&t->sin_t, bytes), e, c, "rope alloc") ||
-                    ce(cudaMemcpy(t->cos_t, host.cos, bytes, cudaMemcpyHostToDevice), e, c, "rope upload") ||
-                    ce(cudaMemcpy(t->sin_t, host.sin, bytes, cudaMemcpyHostToDevice), e, c, "rope upload")))
+                    upload(s, t->cos_t, host.cos, bytes, e, c, "rope upload") ||
+                    upload(s, t->sin_t, host.sin, bytes, e, c, "rope upload")))
         rc = -1;
     mynah_slm_rope_free(&host);
     if (rc != 0) {
