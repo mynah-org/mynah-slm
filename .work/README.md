@@ -45,3 +45,5 @@ same way.
 | [engineering-method.md](engineering-method.md) | How we avoid fooling ourselves: cost model before code, every tool declares a refusal, the completion rule |
 | [ternary-feasibility.md](ternary-feasibility.md) | R1 — can a pretrained Qwen3-0.6B be post-training ternarized and still be worth running? |
 | [archive-2026-08-tasks.md](archive-2026-08-tasks.md) | The M0-M6 task breakdown, moved verbatim from the old `TASKS.md` |
+| [sibling-port-map.md](sibling-port-map.md) | P1 — what mynah-tts / mynah-asr have that transfers to an SLM engine, what does not, and why |
+| [no-blas.md](no-blas.md) | K1 — our own f32 GEMM (`BLAS=none`), its evidence table, and the gate for making it the Linux default |

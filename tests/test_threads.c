@@ -123,7 +123,7 @@ static int bench(int threads) {
 
     const struct { const char *name; int cols, rows_per; } cases[] = {
         /* Work per task in multiply-adds; time it serially on your machine
-         * before reading the ratios (bench_pool in .work/thread-pool-spin.md). */
+         * before reading the ratios (bench/pool_ab/run.sh prints the serial cost). */
         { "empty (pure dispatch)",        0,    1 },
         { "tiny   (256 MAC/task)",       64,    4 },
         { "small  (4 K MAC/task)",      256,   16 },

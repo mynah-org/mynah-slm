@@ -12,7 +12,7 @@
  * would cost more than the work — and for the same reason idle workers spin
  * for a bounded time before parking: a condvar wake per region is tens of
  * microseconds, against regions that are often not much longer
- * (.work/thread-pool-spin.md).
+ * (.work/sibling-port-map.md row 1, bench/pool_ab/).
  *
  * SPDX-License-Identifier: MIT */
 #ifndef MYNAH_SLM_THREADS_H
