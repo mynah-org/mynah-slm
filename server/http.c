@@ -146,6 +146,7 @@ static const char *status_text(int s) {
         case 200: return "OK";
         case 400: return "Bad Request";
         case 404: return "Not Found";
+        case 408: return "Request Timeout";
         case 413: return "Payload Too Large";
         case 500: return "Internal Server Error";
         case 503: return "Service Unavailable";
@@ -230,6 +231,7 @@ typedef struct {
     http_handler fn;
     void        *user;
     int          send_timeout_ms, recv_timeout_ms;
+    int          header_timeout_ms, body_timeout_ms;
 } conn_arg;
 
 static void set_timeout(int fd, int opt, int ms) {
@@ -237,14 +239,33 @@ static void set_timeout(int fd, int opt, int ms) {
     setsockopt(fd, SOL_SOCKET, opt, &tv, sizeof tv);
 }
 
+/* Wait until fd is readable or the deadline (monotonic seconds) passes.
+ * 1 readable, 0 deadline, -1 error. */
+static int wait_readable(int fd, double deadline) {
+    for (;;) {
+        const double left = deadline - mono_s();
+        if (left <= 0.0) return 0;
+        struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
+        const int r = poll(&p, 1, (int)(left * 1000.0) + 1);
+        if (r > 0) return 1;
+        if (r == 0) continue;               /* re-check the clock */
+        if (errno != EINTR) return -1;
+    }
+}
+
 /* Read until the header terminator, then exactly Content-Length more. A
  * fixed-size read would truncate a long prompt; a read-until-EOF would hang on
- * a keep-alive client. */
-static char *read_request(int fd, size_t *out_len, size_t *out_head) {
+ * a keep-alive client. Every recv waits at most until the request's absolute
+ * deadline (headers, then body): *timed_out says that is why it stopped. */
+static char *read_request(int fd, int header_ms, int body_ms, size_t *out_len,
+                          size_t *out_head, int *timed_out) {
     size_t cap = 8192, used = 0;
+    *timed_out = 0;
     char *buf = malloc(cap);
     if (!buf) return NULL;
 
+    const double t0 = mono_s();
+    double deadline = t0 + header_ms / 1000.0;
     size_t head_end = 0;
     for (;;) {
         if (used + 1 >= cap) {
@@ -254,6 +275,9 @@ static char *read_request(int fd, size_t *out_len, size_t *out_head) {
             if (!g) { free(buf); return NULL; }
             buf = g;
         }
+        const int w = wait_readable(fd, deadline);
+        if (w == 0) { *timed_out = 1; free(buf); return NULL; }
+        if (w < 0) break;
         const ssize_t n = recv(fd, buf + used, cap - used - 1, 0);
         if (n <= 0) break;
         used += (size_t)n;
@@ -261,7 +285,10 @@ static char *read_request(int fd, size_t *out_len, size_t *out_head) {
 
         if (!head_end) {
             char *p = strstr(buf, "\r\n\r\n");
-            if (p) head_end = (size_t)(p - buf) + 4;
+            if (p) {
+                head_end = (size_t)(p - buf) + 4;
+                deadline = mono_s() + body_ms / 1000.0;     /* the body's own budget */
+            }
         }
         if (head_end) {
             size_t want = 0;
@@ -289,7 +316,9 @@ static void *serve_conn(void *arg) {
     set_timeout(ca.fd, SO_RCVTIMEO, ca.recv_timeout_ms);
 
     size_t len = 0, head_end = 0;
-    char *raw = read_request(ca.fd, &len, &head_end);
+    int timed_out = 0;
+    char *raw = read_request(ca.fd, ca.header_timeout_ms, ca.body_timeout_ms, &len, &head_end,
+                             &timed_out);
 
     http_conn conn;
     memset(&conn, 0, sizeof conn);
@@ -297,7 +326,8 @@ static void *serve_conn(void *arg) {
     atomic_init(&conn.dead, 0);
     atomic_init(&conn.eof, 0);
     if (!raw) {
-        http_error(&conn, 400, "malformed request");
+        if (timed_out) http_error(&conn, 408, "the request was not received in time");
+        else           http_error(&conn, 400, "malformed request");
         close(ca.fd);
         atomic_fetch_sub(&g_live, 1);
         return NULL;
@@ -359,6 +389,8 @@ int http_serve(const char *host, int port, http_handler fn, void *user,
     const int send_ms = (limits && limits->send_timeout_ms > 0) ? limits->send_timeout_ms : 5000;
     const int recv_ms = (limits && limits->recv_timeout_ms > 0) ? limits->recv_timeout_ms : 30000;
     if (limits && limits->probe_interval_ms > 0) g_probe_ms = limits->probe_interval_ms;
+    const int head_ms = (limits && limits->header_timeout_ms > 0) ? limits->header_timeout_ms : 10000;
+    const int body_ms = (limits && limits->body_timeout_ms > 0) ? limits->body_timeout_ms : 30000;
 
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { snprintf(err, errsz, "socket: %s", strerror(errno)); return 1; }
@@ -405,7 +437,8 @@ int http_serve(const char *host, int port, http_handler fn, void *user,
         conn_arg *ca = malloc(sizeof *ca);
         if (!ca) { close(cfd); continue; }
         *ca = (conn_arg){ .fd = cfd, .fn = fn, .user = user,
-                          .send_timeout_ms = send_ms, .recv_timeout_ms = recv_ms };
+                          .send_timeout_ms = send_ms, .recv_timeout_ms = recv_ms,
+                          .header_timeout_ms = head_ms, .body_timeout_ms = body_ms };
 
         atomic_fetch_add(&g_live, 1);
         pthread_t th;

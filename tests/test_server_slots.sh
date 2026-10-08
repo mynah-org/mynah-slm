@@ -438,6 +438,62 @@ PY
 done
 fi
 
+if want 12; then
+# ── 12. slowloris: a request has an absolute read deadline ───────────────────
+# Review R3: SO_RCVTIMEO bounds one recv(), not a request. --max-conns
+# clients dripping a byte every second held every connection forever and
+# every legitimate client got 503. Now the headers have --header-timeout-ms
+# from accept (here 1500 ms) and the dripper gets 408.
+start "$TMP/loris.log" --slots 2 --max-conns 4 --header-timeout-ms 1500
+python3 - "$PORT" > "$TMP/loris.out" 2>&1 <<'PY'
+import json, socket, sys, threading, time
+port = int(sys.argv[1])
+stop = False
+got = []
+def drip():
+    s = socket.create_connection(('127.0.0.1', port))
+    hdr = b'POST /v1/chat/completions HTTP/1.1\r\nX-Pad: '
+    i = 0
+    try:
+        while not stop:
+            s.sendall(hdr[i:i + 1] if i < len(hdr) else b'a'); i += 1; time.sleep(0.5)
+            s.setblocking(False)
+            try:
+                d = s.recv(4096)
+                if d: got.append(d.split(b'\r\n')[0].decode()); return
+            except BlockingIOError:
+                pass
+            s.setblocking(True)
+    except OSError:
+        pass
+ts = [threading.Thread(target=drip, daemon=True) for _ in range(4)]
+[t.start() for t in ts]
+b = json.dumps({'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 4}).encode()
+req = b'POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n' % len(b) + b
+def legit():
+    s = socket.create_connection(('127.0.0.1', port)); s.settimeout(30); s.sendall(req)
+    r = b''
+    while True:
+        c = s.recv(65536)
+        if not c: break
+        r += c
+    return r.split(b'\r\n')[0].decode()
+time.sleep(0.5)
+print('early', legit())          # 4 drippers hold every connection: 503 is right
+time.sleep(3.0)
+print('later', legit())
+stop = True
+time.sleep(0.6)
+print('drippers', ','.join(sorted(set(got))) or 'none')
+PY
+stop
+L=$(grep '^later' "$TMP/loris.out")
+echo "$L" | grep -q " 200 " && ok "4 slowloris connections on --max-conns 4 lock clients out for the header deadline only ($L)" \
+    || bad "slowloris does not lock legitimate clients out" "$(cat "$TMP/loris.out")"
+grep -q "^drippers.*408" "$TMP/loris.out" && ok "... and the drippers got 408" \
+    || bad "a request past its header deadline gets 408" "$(grep drippers "$TMP/loris.out")"
+fi
+
 if grep -l "Sanitizer" "$TMP"/*.log >/dev/null 2>&1; then
     bad "no sanitizer report in any server log" "$(grep -h -A3 Sanitizer "$TMP"/*.log | head -12)"
 fi

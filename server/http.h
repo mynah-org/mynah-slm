@@ -38,6 +38,15 @@ typedef struct {
     /* Liveness probe period once the client's read side has reached EOF
      * (see http_keepalive). 0 = 250 ms. */
     int probe_interval_ms;
+    /* ABSOLUTE deadlines for reading a request, from accept: the headers
+     * must be complete within header_timeout_ms, the body within
+     * body_timeout_ms after them; past either the answer is 408 and the
+     * connection is closed. SO_RCVTIMEO bounds one recv(), not a request,
+     * so a client dripping a byte every few seconds could otherwise hold a
+     * connection — and, --max-conns of them, every legitimate client out.
+     * 0 = 10000 / 30000 ms. */
+    int header_timeout_ms;
+    int body_timeout_ms;
 } http_limits;
 
 /* Accept loop. Returns when *stop becomes non-zero (a signal handler sets it)

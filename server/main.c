@@ -856,6 +856,9 @@ static void usage_text(FILE *f) {
         "  --send-timeout-ms N  a client that stops reading is dropped (default 5000)\n"
         "  --probe-interval-ms N  liveness write period once a client's read side\n"
         "                       reached EOF (default 250)\n"
+        "  --header-timeout-ms N  request headers must arrive within N ms of accept,\n"
+        "  --body-timeout-ms N    the body within N ms after them; else 408\n"
+        "                       (defaults 10000 / 30000)\n"
         "  --shutdown-grace-ms N  on SIGTERM/SIGINT, running requests get N ms more\n"
         "                       before they are stopped with an error event / 503;\n"
         "                       queued ones get 503 at once (default 0)\n"
@@ -869,7 +872,7 @@ static void usage_text(FILE *f) {
 int main(int argc, char **argv) {
     const char *model_path = NULL, *host = "127.0.0.1";
     int port = 8080, n_ctx = 0, threads = 0;
-    http_limits limits = { 0, 0, 0, 0 };
+    http_limits limits = { 0, 0, 0, 0, 0, 0 };
     int slots = 1, queue = 0, grace_ms = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -886,6 +889,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--send-timeout-ms") && v) { limits.send_timeout_ms = atoi(v); i++; }
         else if (!strcmp(a, "--shutdown-grace-ms") && v) { grace_ms = atoi(v); i++; }
         else if (!strcmp(a, "--probe-interval-ms") && v) { limits.probe_interval_ms = atoi(v); i++; }
+        else if (!strcmp(a, "--header-timeout-ms") && v) { limits.header_timeout_ms = atoi(v); i++; }
+        else if (!strcmp(a, "--body-timeout-ms") && v)   { limits.body_timeout_ms = atoi(v); i++; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage_text(stdout); return 0; }
         else { fprintf(stderr, "mynah-slm-server: unknown option '%s'\n", a); return 2; }
     }
