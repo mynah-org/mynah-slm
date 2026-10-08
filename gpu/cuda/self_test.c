@@ -22,7 +22,8 @@
  *   SwiGLU                1e-6 * max|cpu|: device expf vs libm expf.
  *   attention (bf16 KV)   1e-4 * max|cpu|: same stored bf16 bits on both
  *                         sides; online softmax vs two-pass softmax.
- *   argmax                the exact index, ties to the first.
+ *   argmax                the exact index the CPU gives: ties to the first,
+ *                         NaN never taken, x[0] NaN gives 0.
  *
  * SPDX-License-Identifier: MIT */
 #include "cuda_self_test.h"
@@ -352,17 +353,30 @@ static void check_argmax(ctx *c) {
     enum { V = 151936 };                         /* Qwen3's vocabulary */
     float *x = malloc(V * sizeof(float));
     if (!x) { snprintf(c->err, sizeof c->err, "oom"); fail(c, "argmax"); return; }
-    fill(x, V, 10.0f);
-    x[123456] = 50.0f;
-    x[98765]  = 50.0f;                           /* a tie: the first one wins */
-    uint32_t ic = 0, ig = 0;
-    float *dx = up(c, x, V);
-    if (!dx || mynah_slm_backend_argmax(c->cpu, x, V, &ic, c->err, sizeof c->err) != 0 ||
-        mynah_slm_backend_argmax(c->gpu, dx, V, &ig, c->err, sizeof c->err) != 0) {
-        fail(c, "argmax 151936 with a tie");
-    } else {
-        report(c, "argmax 151936 with a tie (exact index)", ig == ic && ic == 98765,
-               (double)ig, (double)ic);
+    float *dx = mynah_slm_backend_alloc(c->gpu, V, c->err, sizeof c->err);
+    /* A planted tie (the first wins), then NaN the way a parallel argmax can
+     * get it wrong: first in a thread's stride hiding that stride's max
+     * (1024 threads: index 5 and 5 + 1024 share thread 5), and at x[0],
+     * where the CPU answers 0. Expected index from the CPU, never assumed. */
+    static const char *const what[3] = {
+        "argmax 151936, a tie (exact index)",
+        "argmax 151936, NaN first in a stride (exact index)",
+        "argmax 151936, NaN at x[0] (exact index)",
+    };
+    static const uint32_t expect[3] = { 98765, 5 + 1024, 0 };
+    for (int k = 0; k < 3; k++) {
+        fill(x, V, 10.0f);
+        if (k == 0) { x[123456] = 50.0f; x[98765] = 50.0f; }
+        if (k == 1) { x[5 + 1024] = 100.0f; x[5] = NAN; }
+        if (k == 2) { x[0] = NAN; x[777] = 100.0f; }
+        uint32_t ic = 0, ig = 0;
+        if (!dx || mynah_slm_backend_h2d(c->gpu, dx, x, V, c->err, sizeof c->err) != 0 ||
+            mynah_slm_backend_argmax(c->cpu, x, V, &ic, c->err, sizeof c->err) != 0 ||
+            mynah_slm_backend_argmax(c->gpu, dx, V, &ig, c->err, sizeof c->err) != 0) {
+            fail(c, what[k]);
+            continue;
+        }
+        report(c, what[k], ig == ic && ic == expect[k], (double)ig, (double)ic);
     }
     mynah_slm_backend_free(c->gpu, dx);
     free(x);

@@ -72,7 +72,9 @@ cudaError_t launch_attention_bf16(float *out, const float *q, const uint16_t *kc
                                   uint32_t n_heads, uint32_t n_kv_heads,
                                   uint32_t head_dim, float scale, cudaStream_t s);
 
-/* *d_idx = index of the first maximum of x[n]. One block. */
+/* *d_idx = index of the first maximum of x[n], NaN treated exactly as the
+ * CPU argmax treats it (x[0] NaN gives 0; NaN elsewhere is never taken).
+ * One block. */
 cudaError_t launch_argmax(const float *x, size_t n, uint32_t *d_idx, cudaStream_t s);
 
 }  // namespace mynah_cuda

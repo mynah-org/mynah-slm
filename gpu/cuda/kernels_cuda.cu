@@ -25,6 +25,7 @@
 #include <cstring>
 
 extern "C" {
+#include "backend.h"
 #include "kernels.h"
 #include "kvcache.h"
 }
@@ -512,37 +513,57 @@ cudaError_t launch_attention_bf16(float *out, const float *q, const uint16_t *kc
     return cudaGetLastError();
 }
 
-/* ── argmax: one block, first index of the maximum ──────────────────────── */
+/* ── argmax: one block, first index of the maximum ────────────────────────
+ * The CPU definition (backend_cpu.c cpu_argmax, sampler.c greedy) is
+ *     best = 0; for i = 1.. : if (x[i] > x[best]) best = i;
+ * and NaN is where a parallel version can quietly differ from it. Nothing
+ * compares greater than NaN and NaN compares greater than nothing, so the CPU
+ * returns 0 when x[0] is NaN, and otherwise the first index of the maximum
+ * over the non-NaN values (NaN elsewhere is never taken). The device does the
+ * same in three steps written once, __host__ __device__, so that
+ * mynah_slm_cuda_host_check() can run the kernel's exact scan/merge order
+ * against the CPU: each thread skips NaN; the tree merges candidates with
+ * ties to the lower index; then x[0] being NaN (or no candidate at all)
+ * gives 0. Before this, a NaN as a thread's first element was taken as its
+ * candidate and hid that thread's whole stride. */
 
 constexpr int ARGMAX_THREADS = 1024;
+constexpr uint32_t ARGMAX_NONE = 0xffffffffu;
+
+/* One element of a thread's ascending scan: first non-NaN, then strictly greater. */
+MYNAH_HD void argmax_scan(float v, uint32_t i, float *bv, uint32_t *bi) {
+    if (v != v) return;
+    if (*bi == ARGMAX_NONE || v > *bv) { *bv = v; *bi = i; }
+}
+
+/* Fold another candidate in: greater wins, equal keeps the lower index. */
+MYNAH_HD void argmax_merge(float ov, uint32_t oi, float *bv, uint32_t *bi) {
+    if (oi == ARGMAX_NONE) return;
+    if (*bi == ARGMAX_NONE || ov > *bv || (ov == *bv && oi < *bi)) { *bv = ov; *bi = oi; }
+}
+
+/* The CPU's NaN-at-0 rule, and "all NaN" -> 0 as well. */
+MYNAH_HD uint32_t argmax_final(float x0, uint32_t bi) {
+    return (x0 != x0 || bi == ARGMAX_NONE) ? 0u : bi;
+}
 
 __global__ void __launch_bounds__(ARGMAX_THREADS)
 k_argmax(const float *x, size_t n, uint32_t *idx) {
     __shared__ float sv[ARGMAX_THREADS];
     __shared__ uint32_t si[ARGMAX_THREADS];
-    /* Each thread scans a stride; ties keep the lower index, as the CPU's
-     * strict `>` over an ascending scan does. */
     float bv = -INFINITY;
-    uint32_t bi = 0xffffffffu;
-    for (size_t i = threadIdx.x; i < n; i += ARGMAX_THREADS) {
-        const float v = x[i];
-        if (bi == 0xffffffffu || v > bv) { bv = v; bi = (uint32_t)i; }
-    }
+    uint32_t bi = ARGMAX_NONE;
+    for (size_t i = threadIdx.x; i < n; i += ARGMAX_THREADS) argmax_scan(x[i], (uint32_t)i, &bv, &bi);
     sv[threadIdx.x] = bv;
     si[threadIdx.x] = bi;
     __syncthreads();
     for (int stride = ARGMAX_THREADS / 2; stride > 0; stride >>= 1) {
-        if ((int)threadIdx.x < stride) {
-            const float ov = sv[threadIdx.x + stride];
-            const uint32_t oi = si[threadIdx.x + stride];
-            const bool take = oi != 0xffffffffu &&
-                (si[threadIdx.x] == 0xffffffffu || ov > sv[threadIdx.x] ||
-                 (ov == sv[threadIdx.x] && oi < si[threadIdx.x]));
-            if (take) { sv[threadIdx.x] = ov; si[threadIdx.x] = oi; }
-        }
+        if ((int)threadIdx.x < stride)
+            argmax_merge(sv[threadIdx.x + stride], si[threadIdx.x + stride],
+                         &sv[threadIdx.x], &si[threadIdx.x]);
         __syncthreads();
     }
-    if (threadIdx.x == 0) *idx = si[0];
+    if (threadIdx.x == 0) *idx = argmax_final(x[0], si[0]);
 }
 
 cudaError_t launch_argmax(const float *x, size_t n, uint32_t *d_idx, cudaStream_t s) {
@@ -559,8 +580,9 @@ cudaError_t launch_argmax(const float *x, size_t n, uint32_t *d_idx, cudaStream_
  * machine without a device this is the part of the CUDA code that is
  * actually executed. What it proves: the block layouts (the indexing of every
  * nibble, high-bit pair and packed scale), the f16 decode, the bf16 rounding
- * and the RoPE pair mapping. What it cannot prove: anything warp-level —
- * reductions, the online softmax, the launch geometry. */
+ * the RoPE pair mapping, and the argmax scan/merge order (NaN included).
+ * What it cannot prove: anything warp-level — shuffle reductions, the online
+ * softmax, the launch geometry. */
 namespace {
 
 uint32_t hc_rng = 0xC0FFEE11u;
@@ -607,6 +629,69 @@ int hc_decode(FILE *log, const char *name) {
     std::snprintf(what, sizeof what, "host: dq<%s> == ingot decode, 4x1024", name);
     const double tol = std::ldexp(1.0, -22) * mx;
     return hc_report(log, what, !bad && worst <= tol, worst, tol);
+}
+
+/* k_argmax with its 1024 threads run one after another: the same per-thread
+ * strides, the same tree levels (a level reads t + stride and writes t, so
+ * running its threads in order is exactly the parallel result), the same
+ * helpers. */
+uint32_t hc_argmax_kernel(const float *x, size_t n) {
+    using namespace mynah_cuda;
+    static float sv[ARGMAX_THREADS];
+    static uint32_t si[ARGMAX_THREADS];
+    for (int t = 0; t < ARGMAX_THREADS; t++) {
+        float bv = -INFINITY;
+        uint32_t bi = ARGMAX_NONE;
+        for (size_t i = (size_t)t; i < n; i += ARGMAX_THREADS) argmax_scan(x[i], (uint32_t)i, &bv, &bi);
+        sv[t] = bv;
+        si[t] = bi;
+    }
+    for (int stride = ARGMAX_THREADS / 2; stride > 0; stride >>= 1)
+        for (int t = 0; t < stride; t++) argmax_merge(sv[t + stride], si[t + stride], &sv[t], &si[t]);
+    return argmax_final(x[0], si[0]);
+}
+
+/* The kernel's order vs the CPU backend's argmax, on the cases where a
+ * parallel argmax can differ from a serial one: ties across threads, NaN. */
+int hc_argmax(FILE *log) {
+    enum { V = 151936 };                           /* Qwen3's vocabulary */
+    static float x[V];
+    mynah_slm_backend *cpu = nullptr;
+    char err[128];
+    if (mynah_slm_backend_open(MYNAH_SLM_DEVICE_CPU, &cpu, err, sizeof err) != 0)
+        return hc_report(log, "host: argmax (cannot open the cpu backend)", false, -1, 0);
+    static const char *const names[] = {
+        "finite, tie across threads",
+        "NaN first in a stride, max later in it",
+        "NaN at x[0] (the CPU answers 0)",
+        "every value NaN",
+        "-inf everywhere, NaN sprinkled",
+        "NaN every 7th, tie lower index later thread",
+    };
+    int fails = 0;
+    for (int k = 0; k < 6; k++) {
+        for (size_t i = 0; i < V; i++) x[i] = (float)((i * 2654435761u) % 1000u) / 100.0f;
+        switch (k) {
+            case 0: x[98765] = 50.0f; x[123456] = 50.0f; break;
+            case 1: x[5 + 1024] = 100.0f; x[5] = NAN; break;   /* the reviewer's case */
+            case 2: x[0] = NAN; x[777] = 100.0f; break;
+            case 3: for (size_t i = 0; i < V; i++) x[i] = NAN; break;
+            case 4: for (size_t i = 0; i < V; i++) x[i] = (i % 5 == 3) ? NAN : -INFINITY; break;
+            default:
+                for (size_t i = 1; i < V; i += 7) x[i] = NAN;
+                x[1023] = 60.0f;                   /* thread 1023 ...           */
+                x[1025] = 60.0f;                   /* ... ties thread 1, higher index */
+                break;
+        }
+        uint32_t want = 0;
+        const int rc = mynah_slm_backend_argmax(cpu, x, V, &want, err, sizeof err);
+        const uint32_t got = hc_argmax_kernel(x, V);
+        char what[96];
+        std::snprintf(what, sizeof what, "host: argmax order == cpu, %s", names[k]);
+        fails += hc_report(log, what, rc == 0 && got == want, (double)got, (double)want);
+    }
+    mynah_slm_backend_close(cpu);
+    return fails;
 }
 
 }  // namespace
@@ -668,5 +753,7 @@ extern "C" int mynah_slm_cuda_host_check(FILE *log) {
                                    : "host: rope_pair NeoX == rope_apply, pos 1000..1002",
                            worst <= tol, worst, tol);
     }
+
+    fails += hc_argmax(log);
     return fails ? 1 : 0;
 }
