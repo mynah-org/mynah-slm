@@ -103,8 +103,10 @@ per commit, listed in the matrix note.
       compile-time → [`.work/isa-runtime-dispatch.md`](.work/isa-runtime-dispatch.md)
 - [-] **K6** — native BF16 weight matvec: REJECTED, ingot already at
       0.87-0.94x of the read roof → [`.work/bf16-native-matvec.md`](.work/bf16-native-matvec.md)
-- [ ] **S1** — serving foundation: slots, scheduler, continuous batching,
-      batched decode, sliced prefill; note written with the work
+- [~] **S1** — serving foundation: synthetic fixture, per-sequence state,
+      batched decode, client-disconnect cancellation, scheduler, `--slots N`
+      (default serialized). Correct here; no throughput win yet — needs a
+      weight-stationary batched kernel → [`.work/serving-continuous-batching.md`](.work/serving-continuous-batching.md)
 - [~] **G1** — CUDA backend foundation for Qwen3 (GQA, head_dim 128, NeoX RoPE,
       RMSNorm / QK-norm): vtable + CPU backend + kernels compiled for sm_80/89/90,
       never run on a GPU; forward pass not wired yet → [`.work/cuda-backend.md`](.work/cuda-backend.md)
