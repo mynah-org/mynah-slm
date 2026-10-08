@@ -265,13 +265,18 @@ static int e_admit(void *ud, void *job, uint32_t slot) {
     if (mynah_slm_seq_reserve(&S.seqs[slot], S.model, (uint32_t)need, MYNAH_SLM_KV_BF16,
                               MYNAH_SLM_KV_BF16, r->error, sizeof r->error) != 0) {
         atomic_store(&S.kv_held, kv_total());
+        r->error_status = 503;                  /* out of memory: not the client's fault */
         return -1;
     }
     atomic_store(&S.kv_held, kv_total());
     mynah_slm_timing_end_load(&r->tm);
 
     r->sam = mynah_slm_sampler_new(&r->p.sp, mynah_slm_vocab_size(S.model));
-    if (!r->sam) { snprintf(r->error, sizeof r->error, "out of memory"); return -1; }
+    if (!r->sam) {
+        snprintf(r->error, sizeof r->error, "out of memory");
+        r->error_status = 503;
+        return -1;
+    }
 
     mynah_slm_gen_params_init(&r->gp);
     r->gp.prompt = r->p.ids;

@@ -619,7 +619,21 @@ static void handle_chat(server_ctx *c, http_conn *conn,
     }
 
     const int stream  = json_get_bool(&root, "stream", 0);
-    const int max_new = (int)json_get_number(&root, "max_tokens", 256);
+    /* Validated before anything is converted: (int)1e30 is undefined
+     * behaviour, and a negative count became a huge uint32 downstream.
+     * The same answer in both serving modes. */
+    int max_new = 256;
+    {
+        json_val mt;
+        if (json_object_get(&root, "max_tokens", &mt) == 0 && mt.kind != JSON_NULL) {
+            const double v = json_get_number(&root, "max_tokens", -1.0);
+            if (mt.kind != JSON_NUMBER || !(v >= 0.0 && v <= 2147483647.0) || v != (double)(long long)v) {
+                http_error(conn, 400, "max_tokens must be an integer from 0 to 2147483647");
+                goto cleanup_msgs;
+            }
+            max_new = (int)v;
+        }
+    }
 
     /* Thinking is off unless asked for, and even then it never reaches the
      * content field: OpenAI clients render "content" verbatim, and a TTS
@@ -656,10 +670,28 @@ static void handle_chat(server_ctx *c, http_conn *conn,
     uint32_t *ids = malloc((size_t)(n_prompt > 0 ? n_prompt : 1) * sizeof *ids);
     if (n_prompt <= 0 || !ids) {
         http_error(conn, 400, "empty prompt");
+        free(ids);
         free(text);
         goto cleanup_msgs;
     }
     mynah_slm_tokenize(c->tok, text, 1, ids, (size_t)n_prompt);
+
+    /* A prompt that leaves no position to generate into is the client's
+     * error, said the same way by both modes (the serialized path used to
+     * answer 200 with an empty completion). */
+    {
+        uint32_t ctx = c->n_ctx;
+        if (ctx > mynah_slm_n_ctx(c->model)) ctx = mynah_slm_n_ctx(c->model);
+        if ((uint64_t)n_prompt + 1 > ctx) {
+            char msg[160];
+            snprintf(msg, sizeof msg, "the prompt (%ld tokens) does not fit the %u-token context",
+                     n_prompt, ctx);
+            http_error(conn, 400, msg);
+            free(ids);
+            free(text);
+            goto cleanup_msgs;
+        }
+    }
 
     pthread_mutex_lock(&c->stat_mu);
     const unsigned long seq = ++c->next_id;
@@ -726,7 +758,7 @@ static void handle_chat(server_ctx *c, http_conn *conn,
                                 MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_BF16,
                                 err, sizeof err) != 0) {
         gate_leave(c);
-        http_error(conn, 500, err);
+        http_error(conn, 503, err);              /* out of memory: retry later */
         free(ids); free(text);
         goto cleanup_msgs;
     }

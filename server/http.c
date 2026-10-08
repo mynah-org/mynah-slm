@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -209,11 +210,14 @@ void http_respond(http_conn *c, int status, const char *content_type,
 
 void http_error(http_conn *c, int status, const char *message) {
     /* The message is ours, never echoed user input, so a plain format is safe
-     * here — but it still goes through a bounded buffer. */
+     * here — but it still goes through a bounded buffer. The type follows
+     * the status: a 5xx is the server's problem, not the request's. */
+    const char *type = status == 503 ? "service_unavailable"
+                     : status >= 500 ? "server_error" : "invalid_request_error";
     char body[512];
     const int n = snprintf(body, sizeof body,
-        "{\"error\":{\"message\":\"%s\",\"type\":\"invalid_request_error\"}}\n",
-        message ? message : "error");
+        "{\"error\":{\"message\":\"%s\",\"type\":\"%s\"}}\n",
+        message ? message : "error", type);
     http_respond(c, status, "application/json", body, (size_t)n);
 }
 
@@ -277,6 +281,30 @@ static void set_timeout(int fd, int opt, int ms) {
     setsockopt(fd, SOL_SOCKET, opt, &tv, sizeof tv);
 }
 
+/* Content-Length from the header block [buf, buf + head_end): a header
+ * NAME at the start of a line, matched case-insensitively — never a
+ * substring of another header ("X-Content-Length: 999" used to match).
+ * 0 when absent, (size_t)-2 when present but not a number. */
+static size_t content_length(const char *buf, size_t head_end) {
+    const char *p = buf, *end = buf + head_end;
+    while (p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        if (!eol) break;
+        if (p != buf && (size_t)(eol - p) > 15 && strncasecmp(p, "content-length:", 15) == 0) {
+            const char *v = p + 15;
+            while (*v == ' ' || *v == '\t') v++;
+            if (*v < '0' || *v > '9') return (size_t)-2;
+            char *e = NULL;
+            const unsigned long long n = strtoull(v, &e, 10);
+            while (*e == ' ' || *e == '\t') e++;
+            if (*e != '\r' && *e != '\n') return (size_t)-2;
+            return n > (unsigned long long)MAX_BODY ? (size_t)MAX_BODY + 1 : (size_t)n;
+        }
+        p = eol + 1;
+    }
+    return 0;
+}
+
 /* Wait until fd is readable or the deadline (monotonic seconds) passes.
  * 1 readable, 0 deadline, -1 error. */
 static int wait_readable(int fd, double deadline) {
@@ -304,7 +332,7 @@ static char *read_request(int fd, int header_ms, int body_ms, size_t *out_len,
 
     const double t0 = mono_s();
     double deadline = t0 + header_ms / 1000.0;
-    size_t head_end = 0;
+    size_t head_end = 0, want = (size_t)-1;
     for (;;) {
         if (used + 1 >= cap) {
             cap *= 2;
@@ -329,14 +357,18 @@ static char *read_request(int fd, int header_ms, int body_ms, size_t *out_len,
             }
         }
         if (head_end) {
-            size_t want = 0;
-            const char *cl = strcasestr(buf, "content-length:");
-            if (cl && cl < buf + head_end) want = strtoul(cl + 15, NULL, 10);
+            if (want == (size_t)-1 && (want = content_length(buf, head_end)) == (size_t)-2) {
+                free(buf);                    /* unparsable */
+                return NULL;
+            }
             if (want > MAX_BODY) { free(buf); return NULL; }
             if (used >= head_end + want) break;
         }
     }
     if (!head_end) { free(buf); return NULL; }
+    /* EOF or an error before Content-Length bytes arrived: the body is cut
+     * short, and a prefix of a JSON document must not be served as one. */
+    if (used < head_end + want) { free(buf); return NULL; }
     *out_len  = used;
     *out_head = head_end;
     return buf;

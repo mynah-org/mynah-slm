@@ -603,6 +603,69 @@ sys.exit(0 if budget != 'None' and 0 < mx <= int(budget) and after != 'None' and
 PY
 fi
 
+if want 15; then
+# ── 15. request validation, the same in both modes (review NITs) ─────────────
+for MODE in 1 2; do
+    start "$TMP/val$MODE.log" --slots $MODE --ctx 96
+    python3 - "$PORT" > "$TMP/val$MODE.out" 2>&1 <<'PY'
+import json, socket, sys, time
+port = int(sys.argv[1])
+def raw(data, half=False, timeout=8):
+    s = socket.create_connection(('127.0.0.1', port)); s.settimeout(timeout); s.sendall(data)
+    if half: s.shutdown(socket.SHUT_WR)
+    r = b''
+    try:
+        while True:
+            c = s.recv(65536)
+            if not c: break
+            r += c
+    except socket.timeout:
+        return 'TIMEOUT'
+    return r.split(b'\r\n')[0].decode() + ' ' + (r.split(b'\r\n\r\n', 1)[1][:160].decode('utf-8', 'replace') if b'\r\n\r\n' in r else '')
+def req(body, extra=b''):
+    return (b'POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n' + extra +
+            b'Content-Type: application/json\r\nContent-Length: %d\r\n\r\n' % len(body) + body)
+def chat(**kw):
+    d = {'messages': [{'role': 'user', 'content': kw.pop('content', 'hi')}], 'temperature': 0}
+    d.update(kw)
+    return json.dumps(d).encode()
+for name, v in (('negative', -5), ('huge', 1e30), ('fractional', 2.5), ('string', 'many')):
+    body = json.loads(chat()); body['max_tokens'] = v
+    print('max_tokens', name, raw(req(json.dumps(body).encode())))
+print('long_prompt', raw(req(chat(content='word ' * 60, max_tokens=4))))
+# "X-Content-Length" must not be read as Content-Length
+print('xcl', raw(req(chat(max_tokens=2), b'X-Content-Length: 999\r\n')))
+# a body cut short (Content-Length 40 bytes too long, then half-close):
+# the prefix that did arrive is a complete JSON document, and must not be served
+b = chat(max_tokens=2)
+print('truncated', raw(b'POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n' % (len(b) + 40) + b, half=True))
+PY
+    stop
+    for V in negative huge fractional string; do
+        L=$(grep "^max_tokens $V " "$TMP/val$MODE.out")
+        echo "$L" | grep -q "400 Bad Request" && ok "--slots $MODE: max_tokens $V -> 400" \
+            || bad "--slots $MODE: max_tokens $V is refused with 400" "$L"
+    done
+    L=$(grep "^long_prompt" "$TMP/val$MODE.out")
+    echo "$L" | grep -q "400 Bad Request.*does not fit" && ok "--slots $MODE: a prompt longer than the context -> 400" \
+        || bad "--slots $MODE: a prompt longer than the context is 400" "$L"
+    L=$(grep "^xcl" "$TMP/val$MODE.out")
+    echo "$L" | grep -q "200 OK" && ok "--slots $MODE: X-Content-Length is not Content-Length" \
+        || bad "--slots $MODE: Content-Length is parsed as a header name" "$L"
+    L=$(grep "^truncated" "$TMP/val$MODE.out")
+    echo "$L" | grep -q "400 Bad Request" && ok "--slots $MODE: a truncated body -> 400, not processed" \
+        || bad "--slots $MODE: a truncated body is 400" "$L"
+done
+# A 5xx is the server's problem: its type is not invalid_request_error.
+start "$TMP/val503.log" --slots 2 --kv-budget-mb 1
+R=$(curl -s -X POST "localhost:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":400}' -w ' %{http_code}')
+stop
+echo "$R" | grep -q ' 503$' && ! echo "$R" | grep -q invalid_request_error \
+    && ok "a 503 says service_unavailable, not invalid_request_error" \
+    || bad "5xx error types" "$R"
+fi
+
 if grep -l "Sanitizer" "$TMP"/*.log >/dev/null 2>&1; then
     bad "no sanitizer report in any server log" "$(grep -h -A3 Sanitizer "$TMP"/*.log | head -12)"
 fi
