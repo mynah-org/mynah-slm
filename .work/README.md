@@ -47,3 +47,4 @@ same way.
 | [archive-2026-08-tasks.md](archive-2026-08-tasks.md) | The M0-M6 task breakdown, moved verbatim from the old `TASKS.md` |
 | [sibling-port-map.md](sibling-port-map.md) | P1 — what mynah-tts / mynah-asr have that transfers to an SLM engine, what does not, and why |
 | [no-blas.md](no-blas.md) | K1 — our own f32 GEMM (`BLAS=none`), its evidence table, and the gate for making it the Linux default |
+| [cuda-backend.md](cuda-backend.md) | G1 — backend vtable (CPU reference implementation) and the Qwen3 CUDA backend behind `make cuda`; integration plan, kernel parity gates, what transfers from mynah-tts |
