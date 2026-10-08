@@ -5,16 +5,32 @@
  * a wrong layer offset in the KV, a swapped K/V would all fail here).
  *
  * The CPU backend is the reference: it IS the engine's arithmetic
- * (tests/test_backend.c pins that bit for bit). Tolerances, one per kind of
- * difference, also written in .work/cuda-backend.md:
+ * (tests/test_backend.c pins that bit for bit), pinned here to f32
+ * activations — MYNAH_SLM_INT8 would quantize the CPU side's activations to
+ * int8 and turn every product gate into a measure of that instead.
+ * Tolerances, one per kind of difference, also written in
+ * .work/cuda-backend.md:
  *
- *   GEMV / batched GEMV   |gpu - cpu| <= 1e-4 * sum_i |w_i x_i| + 1e-6, per row.
+ *   GEMV / batched GEMV   |gpu - cpu| <= 1e-6 * sum_i |w_i x_i|, per row.
  *                         A reorder bound: the CPU sums per block in its own
  *                         order, the device per lane then a shuffle tree.
- *   block decode, RoPE    |gpu - cpu| <= 2^-22 * max|cpu|. Same products in
- *                         the same order (__fmul_rn on the device), so exact
- *                         is expected; the slack covers a CPU compiler that
- *                         contracts a*c - b*s into an FMA.
+ *                         Both are f32 sums of the same f32 products; a
+ *                         host emulation of this kernel (reviewer, warp by
+ *                         warp) differed from the CPU by at most ~5.5e-8 of
+ *                         sum|wx| over Q4_K / Q6_K / Q8_0 / F32 rows, so
+ *                         1e-6 leaves ~18x headroom and still catches a
+ *                         wrong scale, a dropped block or a lost lane, which
+ *                         cost orders of magnitude more.
+ *   block decode, RoPE    BITWISE (tol 0). Same products in the same order
+ *                         (__fmul_rn/__fsub_rn on the device, no contraction
+ *                         on the gcc -std=c11 CPU side), and the host check
+ *                         already runs these helpers to err 0. A CPU build
+ *                         that contracts a*c - b*s into an FMA (clang's
+ *                         default -ffp-contract=on with -march=native) breaks
+ *                         the premise and fails here, as it should.
+ *   bf16 KV storage       bitwise on the HOST only (host check); the device
+ *                         planes are not read back, so on the device the
+ *                         stored bits are gated only through attention.
  *   add                   bitwise.
  *   add_scaled            2^-22 * max|cpu| (same FMA caveat).
  *   RMSNorm, QK-norm      2e-6 * max|cpu|: the CPU sums squares in double,
@@ -30,6 +46,7 @@
 
 #include "backend.h"
 #include "kernels.h"
+#include "qmat.h"
 
 #include "ingot/dtype.h"
 #include "ingot/quant.h"
@@ -156,7 +173,9 @@ static void check_products(ctx *c, int type, const char *tname, size_t rows, siz
                 double mag = 0.0;
                 for (size_t k = 0; k < cols; k++)
                     mag += fabs((double)wd[r * cols + k] * (double)x[t * cols + k]);
-                const double bound = 1e-4 * mag + 1e-6;
+                /* 1e-6: see the table at the top. The 1e-30 only keeps an
+                 * all-zero row (mag 0, both sides exactly 0) from 0/0. */
+                const double bound = 1e-6 * mag + 1e-30;
                 const double e = fabs((double)yg[t * rows + r] - (double)yc[t * rows + r]);
                 const double ratio = (e != e) ? 1e30 : e / bound;
                 if (ratio > worst) worst = ratio;
@@ -169,14 +188,14 @@ static void check_products(ctx *c, int type, const char *tname, size_t rows, siz
         const uint32_t ids[4] = { 0, (uint32_t)rows - 1, 7, (uint32_t)rows / 2 };
         float *ec = malloc(4 * cols * sizeof(float)), *eg = malloc(4 * cols * sizeof(float));
         float *de = mynah_slm_backend_alloc(c->gpu, 4 * cols, c->err, sizeof c->err);
-        snprintf(what, sizeof what, "embed (block decode) %s, 4 rows", tname);
+        snprintf(what, sizeof what, "embed (block decode) %s %zux%zu, 4 rows, bitwise", tname, rows, cols);
         if (!ec || !eg || !de ||
             mynah_slm_backend_embed(c->cpu, wc, ids, 4, ec, c->err, sizeof c->err) != 0 ||
             mynah_slm_backend_embed(c->gpu, wg, ids, 4, de, c->err, sizeof c->err) != 0 ||
             down(c, eg, de, 4 * cols) != 0) {
             fail(c, what);
         } else {
-            const double tol = ldexp(1.0, -22) * max_abs(ec, 4 * cols);
+            const double tol = 0.0;                 /* bitwise: see the table */
             const double e = max_diff(eg, ec, 4 * cols);
             report(c, what, e <= tol, e, tol);
         }
@@ -234,7 +253,8 @@ static void check_elementwise(ctx *c) {
 
     /* RoPE, both pairings, theta 1e6 (Qwen3's), positions 1000..1003. */
     for (int il = 0; il <= 1; il++) {
-        const char *what = il ? "rope interleaved, pos 1000..1003" : "rope NeoX split-half, pos 1000..1003";
+        const char *what = il ? "rope interleaved, pos 1000..1003, bitwise"
+                              : "rope NeoX split-half, pos 1000..1003, bitwise";
         mynah_slm_brope *pc = NULL, *pg = NULL;
         float *xn = rc;
         for (size_t i = 0; i < N; i++) xn[i] = x[i] / 4000.0f;
@@ -246,7 +266,7 @@ static void check_elementwise(ctx *c) {
             down(c, rg, dy, N) != 0) {
             fail(c, what);
         } else {
-            const double tol = ldexp(1.0, -22) * max_abs(rc, N), e = max_diff(rg, rc, N);
+            const double tol = 0.0, e = max_diff(rg, rc, N);     /* bitwise */
             report(c, what, e <= tol, e, tol);
         }
         mynah_slm_backend_rope_free(c->cpu, pc);
@@ -323,12 +343,24 @@ static void check_attention(ctx *c, uint32_t nh, uint32_t nkv, uint32_t hd) {
     }
     if (!ok) { fail(c, "kv_append"); goto out; }
 
-    /* Decode at the last position, then a causal batch of 8 ending there. */
-    for (int pass = 0; pass < 2; pass++) {
-        const uint32_t pos0 = pass ? FILL - MB : FILL - 1;
-        const size_t nq = pass ? MB : 1;
+    /* Decode at the last position, then a causal batch of 8 ending there;
+     * then the short histories where some of the ATT_WARPS (4) warps see no
+     * position at all and must drop out of the merge instead of adding a
+     * NaN: decode at pos0 = 0, 1, 2, and a causal batch of 8 from pos0 = 0
+     * (its rows 0..2 are such rows). */
+    static const struct { uint32_t pos0, nq; const char *tag; } passes[] = {
+        { FILL - 1,  1,  "decode, 200 positions" },
+        { FILL - MB, MB, "batch of 8 (causal)" },
+        { 0,         1,  "decode at pos 0" },
+        { 1,         1,  "decode at pos 1" },
+        { 2,         1,  "decode at pos 2" },
+        { 0,         MB, "batch of 8 from pos 0" },
+    };
+    for (size_t pass = 0; pass < sizeof passes / sizeof passes[0]; pass++) {
+        const uint32_t pos0 = passes[pass].pos0;
+        const size_t nq = passes[pass].nq;
         snprintf(what, sizeof what, "attention bf16 %s, %u/%u heads x %u",
-                 pass ? "batch of 8 (causal)" : "decode, 200 positions", nh, nkv, hd);
+                 passes[pass].tag, nh, nkv, hd);
         if (mynah_slm_backend_attention(c->cpu, kc, 1, q, oc, pos0, nq, scale, c->err, sizeof c->err) != 0 ||
             mynah_slm_backend_attention(c->gpu, kg, 1, dq, dout, pos0, nq, scale, c->err, sizeof c->err) != 0 ||
             down(c, og, dout, nq * q_dim) != 0) {
@@ -461,14 +493,24 @@ int mynah_slm_cuda_self_test(FILE *log) {
         return 1;
     }
 
+    /* The f32-activation CPU reference, whatever MYNAH_SLM_INT8 says. */
+    const int int8_was = mynah_slm_matvec_int8_enabled();
+    mynah_slm_matvec_set_int8(0);
+
     /* Qwen3-0.6B shapes: q/o/k/v-like 1024-wide, the FFN 3072 both ways, and
-     * an LM-head-like Q6_K slab (the real one is 151936 rows). */
-    void *keep[8] = { 0 };
+     * an LM-head-like Q6_K slab (the real one is 151936 rows). Then 1026 rows
+     * of every type: not a multiple of the 4 rows per block, so the last
+     * block runs with two warps past the end. */
+    void *keep[12] = { 0 };
     check_products(&c, INGOT_TYPE_F32,  "F32",  512,  1024, &keep[0]);
     check_products(&c, INGOT_TYPE_Q8_0, "Q8_0", 1024, 1024, &keep[1]);
     check_products(&c, INGOT_TYPE_Q4_K, "Q4_K", 3072, 1024, &keep[2]);
     check_products(&c, INGOT_TYPE_Q4_K, "Q4_K", 1024, 3072, &keep[3]);
     check_products(&c, INGOT_TYPE_Q6_K, "Q6_K", 4096, 1024, &keep[4]);
+    check_products(&c, INGOT_TYPE_F32,  "F32",  1026, 1024, &keep[5]);
+    check_products(&c, INGOT_TYPE_Q8_0, "Q8_0", 1026, 1024, &keep[6]);
+    check_products(&c, INGOT_TYPE_Q4_K, "Q4_K", 1026, 1024, &keep[7]);
+    check_products(&c, INGOT_TYPE_Q6_K, "Q6_K", 1026, 1024, &keep[8]);
     check_elementwise(&c);
     check_attention(&c, 16, 8, 128);   /* Qwen3-0.6B: GQA group 2, head_dim 128 */
     check_attention(&c, 8, 1, 64);     /* MQA at 64: the template, not a special case */
@@ -479,7 +521,8 @@ int mynah_slm_cuda_self_test(FILE *log) {
 
     mynah_slm_backend_close(c.gpu);
     mynah_slm_backend_close(c.cpu);
-    for (int i = 0; i < 8; i++) free(keep[i]);
+    for (int i = 0; i < 12; i++) free(keep[i]);
+    mynah_slm_matvec_set_int8(int8_was);
 
     fprintf(c.log, "%d/%d cuda checks passed\n", c.checks - c.failures, c.checks);
     return c.failures ? 1 : 0;

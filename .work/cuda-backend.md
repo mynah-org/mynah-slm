@@ -156,16 +156,16 @@ Every kernel is compared against the **CPU backend** on random data by
 
 | Kernel | Shape / layout | Gate vs CPU backend |
 |---|---|---|
-| Dequant (embedding rows) Q8_0 / Q4_K / Q6_K / F32 | block per token | **bitwise** (same float ops, `__fmul_rn`/`__fsub_rn` forbid FMA contraction) |
-| GEMV Q8_0, Q4_K, Q6_K, F32 | a warp per output row, f32 accumulate, shuffle reduce | `abs(gpu - cpu) <= 1e-4 * sum_i abs(w_i x_i) + 1e-6` per row (a reorder bound, not a quality claim) |
+| Dequant (embedding rows) Q8_0 / Q4_K / Q6_K / F32 | block per token | **bitwise**, tol 0 on host and device (same float ops, `__fmul_rn`/`__fsub_rn` forbid FMA contraction; host half built with `-ffp-contract=off`) |
+| GEMV Q8_0, Q4_K, Q6_K, F32 | a warp per output row, f32 accumulate, shuffle reduce | `abs(gpu - cpu) <= 1e-6 * sum_i abs(w_i x_i)` per row, CPU pinned to f32 activations (a reorder bound, not a quality claim; ~18x over the ~5.5e-8 a warp-by-warp host emulation shows) |
 | RMSNorm | block per row, f32 tree reduction | `<= 2e-6 * max|out| + 1e-7` |
 | QK-RMSNorm | warp per head | same as RMSNorm |
-| NeoX RoPE | thread per pair, table from host (double, the CPU's own table) | **bitwise** (same table, `__fmul_rn`) |
+| NeoX RoPE | thread per pair, table from host (double, the CPU's own table) | **bitwise**, tol 0 on host and device (same table, `__fmul_rn`) |
 | SwiGLU | elementwise, stable sigmoid (`expf` of a non-positive argument only) | `<= 1e-6` relative (device `expf` vs libm) |
 | Residual add | elementwise | **bitwise** |
-| KV append, bf16 RNE | thread per value | stored bits identical to `src/kvcache.c:put_row` |
+| KV append, bf16 RNE | thread per value | stored bits identical to `src/kvcache.c:put_row` — gated **on the host only**; the device planes are not read back, so there it is gated through attention |
 | GQA attention, bf16 KV | block per (q head, query row), warps split positions, online softmax, fixed merge order | `<= 1e-4 * max|out|` vs `mynah_slm_attention_kv_mt` on the same bf16 cache |
-| Argmax | one block, first index of the max | **exact** index |
+| Argmax | one block, first index of the max | **exact** index, NaN as the CPU treats it (x[0] NaN → 0, NaN never taken) |
 
 `head_dim` comes from the config: the attention kernel is templated on 64 / 128
 / 256 and **refuses** (returns 1) anything else rather than guessing.

@@ -610,7 +610,7 @@ int hc_decode(FILE *log, const char *name) {
     uint8_t *q = static_cast<uint8_t *>(std::malloc((size_t)bytes));
     for (size_t i = 0; i < n; i++) f[i] = hc_rand() * 3.0f;
     int bad = 0;
-    double worst = 0.0, mx = 0.0;
+    double worst = 0.0;
     if (!q) bad = 1;
     else if (TYPE == mynah_cuda::TYPE_F32) std::memcpy(q, f, n * sizeof(float));
     else if (ingot_quantize(TYPE, f, n, q) != 0) bad = 1;
@@ -622,12 +622,11 @@ int hc_decode(FILE *log, const char *name) {
             const double want = ref[r * cols + c];
             const double d = std::fabs(got - want);
             if (d > worst || d != d) worst = d;
-            if (std::fabs(want) > mx) mx = std::fabs(want);
         }
     std::free(f); std::free(ref); std::free(q);
     char what[96];
-    std::snprintf(what, sizeof what, "host: dq<%s> == ingot decode, 4x1024", name);
-    const double tol = std::ldexp(1.0, -22) * mx;
+    std::snprintf(what, sizeof what, "host: dq<%s> == ingot decode, 4x1024, bitwise", name);
+    const double tol = 0.0;                   /* exact: the same products, no contraction */
     return hc_report(log, what, !bad && worst <= tol, worst, tol);
 }
 
@@ -741,16 +740,15 @@ extern "C" int mynah_slm_cuda_host_check(FILE *log) {
         for (int t = 0; t < T; t++) mynah_slm_rope_apply(&tab, ref + t * NH * HD, NH, 1000 + t);
         for (size_t p = 0; p < (size_t)T * NH * (HD / 2); p++)
             rope_pair(x, tab.cos, tab.sin, p, NH, HD, 1000, il);
-        double worst = 0.0, mx = 0.0;
+        double worst = 0.0;
         for (int i = 0; i < N; i++) {
             const double d = std::fabs((double)x[i] - (double)ref[i]);
             if (d > worst || d != d) worst = d;
-            if (std::fabs((double)ref[i]) > mx) mx = std::fabs((double)ref[i]);
         }
         mynah_slm_rope_free(&tab);
-        const double tol = std::ldexp(1.0, -22) * mx;
-        fails += hc_report(log, il ? "host: rope_pair interleaved == rope_apply, pos 1000..1002"
-                                   : "host: rope_pair NeoX == rope_apply, pos 1000..1002",
+        const double tol = 0.0;               /* exact: the same products, no contraction */
+        fails += hc_report(log, il ? "host: rope_pair interleaved == rope_apply, bitwise"
+                                   : "host: rope_pair NeoX == rope_apply, bitwise",
                            worst <= tol, worst, tol);
     }
 
