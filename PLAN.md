@@ -102,8 +102,9 @@ per commit, listed in the matrix note.
       written with the work
 - [ ] **S1** — serving foundation: slots, scheduler, continuous batching,
       batched decode, sliced prefill; note written with the work
-- [ ] **G1** — CUDA backend foundation for Qwen3 (GQA, head_dim 128, NeoX RoPE,
-      RMSNorm / QK-norm); note written with the work
+- [~] **G1** — CUDA backend foundation for Qwen3 (GQA, head_dim 128, NeoX RoPE,
+      RMSNorm / QK-norm): vtable + CPU backend + kernels compiled for sm_80/89/90,
+      never run on a GPU; forward pass not wired yet → [`.work/cuda-backend.md`](.work/cuda-backend.md)
 
 ### R — research items
 
