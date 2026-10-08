@@ -30,6 +30,7 @@ jobs:
           - runner: ubuntu-latest
             name: linux-x86_64 (native)
             extra: ''
+            blas: auto
           # src/kernels.c is NEON / AVX2 / scalar. On a hosted x86 runner the
           # default -march=native always picks AVX2, so the scalar fallback —
           # the path any older CPU takes — would never once be compiled, let
@@ -37,12 +38,27 @@ jobs:
           - runner: ubuntu-latest
             name: linux-x86_64 (no AVX2, scalar fallback)
             extra: '-march=x86-64-v2'
+            blas: auto
           - runner: ubuntu-24.04-arm
             name: linux-aarch64 (neon)
             extra: ''
+            blas: auto
           - runner: macos-latest
             name: macos-arm64 (accelerate)
             extra: ''
+            blas: auto
+          # BLAS=none: our src/sgemm.c and NO vendor BLAS — the OpenBLAS
+          # package is deliberately not installed, so a stray cblas include or
+          # -lopenblas fails here instead of on a user's minimal machine.
+          # x86 and aarch64, because the GEMM micro-kernels differ by ISA.
+          - runner: ubuntu-latest
+            name: linux-x86_64 (BLAS=none, no vendor BLAS)
+            extra: ''
+            blas: none
+          - runner: ubuntu-24.04-arm
+            name: linux-aarch64 (BLAS=none, no vendor BLAS)
+            extra: ''
+            blas: none
 
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.name }}
@@ -52,7 +68,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install OpenBLAS (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.blas != 'none'
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
 
       # EXTRA_CFLAGS, never CFLAGS=. A command-line CFLAGS overrides everything
@@ -60,13 +76,13 @@ jobs:
       # -DMYNAH_SLM_BUILD='"..."' — and the build stops compiling. EXTRA_CFLAGS
       # is appended last, so a later -march still wins over -march=native.
       - name: Build CLI and server
-        run: make EXTRA_CFLAGS="${{ matrix.extra }}"
+        run: make BLAS=${{ matrix.blas }} EXTRA_CFLAGS="${{ matrix.extra }}"
 
       - name: Tests (model-dependent cases report SKIP)
-        run: make test EXTRA_CFLAGS="${{ matrix.extra }}"
+        run: make test BLAS=${{ matrix.blas }} EXTRA_CFLAGS="${{ matrix.extra }}"
 
       - name: Static and shared library
-        run: make lib shared EXTRA_CFLAGS="${{ matrix.extra }}"
+        run: make lib shared BLAS=${{ matrix.blas }} EXTRA_CFLAGS="${{ matrix.extra }}"
 
       - name: Binaries answer
         run: |
@@ -78,7 +94,7 @@ jobs:
       # somebody else's build.
       - name: Install into a staging prefix
         run: |
-          make install DESTDIR="$PWD/staging" PREFIX=/usr
+          make install BLAS=${{ matrix.blas }} DESTDIR="$PWD/staging" PREFIX=/usr
           test -x staging/usr/bin/mynah-slm
           test -x staging/usr/bin/mynah-slm-server
           test -f staging/usr/lib/libmynah_slm.a
