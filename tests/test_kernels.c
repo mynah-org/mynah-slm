@@ -696,6 +696,34 @@ static void test_int8_contracts_here(void) {
     }
 }
 
+/* MYNAH_SLM_INT8_TYPES: exact comma tokens, case-insensitive, unknown ones
+ * reported. It used to be a substring search, so "q4_k_m" selected Q4_K and
+ * a typo silently selected nothing. */
+static void test_int8_types_parse(void) {
+    static const struct { const char *in; int mask; int warnings; } cases[] = {
+        { NULL, 7, 0 }, { "", 7, 0 }, { "q4_k", 1, 0 }, { "Q8_0,q6_K", 6, 0 },
+        { " q4_k , q6_k ", 5, 0 }, { "q4_k,q8_0,q6_k", 7, 0 },
+        { "q4_k_m", 0, 1 }, { "noq6_k,q8_0", 2, 1 }, { "q4_k,,bogus", 1, 1 },
+        { "q6_k,Q6_K", 4, 0 }, { "all", 0, 1 },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        FILE *f = tmpfile();
+        const int mask = mynah_slm_matvec_int8_types_parse(cases[i].in, f);
+        int lines = 0;
+        if (f) {
+            rewind(f);
+            for (int ch; (ch = fgetc(f)) != EOF;) if (ch == '\n') lines++;
+            fclose(f);
+        }
+        char what[96], d[64];
+        snprintf(what, sizeof what, "MYNAH_SLM_INT8_TYPES=\"%s\" -> mask %d, %d warning%s",
+                 cases[i].in ? cases[i].in : "(unset)", cases[i].mask, cases[i].warnings,
+                 cases[i].warnings == 1 ? "" : "s");
+        snprintf(d, sizeof d, "got mask %d, %d warnings", mask, lines);
+        check(what, mask == cases[i].mask && (!f || lines == cases[i].warnings), d);
+    }
+}
+
 /* The contract at EVERY level this CPU can run (src/isa.c), not only the one
  * it picks by default: since K5 a single binary carries every variant, so a
  * kernel nobody's default machine selects still ships. */
@@ -885,7 +913,7 @@ int main(void) {
     printf("\n-- rope --\n");       test_rope();
     printf("\n-- activations --\n");test_activations();
     printf("\n-- attention --\n");  test_attention();
-    printf("\n-- quantized matvec --\n"); test_q4_k_matvec();
+    printf("\n-- quantized matvec --\n"); test_q4_k_matvec(); test_int8_types_parse();
     mynah_slm_threads_init(4);
     printf("\n-- int8 matvec contract --\n"); test_int8_contracts();
     mynah_slm_threads_shutdown();

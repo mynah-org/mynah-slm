@@ -379,12 +379,17 @@ int mynah_slm_isa_report(FILE *f) {
     for (size_t i = 0; i < N_OF(attn_tables); i++)  an[i] = attn_tables[i]->name;
     for (size_t i = 0; i < N_OF(sgemm_tables); i++) sn[i] = sgemm_tables[i]->name;
 
-    char q_extra[128];
+    char q_extra[192];
     const int want8 = mynah_slm_matvec_int8_requested();
-    snprintf(q_extra, sizeof q_extra, "int8 kernels: %s, switch %s%s",
+    const int types = mynah_slm_matvec_int8_types();
+    snprintf(q_extra, sizeof q_extra, "int8 kernels: %s, switch %s, types %s%s%s%s%s",
              g_qmat->int8 ? g_qmat->int8_name : "none",
              want8 ? "ON" : "off",
-             want8 && !g_qmat->int8 ? " <- REQUESTED BUT UNAVAILABLE at this level" : "");
+             types & MYNAH_SLM_INT8_Q4_K ? "q4_k " : "",
+             types & MYNAH_SLM_INT8_Q8_0 ? "q8_0 " : "",
+             types & MYNAH_SLM_INT8_Q6_K ? "q6_k " : "",
+             types ? "" : "(none) ",
+             want8 && !g_qmat->int8 ? "<- REQUESTED BUT UNAVAILABLE at this level" : "");
     if (want8 && !g_qmat->int8) bad = 1;
     char s_extra[96];
     snprintf(s_extra, sizeof s_extra, "backend %s", mynah_slm_sgemm_backend());

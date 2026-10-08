@@ -35,6 +35,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 /* The per-32-element input sums our Q4_K kernel reads. Sized for a stack
  * buffer: cols/32, so 16384 columns. Everything we ship is far under it. */
@@ -132,6 +133,17 @@ int  mynah_slm_matvec_int8_requested(void);
 /* Narrow the int8 switch to some types (MYNAH_SLM_INT8_TYPES=q4_k,q8_0,q6_k,
  * default all). Never enables int8 on its own. */
 void mynah_slm_matvec_set_int8_types(int q4_k, int q8_0, int q6_k);
+
+/* The resolved type mask (MYNAH_SLM_INT8_* bits), for --dispatch. */
+#define MYNAH_SLM_INT8_Q4_K 1
+#define MYNAH_SLM_INT8_Q8_0 2
+#define MYNAH_SLM_INT8_Q6_K 4
+int mynah_slm_matvec_int8_types(void);
+
+/* The parser behind MYNAH_SLM_INT8_TYPES: comma-separated exact tokens,
+ * case-insensitive; NULL or "" = all; unknown tokens are reported on `warn`
+ * (when not NULL) and ignored. Returns the mask. */
+int mynah_slm_matvec_int8_types_parse(const char *s, FILE *warn);
 
 /* Does this build have a kernel of its own for `type`? */
 int mynah_slm_matvec_have(int type);

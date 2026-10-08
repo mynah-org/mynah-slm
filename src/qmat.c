@@ -13,8 +13,10 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 /* The kernels themselves live in qmat_kern.c, compiled once per ISA; this
  * file is the API, the activation prep and the dispatch through the table
@@ -30,7 +32,8 @@
  * are relaxed atomics: the setters below exist for tests and benches that
  * flip a switch between calls, with the pool idle, and a relaxed load is a
  * plain load on every target we build. */
-enum { INT8_Q4_K = 1, INT8_Q8_0 = 2, INT8_Q6_K = 4, INT8_ALL = 7 };
+enum { INT8_Q4_K = MYNAH_SLM_INT8_Q4_K, INT8_Q8_0 = MYNAH_SLM_INT8_Q8_0,
+       INT8_Q6_K = MYNAH_SLM_INT8_Q6_K, INT8_ALL = 7 };
 
 static pthread_once_t g_env_once = PTHREAD_ONCE_INIT;
 static _Atomic int g_own = 1;           /* our kernels (0: MYNAH_SLM_KERNELS=ingot) */
@@ -96,16 +99,46 @@ void mynah_slm_matvec_set_int8(int on) { env_set(&g_int8, on ? 1 : 0); }
  * never turn int8 on by itself. It exists so the perplexity gate can price
  * each type on ONE binary — the Q6_K head in front of the softmax is a
  * different quality question from the Q4_K layers (.work/int8-q8_0-q6_k.md). */
-static int parse_int8_types(const char *e) {
-    int mask = INT8_ALL;
-    if (e && *e) {
-        mask = 0;
-        if (strstr(e, "q4_k") || strstr(e, "Q4_K")) mask |= INT8_Q4_K;
-        if (strstr(e, "q8_0") || strstr(e, "Q8_0")) mask |= INT8_Q8_0;
-        if (strstr(e, "q6_k") || strstr(e, "Q6_K")) mask |= INT8_Q6_K;
+/*
+ * Exact tokens, not substrings: "q4_k_m" or "noq6_k" used to match, and a
+ * typo silently selected nothing. Case-insensitive, blanks around a token
+ * ignored, an unknown token reported (once: the environment is read once).
+ * An empty or unset value means all three; a value with no known token means
+ * none — narrow is the safe direction. */
+int mynah_slm_matvec_int8_types_parse(const char *e, FILE *warn) {
+    if (!e || !*e) return INT8_ALL;
+    static const struct { const char *name; int bit; } known[] = {
+        { "q4_k", INT8_Q4_K }, { "q8_0", INT8_Q8_0 }, { "q6_k", INT8_Q6_K },
+    };
+    int mask = 0;
+    const char *p = e;
+    for (;;) {
+        const char *end = strchr(p, ',');
+        if (!end) end = p + strlen(p);
+        const char *a = p, *b = end;
+        while (a < b && (*a == ' ' || *a == '\t')) a++;
+        while (b > a && (b[-1] == ' ' || b[-1] == '\t')) b--;
+        const size_t n = (size_t)(b - a);
+        int hit = 0;
+        for (size_t k = 0; k < sizeof known / sizeof *known; k++)
+            if (n == strlen(known[k].name) && strncasecmp(a, known[k].name, n) == 0) {
+                mask |= known[k].bit;
+                hit = 1;
+            }
+        if (!hit && n > 0 && warn)
+            fprintf(warn, "mynah-slm: MYNAH_SLM_INT8_TYPES: unknown type \"%.*s\" ignored "
+                          "(known: q4_k, q8_0, q6_k)\n", (int)n, a);
+        if (!*end) break;
+        p = end + 1;
     }
     return mask;
 }
+
+static int parse_int8_types(const char *e) {
+    return mynah_slm_matvec_int8_types_parse(e, stderr);
+}
+
+int mynah_slm_matvec_int8_types(void) { return env_get(&g_int8_types); }
 
 static int int8_type_bit(int type) {
     return type == INGOT_TYPE_Q4_K ? INT8_Q4_K :
