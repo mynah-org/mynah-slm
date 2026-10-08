@@ -118,6 +118,9 @@ jobs:
     runs-on: ubuntu-latest
     container: nvidia/cuda:12.6.2-devel-ubuntu24.04
     timeout-minutes: 20
+    env:
+      # apt in a bare container: no debconf prompt may block the job.
+      DEBIAN_FRONTEND: noninteractive
     strategy:
       fail-fast: false
       matrix:
@@ -133,6 +136,12 @@ jobs:
           nvcc --version
 
       - uses: actions/checkout@v7
+
+      # The container runs as root over a checkout owned by the runner user,
+      # so git refuses the repository ("dubious ownership") and the
+      # Makefile's `git describe` build stamp comes out empty.
+      - name: Trust the checkout for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       # BLAS=none: no vendor package to install in the container, and the
       # CUDA build does not care which CPU GEMM the reference path links.
