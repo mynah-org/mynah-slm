@@ -56,8 +56,9 @@ double mynah_slm_decode_tok_s(const mynah_slm_timing *t) {
 int mynah_slm_timing_format(const mynah_slm_timing *t, char *buf, size_t n) {
     return snprintf(buf, n,
         "[load %.2fs | prompt %u tok, prefill %.1f tok/s | "
-        "gen %u tok, decode %.1f tok/s | TTFT %.0f ms | %d threads%s]",
+        "gen %u tok, decode %.1f tok/s | TTFT %.0f ms | %d threads%s%s%s]",
         t->load_s, t->n_prompt, mynah_slm_prefill_tok_s(t),
         t->n_gen, mynah_slm_decode_tok_s(t), t->ttft_s * 1000.0, t->n_threads,
+        t->device ? " | device " : "", t->device ? t->device : "",
         t->cancelled ? " | CANCELLED" : "");
 }

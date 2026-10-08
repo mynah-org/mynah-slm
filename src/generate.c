@@ -39,8 +39,28 @@ size_t mynah_slm_gen_prefill_left(const mynah_slm_gen *g) {
     return g->decoding ? 0 : (g->p.n_prompt - 1) - g->prefilled;
 }
 
+/* The reference forward pass (arch_qwen3.c) as a driver. */
+typedef struct { mynah_slm_state *ws; mynah_slm_seq *q; } ref_driver;
+
+static int ref_prefill(void *ctx, const uint32_t *tokens, uint32_t n) {
+    ref_driver *r = ctx;
+    return mynah_slm_seq_forward_batch(r->ws, r->q, tokens, n, NULL);
+}
+
+static float *ref_step(void *ctx, uint32_t token) {
+    ref_driver *r = ctx;
+    return mynah_slm_seq_forward(r->ws, r->q, token, r->ws->logits) == 0 ? r->ws->logits : NULL;
+}
+
 int mynah_slm_gen_prefill(mynah_slm_gen *g, mynah_slm_state *ws, mynah_slm_seq *q,
                           uint32_t budget) {
+    ref_driver r = { ws, q };
+    const mynah_slm_gen_driver d = { ref_prefill, ref_step, mynah_slm_batch_max(ws), &r };
+    return mynah_slm_gen_prefill_driver(g, &d, budget);
+}
+
+int mynah_slm_gen_prefill_driver(mynah_slm_gen *g, const mynah_slm_gen_driver *d,
+                                 uint32_t budget) {
     if (g->stop == MYNAH_SLM_STOP_ERROR || g->stop == MYNAH_SLM_STOP_CANCELLED) return -1;
     if (g->decoding) return 1;
 
@@ -51,7 +71,7 @@ int mynah_slm_gen_prefill(mynah_slm_gen *g, mynah_slm_state *ws, mynah_slm_seq *
      * behaviour change, since the last token's logits are computed the same
      * way either way. */
     const size_t n_pre = g->p.n_prompt - 1;
-    const uint32_t bmax = mynah_slm_batch_max(ws);
+    const uint32_t bmax = d->batch_max ? d->batch_max : 1;
     size_t left = budget ? budget : n_pre;
     while (g->prefilled < n_pre && left > 0) {
         /* Before every batch: a prompt of thousands of tokens is seconds of
@@ -65,8 +85,7 @@ int mynah_slm_gen_prefill(mynah_slm_gen *g, mynah_slm_state *ws, mynah_slm_seq *
          * once for the whole group, which is the difference between prefill
          * being memory-bound and being compute-bound. A batch of one falls
          * back to the single-token path inside forward_batch. */
-        if (mynah_slm_seq_forward_batch(ws, q, g->p.prompt + g->prefilled,
-                                        (uint32_t)take, NULL) != 0) {
+        if (d->prefill(d->ctx, g->p.prompt + g->prefilled, (uint32_t)take) != 0) {
             g->stop = MYNAH_SLM_STOP_ERROR;
             return -1;
         }
@@ -176,11 +195,20 @@ void mynah_slm_gen_finish(mynah_slm_gen *g) {
 long mynah_slm_generate(mynah_slm_state *st, const mynah_slm_tokenizer *tok,
                         mynah_slm_sampler *sam, const mynah_slm_gen_params *p,
                         mynah_slm_timing *t) {
-    if (!st || !p || p->n_prompt == 0) return -1;
+    if (!st) return -1;
+    ref_driver r = { st, &st->own };
+    const mynah_slm_gen_driver d = { ref_prefill, ref_step, mynah_slm_batch_max(st), &r };
+    return mynah_slm_generate_driver(&d, tok, sam, p, t);
+}
+
+long mynah_slm_generate_driver(const mynah_slm_gen_driver *d, const mynah_slm_tokenizer *tok,
+                               mynah_slm_sampler *sam, const mynah_slm_gen_params *p,
+                               mynah_slm_timing *t) {
+    if (!d || !p || p->n_prompt == 0) return -1;
 
     mynah_slm_gen g;
     if (mynah_slm_gen_start(&g, tok, sam, p, t) != 0) return -1;
-    if (mynah_slm_gen_prefill(&g, st, &st->own, 0) != 1) {
+    if (mynah_slm_gen_prefill_driver(&g, d, 0) != 1) {
         if (g.stop != MYNAH_SLM_STOP_CANCELLED) return -1;
         mynah_slm_gen_finish(&g);
         return 0;                    /* cancelled during the prompt: nothing generated */
@@ -191,12 +219,12 @@ long mynah_slm_generate(mynah_slm_state *st, const mynah_slm_tokenizer *tok,
          * tokens are never written, so a write failure cannot be the only
          * way to notice the client left. */
         if (mynah_slm_gen_check_cancel(&g)) break;
-        if (mynah_slm_seq_forward(st, &st->own, mynah_slm_gen_next_token(&g),
-                                  st->logits) != 0) {
+        float *logits = d->step(d->ctx, mynah_slm_gen_next_token(&g));
+        if (!logits) {
             mynah_slm_gen_fail(&g);
             break;
         }
-        mynah_slm_gen_accept_logits(&g, st->logits);
+        mynah_slm_gen_accept_logits(&g, logits);
     }
     mynah_slm_gen_finish(&g);
     return g.produced;

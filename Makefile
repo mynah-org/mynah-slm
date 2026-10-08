@@ -161,6 +161,7 @@ help:
 	@echo "  shared       libmynah_slm.{dylib,so}"
 	@echo "  test         unit tests + parity (exit 77 = skipped, model missing)"
 	@echo "  test-parity  C forward pass vs the numpy oracle, stage by stage"
+	@echo "  test-device  run --device: cpu-backend == cpu, cuda refused cleanly (no model)"
 	@echo "  test-server  end-to-end HTTP checks (needs a minute of generation)"
 	@echo "  test-server-cancel  disconnects cost no CPU, 503 at the cap (no model needed)"
 	@echo "  test-server-slots   --slots 4 continuous batching end to end (no model needed)"
@@ -254,13 +255,14 @@ tests/test_http: build/tests/test_http.o build/server/http.o $(TEST_SUPPORT) $(O
 tests/%: build/tests/%.o $(TEST_SUPPORT) $(OBJ) $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
-test: $(TESTS) mynah-slm
+test: $(TESTS) mynah-slm tests/write_fixture
 	@for t in $(TESTS); do \
 	  $$t; rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP $$t: model missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi; \
 	done
 	@./mynah-slm --version >/dev/null || exit 1
+	@bash tests/test_device.sh ./mynah-slm tests/write_fixture || exit 1
 	@python3 tools/check_plan.py || exit 1
 	@if [ -e "$(MODEL)" ]; then ./mynah-slm inspect "$(MODEL)" >/dev/null || exit 1; \
 	 else echo "SKIP inspect: $(MODEL) not found (scripts/download_model.sh --list)"; fi
@@ -299,6 +301,14 @@ bench-qmat: $(BENCH_QMAT)
 BENCH_DECODE := tests/bench_decode
 bench-decode: $(BENCH_DECODE)
 	@if [ -e "$(MODEL)" ]; then $(BENCH_DECODE) "$(MODEL)"; else $(BENCH_DECODE); fi
+
+# `run --device`, model-free (also part of `test`): cpu-backend output ==
+# the default path byte for byte, the speed line names the device, and
+# --device cuda is refused with its reason when it cannot run. In a CUDA
+# build: make test-device MYNAH_SLM_BIN=build/cuda/mynah-slm
+MYNAH_SLM_BIN ?= ./mynah-slm
+test-device: mynah-slm tests/write_fixture
+	@bash tests/test_device.sh $(MYNAH_SLM_BIN) tests/write_fixture
 
 # End-to-end server checks: shape, determinism (sequential and concurrent),
 # SSE framing, and that reasoning never reaches content. Separate from `test`
@@ -566,4 +576,4 @@ dist: mynah-slm mynah-slm-server libmynah_slm.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot bench-qmat dispatch bench-decode test-server-cancel tsan test-server-slots
+.PHONY: all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot bench-qmat dispatch bench-decode test-server-cancel tsan test-server-slots test-device

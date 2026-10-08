@@ -156,6 +156,33 @@ int  mynah_slm_gen_start(mynah_slm_gen *g, const mynah_slm_tokenizer *tok,
 int  mynah_slm_gen_prefill(mynah_slm_gen *g, mynah_slm_state *ws, mynah_slm_seq *q,
                            uint32_t budget);
 
+/* ── who runs the forward pass ─────────────────────────────────────────────
+ * The token loop above does not care WHAT computes the logits, only that
+ * something fills the cache with a slice of prompt and returns one logits
+ * row per decode step. gen_prefill and generate() drive arch_qwen3.c through
+ * this; src/forward_backend.c supplies one that drives the backend vtable
+ * (`--device`). One loop, several forward passes — never two loops (rule 2).
+ *
+ *   prefill  feed n <= batch_max prompt tokens into the cache, no logits;
+ *            0 or -1
+ *   step     feed one token, return its logits row (HOST memory, valid until
+ *            the next call; the sampler modifies it in place), NULL on
+ *            failure */
+typedef struct {
+    int    (*prefill)(void *ctx, const uint32_t *tokens, uint32_t n);
+    float *(*step)(void *ctx, uint32_t token);
+    uint32_t batch_max;
+    void    *ctx;
+} mynah_slm_gen_driver;
+
+/* gen_prefill and generate() with the forward pass supplied by `d`.
+ * mynah_slm_gen_prefill(g, ws, q, b) is this with arch_qwen3.c on (ws, q). */
+int  mynah_slm_gen_prefill_driver(mynah_slm_gen *g, const mynah_slm_gen_driver *d,
+                                  uint32_t budget);
+long mynah_slm_generate_driver(const mynah_slm_gen_driver *d, const mynah_slm_tokenizer *tok,
+                               mynah_slm_sampler *sam, const mynah_slm_gen_params *p,
+                               mynah_slm_timing *t);
+
 /* Prompt tokens still to prefill. */
 size_t mynah_slm_gen_prefill_left(const mynah_slm_gen *g);
 

@@ -29,6 +29,7 @@
 #define MYNAH_SLM_FORWARD_BACKEND_H
 
 #include "backend.h"
+#include "generate.h"
 #include "model.h"
 
 typedef struct mynah_slm_bfwd mynah_slm_bfwd;
@@ -99,5 +100,18 @@ int  mynah_slm_bfwd_step_argmax(mynah_slm_bfwd *f, mynah_slm_bseq *q, uint32_t t
                                 uint32_t *next, char *err, size_t errsz);
 int  mynah_slm_bfwd_prefill(mynah_slm_bfwd *f, mynah_slm_bseq *q, const uint32_t *tokens,
                             uint32_t n, float *logits, char *err, size_t errsz);
+
+/* ── as a generation driver (generate.h) ───────────────────────────────────
+ * Lets generate.c's one token loop run on this forward: prefill in slices of
+ * batch_max, then one step per token whose logits row lands in a host buffer
+ * the forward owns. A failure's text is kept in `err` (the driver interface
+ * only carries a status). `r` must outlive the driver. */
+typedef struct {
+    mynah_slm_bfwd *f;
+    mynah_slm_bseq *q;
+    char            err[256];
+} mynah_slm_bfwd_run;
+
+void mynah_slm_bfwd_driver(mynah_slm_bfwd_run *r, mynah_slm_gen_driver *out);
 
 #endif /* MYNAH_SLM_FORWARD_BACKEND_H */

@@ -12,6 +12,8 @@
 
 #include "backend_ops.h"   /* kv->desc */
 
+#include "kernels.h"       /* mynah_slm_aligned_alloc */
+
 #include "ingot/dtype.h"
 
 #include <stdio.h>
@@ -38,6 +40,7 @@ struct mynah_slm_bfwd {
     /* Backend buffers, [rows][width] each — device memory on a device. */
     float *x, *h, *q, *k, *v, *attn, *proj, *gate, *up;
     float *logits;     /* [max(1, dec_max)][vocab] */
+    float *hlogits;    /* the same, in HOST memory: what a driver hands out */
 };
 
 static void set_err(char *err, size_t errsz, const char *msg) {
@@ -206,6 +209,8 @@ int mynah_slm_bfwd_create(mynah_slm_backend *b, const mynah_slm_model_t *m,
         f->gate  = buf(f, R * c->d_ff, &ok, err, errsz);
         f->up    = buf(f, R * c->d_ff, &ok, err, errsz);
         f->logits = buf(f, (size_t)f->dec_max * f->vocab, &ok, err, errsz);
+        f->hlogits = mynah_slm_aligned_alloc((size_t)f->dec_max * f->vocab * sizeof(float));
+        if (ok && !f->hlogits) { set_err(err, errsz, "out of memory for host logits"); ok = 0; }
         if (!ok) { rc = -1; goto fail; }
     }
     *out = f;
@@ -224,6 +229,7 @@ void mynah_slm_bfwd_free(mynah_slm_bfwd *f) {
                       f->logits };
     for (size_t i = 0; i < sizeof bufs / sizeof *bufs; i++) mynah_slm_backend_free(f->b, bufs[i]);
     mynah_slm_backend_rope_free(f->b, f->rope);
+    mynah_slm_aligned_free(f->hlogits);
     /* Weight handles belong to the backend (freed at its close or flush). */
     free(f->L);
     free(f);
@@ -443,4 +449,25 @@ int mynah_slm_bfwd_prefill(mynah_slm_bfwd *f, mynah_slm_bseq *q, const uint32_t 
            "d2h", err, errsz)) return -1;
     q->n_past += n;
     return 0;
+}
+
+/* ── as a generation driver ──────────────────────────────────────────────── */
+
+static int drv_prefill(void *ctx, const uint32_t *tokens, uint32_t n) {
+    mynah_slm_bfwd_run *r = ctx;
+    return mynah_slm_bfwd_prefill(r->f, r->q, tokens, n, NULL, r->err, sizeof r->err);
+}
+
+static float *drv_step(void *ctx, uint32_t token) {
+    mynah_slm_bfwd_run *r = ctx;
+    return mynah_slm_bfwd_step(r->f, r->q, token, r->f->hlogits, r->err, sizeof r->err) == 0
+               ? r->f->hlogits : NULL;
+}
+
+void mynah_slm_bfwd_driver(mynah_slm_bfwd_run *r, mynah_slm_gen_driver *out) {
+    r->err[0] = '\0';
+    out->prefill = drv_prefill;
+    out->step = drv_step;
+    out->batch_max = r->f ? r->f->batch_max : 1;
+    out->ctx = r;
 }

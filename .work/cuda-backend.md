@@ -438,6 +438,46 @@ fused-matvec input only when `cols % 256 == 0`, `mynah_slm_project` when
 a multiple of 32 but not 256 the two would pick different kernels. Every
 Qwen3 width is a multiple of 256; the fixture's too.
 
+### G2-b — `mynah-slm run --device cpu|cuda`
+
+- `--device cpu` (default): the existing path — `mynah_slm_generate` on an
+  arch_qwen3.c state, speed line unchanged byte for byte.
+- `--device cuda`: the backend is opened BEFORE the checkpoint is mapped;
+  a CPU-only build fails with "CUDA backend is not compiled; build with
+  `make cuda`", a CUDA build without a device with "no CUDA device: …", both
+  exit 1 with nothing on stdout. `--fast` (int8 CPU activations) with a
+  device is refused rather than ignored. Then `mynah_slm_bfwd_create` (any
+  refusal — e.g. `--kv f32`, which the CUDA backend does not store — is the
+  same clean exit 1 with the reason) and generation through it.
+- `--device cpu-backend`: the CPU kernels through the backend forward. Not a
+  product mode: the CLI-level parity check that runs where no GPU exists.
+- One token loop: `generate.c` now runs on a `mynah_slm_gen_driver`
+  (prefill-a-slice + step-returns-logits). `mynah_slm_generate` and
+  `mynah_slm_gen_prefill` are that with arch_qwen3.c; `mynah_slm_bfwd_driver`
+  supplies the backend one. No second loop (rule 2).
+- The speed line gains `| device <name>` only when a device was asked for
+  (`mynah_slm_timing.device`, NULL by default — the server's lines are
+  unchanged).
+
+Evidence: `tests/test_device.sh` (in `make test`, also `make test-device`):
+on the untied Q4_K_M-mix "slow" fixture (the tied one echoes its input and
+compares nothing), `--device cpu-backend` stdout == the default path's,
+greedy and sampled (`--temp 0.8 --seed 3`); the speed line names the device
+only when asked; `--device cuda` refused cleanly; `--device tpu` exit 2.
+`tests/test_forward_backend.c`: `mynah_slm_generate_driver` on the backend
+forward (prefill sliced at 16) == `mynah_slm_generate`, sampled, all four
+fixtures. `test_synth`'s generate() checks still pass on the refactored loop.
+In the `make cuda CUDA_ARCH=sm_89` build on this VM:
+`build/cuda/mynah-slm run --device cuda` → exit 1, 0 bytes on stdout,
+"mynah-slm: --device cuda: no CUDA device: no CUDA-capable device is
+detected"; `--device cpu-backend` == default there too.
+
+Not done here: greedy decode still copies the logits row back (one d2h, one
+sync, vocab x 4 bytes — 0.6 MB at 151936) because the sampler owns the pick;
+`mynah_slm_bfwd_step_argmax` is the 4-byte path, to wire in when the
+sampler is pure greedy. The host logits buffer is pageable; pinned memory
+needs a backend op that does not exist yet.
+
 ## Conclusion
 
 G1-a: **KEEP** — the boundary exists, the CPU side of it is the engine's own

@@ -27,8 +27,10 @@
 #include "backend.h"
 #include "fixture_model.h"
 #include "forward_backend.h"
+#include "generate.h"
 #include "model.h"
 #include "mynah_slm.h"
+#include "sampler.h"
 #include "threads.h"
 #include "tokenizer.h"
 
@@ -233,6 +235,82 @@ static void check_parity(const fx *x, mynah_slm_backend *b, mynah_slm_kv_type kt
     free(ref_steps); free(got_steps);
 }
 
+/* ── generate.c's token loop on the backend forward ───────────────────── */
+
+typedef struct { uint32_t ids[64]; size_t n; } collect;
+
+static int collect_cb(void *ctx, uint32_t id, const char *text, size_t len) {
+    (void)text;
+    collect *c = ctx;
+    if (len == 0 && id == 0) return 0;
+    if (c->n < 64) c->ids[c->n++] = id;
+    return 0;
+}
+
+/* generate() on the reference state and generate_driver() on the backend
+ * forward, same params and sampler seed: the same ids, the same counts.
+ * Sampled, not greedy, so the whole logits row matters, not just its max. */
+static void check_driver(const fx *x, mynah_slm_backend *b, const mynah_slm_tokenizer *tok,
+                         const char *label) {
+    char err[256] = "", what[128], detail[400];
+    mynah_slm_sampler_params sp;
+    mynah_slm_sampler_defaults(&sp);
+    sp.temp = 0.8f;
+    sp.seed = 11;
+    mynah_slm_gen_params gp;
+    mynah_slm_gen_params_init(&gp);
+    gp.prompt = x->ids;
+    gp.n_prompt = (size_t)x->n_tok;
+    gp.max_new = 24;
+
+    collect a, c;
+    memset(&a, 0, sizeof a);
+    memset(&c, 0, sizeof c);
+    long na = -1, nc = -1;
+    {
+        mynah_slm_state st;
+        if (mynah_slm_state_init_kv(&st, x->m, (uint32_t)x->n_tok + 32, MYNAH_SLM_KV_BF16,
+                                    MYNAH_SLM_KV_BF16, err, sizeof err) == 0) {
+            mynah_slm_sampler *sam = mynah_slm_sampler_new(&sp, x->vocab);
+            gp.cb = collect_cb; gp.cb_ctx = &a;
+            na = mynah_slm_generate(&st, tok, sam, &gp, NULL);
+            mynah_slm_sampler_free(sam);
+            mynah_slm_state_free(&st);
+        }
+    }
+    {
+        /* batch 16 < the prompt: the driver's slicing is exercised too */
+        mynah_slm_bfwd_desc d = { .ctx_cap = 256, .batch_max = 16, .dec_max = 1,
+                                  .kv_k = MYNAH_SLM_KV_BF16, .kv_v = MYNAH_SLM_KV_BF16 };
+        mynah_slm_bfwd *f = NULL;
+        mynah_slm_bseq q;
+        memset(&q, 0, sizeof q);
+        if (mynah_slm_bfwd_create(b, x->m, &d, &f, err, sizeof err) == 0 &&
+            mynah_slm_bseq_init(f, &q, (uint32_t)x->n_tok + 32, err, sizeof err) == 0) {
+            mynah_slm_sampler *sam = mynah_slm_sampler_new(&sp, x->vocab);
+            mynah_slm_bfwd_run r;
+            memset(&r, 0, sizeof r);
+            r.f = f;
+            r.q = &q;
+            mynah_slm_gen_driver drv;
+            mynah_slm_bfwd_driver(&r, &drv);
+            gp.cb = collect_cb; gp.cb_ctx = &c;
+            nc = mynah_slm_generate_driver(&drv, tok, sam, &gp, NULL);
+            if (r.err[0]) snprintf(err, sizeof err, "%s", r.err);
+            mynah_slm_sampler_free(sam);
+        }
+        mynah_slm_bseq_free(f, &q);
+        mynah_slm_bfwd_free(f);
+    }
+    snprintf(what, sizeof what, "[%s] generate_driver(backend forward) == generate(), sampled",
+             label);
+    snprintf(detail, sizeof detail, "%ld vs %ld tokens, %zu vs %zu ids %s", na, nc, a.n, c.n,
+             err);
+    check(what, na > 0 && na == nc && a.n == c.n && memcmp(a.ids, c.ids, a.n * sizeof *a.ids) == 0,
+          detail);
+    printf("     %s\n", detail);
+}
+
 static void run(const char *label, int quant) {
     printf("\n-- %s fixture --\n", label);
     fixture_spec spec;
@@ -265,6 +343,7 @@ static void run(const char *label, int quant) {
         } else {
             check_parity(&x, b, MYNAH_SLM_KV_F32, lab);
             check_parity(&x, b, MYNAH_SLM_KV_BF16, lab);
+            check_driver(&x, b, tok, lab);
         }
         mynah_slm_backend_close(b);
         free(ids);

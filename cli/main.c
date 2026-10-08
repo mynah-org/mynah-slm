@@ -6,6 +6,8 @@
  *
  * SPDX-License-Identifier: MIT */
 #include "arch_qwen3.h"
+#include "backend.h"
+#include "forward_backend.h"
 #include "generate.h"
 #include "isa.h"
 #include "model.h"
@@ -42,6 +44,12 @@ static void usage(FILE *f) {
         "                [--raw] [--no-stream] [--quiet] [--ctx N] [--show-think]\n"
         "                [--tools tools.json] [--kv f32|bf16|fp8|q8|q4] [--fast]\n"
         "                [-t N | --threads N]   (default: performance cores)\n"
+        "                [--device cpu|cuda]\n"
+        "\n"
+        "  --device cuda runs the forward pass on the GPU (a `make cuda` build,\n"
+        "  KV bf16). It never falls back to the CPU: no build or no device is an\n"
+        "  error. cpu (the default) is the reference path; cpu-backend runs the\n"
+        "  CPU kernels through the device driver, for parity checks.\n"
         "\n"
         "  Reasoning NEVER reaches stdout: it is discarded, or written to stderr\n"
         "  with --show-think. stdout is the answer, so `| mynah-tts` is safe.\n"
@@ -346,6 +354,10 @@ static int cmd_ppl(const char *model_path, const char *path, int threads,
 typedef struct {
     const char *model, *prompt, *system, *tools_path;
     int   max_new, raw, stream, quiet, think, ctx, show_think, threads, fast;
+    /* 0 = the reference CPU path (default, arch_qwen3.c directly);
+     * otherwise the backend forward on this device. */
+    int   use_backend;
+    mynah_slm_device device;
     mynah_slm_kv_type kv_k, kv_v;
     mynah_slm_sampler_params sp;
 } run_opts;
@@ -378,6 +390,22 @@ static int cmd_run(run_opts *o) {
     tm.n_threads = mynah_slm_threads_init(o->threads);
 
     mynah_slm_timing_start(&tm);
+    /* An explicit device is a request, not a capability (engineering-method):
+     * a build without it, or a machine without one, is an error here, before
+     * the checkpoint is mapped — never a quiet run on the CPU. */
+    mynah_slm_backend *be = NULL;
+    if (o->use_backend) {
+        const char *dn = mynah_slm_device_name(o->device);
+        if (o->fast && o->device != MYNAH_SLM_DEVICE_CPU) {
+            fprintf(stderr, "mynah-slm: --fast is a CPU kernel option; it has no meaning "
+                            "with --device %s\n", dn);
+            return 1;
+        }
+        if (mynah_slm_backend_open(o->device, &be, err, sizeof err) != 0) {
+            fprintf(stderr, "mynah-slm: --device %s: %s\n", dn, err);
+            return 1;
+        }
+    }
     mynah_slm_model_t *m = mynah_slm_load(o->model, err, sizeof err);
     if (!m) { fprintf(stderr, "mynah-slm: %s\n", err); return 1; }
 
@@ -418,10 +446,32 @@ static int cmd_run(run_opts *o) {
     mynah_slm_tokenize(tok, text, 1, ids, (size_t)n_prompt);
 
     mynah_slm_state st;
+    memset(&st, 0, sizeof st);
     const uint32_t want_ctx = o->ctx > 0 ? (uint32_t)o->ctx
                                          : (uint32_t)(n_prompt + o->max_new + 8);
-    if (mynah_slm_state_init_kv(&st, m, want_ctx, o->kv_k, o->kv_v,
-                                err, sizeof err) != 0) {
+    /* The backend path: weights uploaded once, KV in backend memory, one
+     * host wait per token. Everything after this point is the same token
+     * loop (generate.c) either way. */
+    mynah_slm_bfwd *bf = NULL;
+    mynah_slm_bseq bq;
+    mynah_slm_bfwd_run brun;
+    memset(&bq, 0, sizeof bq);
+    memset(&brun, 0, sizeof brun);
+    if (be) {
+        const mynah_slm_bfwd_desc bd = { .ctx_cap = want_ctx, .batch_max = 0, .dec_max = 1,
+                                         .kv_k = o->kv_k, .kv_v = o->kv_v };
+        if (mynah_slm_bfwd_create(be, m, &bd, &bf, err, sizeof err) != 0 ||
+            mynah_slm_bseq_init(bf, &bq, want_ctx, err, sizeof err) != 0) {
+            fprintf(stderr, "mynah-slm: --device %s: %s\n",
+                    mynah_slm_device_name(o->device), err);
+            mynah_slm_bfwd_free(bf);
+            mynah_slm_backend_close(be);
+            return 1;
+        }
+        tm.device = o->device == MYNAH_SLM_DEVICE_CPU ? "cpu-backend"
+                                                      : mynah_slm_backend_name(be);
+    } else if (mynah_slm_state_init_kv(&st, m, want_ctx, o->kv_k, o->kv_v,
+                                       err, sizeof err) != 0) {
         fprintf(stderr, "mynah-slm: %s\n", err);
         return 1;
     }
@@ -466,7 +516,18 @@ static int cmd_run(run_opts *o) {
         gp.cb_tool_ctx = &calls;
     }
 
-    const long n = mynah_slm_generate(&st, tok, sam, &gp, &tm);
+    long n;
+    if (bf) {
+        brun.f = bf;
+        brun.q = &bq;
+        mynah_slm_gen_driver drv;
+        mynah_slm_bfwd_driver(&brun, &drv);
+        n = mynah_slm_generate_driver(&drv, tok, sam, &gp, &tm);
+        if (brun.err[0]) fprintf(stderr, "mynah-slm: --device %s: %s\n",
+                                 mynah_slm_device_name(o->device), brun.err);
+    } else {
+        n = mynah_slm_generate(&st, tok, sam, &gp, &tm);
+    }
     if (!o->stream && col.buf) fputs(col.buf, stdout);
     fputc('\n', stdout);
 
@@ -512,6 +573,9 @@ static int cmd_run(run_opts *o) {
     mynah_slm_tools_free(tools);
     mynah_slm_sampler_free(sam);
     mynah_slm_state_free(&st);
+    mynah_slm_bseq_free(bf, &bq);
+    mynah_slm_bfwd_free(bf);
+    mynah_slm_backend_close(be);
     mynah_slm_tokenizer_free(tok);
     mynah_slm_free(m);
     mynah_slm_threads_shutdown();
@@ -573,6 +637,16 @@ int main(int argc, char **argv) {
                 o.think = !strcmp(v, "on")  ? MYNAH_SLM_THINK_ON
                         : !strcmp(v, "low") ? MYNAH_SLM_THINK_LOW
                                             : MYNAH_SLM_THINK_OFF;
+            }
+            else if (!strcmp(a, "--device")) {
+                NEEDV();
+                if (!strcmp(v, "cpu")) o.use_backend = 0;
+                else if (!strcmp(v, "cuda")) { o.use_backend = 1; o.device = MYNAH_SLM_DEVICE_CUDA; }
+                else if (!strcmp(v, "cpu-backend")) { o.use_backend = 1; o.device = MYNAH_SLM_DEVICE_CPU; }
+                else {
+                    fprintf(stderr, "mynah-slm: --device takes cpu|cuda (or cpu-backend)\n");
+                    return 2;
+                }
             }
             else if (!strcmp(a, "--fast"))      o.fast = 1;
             else if (!strcmp(a, "--show-think")) o.show_think = 1;
