@@ -27,9 +27,22 @@
 
 /* ── ISA abstraction ───────────────────────────────────────────────────────
  * The scalar build is not a second algorithm: SG_L == 1 makes a "vector" one
- * float and the same loop nest runs. fmaf, not a*b+c, so a scalar lane rounds
- * exactly like a vector lane — that is what makes the edge kernels agree with
- * the full ones bit for bit. */
+ * float and the same loop nest runs. SG_FMA1, not a bare a*b+c, so a scalar
+ * lane rounds exactly like a vector lane — that is what makes the edge
+ * kernels agree with the full ones bit for bit.
+ *
+ * SG_FMA1 is a FUSED multiply-add wherever the hardware has one (every vector
+ * build here requires it) and an explicit unfused a*b+c where it does not: a
+ * baseline x86-64 build has no FMA instruction, and fmaf() there is a
+ * software routine ~30x slower than the AVX2 kernel (measured by review).
+ * Either way every path in ONE build uses the same macro, so the
+ * bit-identity claims hold per build. They never held across ISAs for NT:
+ * its horizontal-sum tree depends on the vector width. */
+#if defined(__FMA__) || defined(__aarch64__) || defined(__ARM_FEATURE_FMA)
+#define SG_FMA1(a, b, c) fmaf((a), (b), (c))
+#else
+#define SG_FMA1(a, b, c) ((a) * (b) + (c))
+#endif
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
 #define SG_ISA "neon"
@@ -50,7 +63,7 @@ static inline float sg_hsum(sg_v v) {
     return vget_lane_f32(s, 0) + vget_lane_f32(s, 1);
 }
 
-#elif defined(__AVX512F__)
+#elif defined(__AVX512F__) && defined(__AVX512DQ__)   /* DQ: _mm512_extractf32x8_ps */
 #include <immintrin.h>
 #define SG_ISA "avx512"
 #define SG_L 16
@@ -100,7 +113,7 @@ typedef float sg_v;
 #define sg_load(p)       (*(p))
 #define sg_store(p, v)   (*(p) = (v))
 #define sg_dup(x)        (x)
-#define sg_fma(acc, a, b) fmaf((a), (b), (acc))
+#define sg_fma(acc, a, b) SG_FMA1((a), (b), (acc))
 #define SG_NT_MR 4
 #define SG_NT_NR 2
 #define SG_NN_NV 4
@@ -154,9 +167,13 @@ void mynah_slm_sgemm_reference(int trans_b, size_t m, size_t n, size_t k,
 }
 
 /* ── store, shared by both families ────────────────────────────────────────
- * beta == 0 never reads C. */
+ * beta == 0 never reads C. With beta != 0 the rounding is spelled out:
+ * written as alpha*v + beta*c, a compiler allowed to contract (gnu11,
+ * -ffp-contract=fast, clang's defaults on some targets) fused it in two
+ * different ways in two instantiations of the same store, and elements
+ * stopped being tiling-invariant — 814 of 2775 in the review's repro. */
 static inline void sg_put(float *cp, float v, float alpha, float beta) {
-    *cp = (beta == 0.0f) ? alpha * v : alpha * v + beta * *cp;
+    *cp = (beta == 0.0f) ? alpha * v : SG_FMA1(beta, *cp, alpha * v);
 }
 
 /* ── NT: C[i][j] = A[i][:] . B[j][:] ───────────────────────────────────────
@@ -185,7 +202,7 @@ static inline void sg_put(float *cp, float v, float alpha, float beta) {
                 float s = sg_hsum(acc[r][q]);                                   \
                 float t = 0.0f;                                                 \
                 for (size_t pp = p; pp < k; pp++)                               \
-                    t = fmaf(a[r * lda + pp], b[q * ldb + pp], t);              \
+                    t = SG_FMA1(a[r * lda + pp], b[q * ldb + pp], t);          \
                 sg_put(c + r * ldc + q, s + t, alpha, beta);                    \
             }                                                                   \
     }
@@ -237,7 +254,7 @@ static void sg_nn_tail(size_t rows, size_t cols, size_t k, const float *a,
     for (size_t r = 0; r < rows; r++)
         for (size_t j = 0; j < cols; j++) {
             float s = resume ? c[r * ldc + j] : 0.0f;
-            for (size_t p = 0; p < k; p++) s = fmaf(a[r * lda + p], b[p * ldb + j], s);
+            for (size_t p = 0; p < k; p++) s = SG_FMA1(a[r * lda + p], b[p * ldb + j], s);
             if (finish) sg_put(c + r * ldc + j, s, alpha, beta);
             else        c[r * ldc + j] = s;
         }

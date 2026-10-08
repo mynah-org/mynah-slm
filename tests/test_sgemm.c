@@ -136,26 +136,31 @@ static void run_case(const shape *s, float alpha, float beta) {
 /* An element must not depend on where in the matrix it sits: compute a
  * 1x1 problem on its own and compare it with the same row/column inside a
  * large, multi-tile, multi-thread problem. */
-static void tile_invariance(int tb, size_t m, size_t n, size_t k) {
-    float *a = alloc_fill(m * k), *b = alloc_fill(n * k), *c = malloc(m * n * sizeof *c);
+static void tile_invariance(int tb, size_t m, size_t n, size_t k, float beta) {
+    /* alpha and beta both non-trivial: with beta != 0 the store reads C and
+     * its rounding is part of what must not depend on the tile. */
+    const float alpha = 0.3f;
+    float *a = alloc_fill(m * k), *b = alloc_fill(n * k), *c0 = alloc_fill(m * n);
+    float *c = malloc(m * n * sizeof *c);
+    memcpy(c, c0, m * n * sizeof *c);
     mynah_slm_threads_init(4);
-    mynah_slm_sgemm_own(tb, m, n, k, 1.0f, a, k, b, tb ? k : n, 0.0f, c, n);
+    mynah_slm_sgemm_own(tb, m, n, k, alpha, a, k, b, tb ? k : n, beta, c, n);
     int same = 1;
     for (size_t i = 0; i < m; i++)
         for (size_t j = 0; j < n; j++) {
-            float one;
-            if (tb) mynah_slm_sgemm_own(1, 1, 1, k, 1.0f, a + i * k, k, b + j * k, k, 0.0f, &one, 1);
+            float one = c0[i * n + j];
+            if (tb) mynah_slm_sgemm_own(1, 1, 1, k, alpha, a + i * k, k, b + j * k, k, beta, &one, 1);
             else {
                 /* op(B) column j as a 1-wide B: stride n picks it out. */
-                mynah_slm_sgemm_own(0, 1, 1, k, 1.0f, a + i * k, k, b + j, n, 0.0f, &one, 1);
+                mynah_slm_sgemm_own(0, 1, 1, k, alpha, a + i * k, k, b + j, n, beta, &one, 1);
             }
             if (memcmp(&one, &c[i * n + j], sizeof one) != 0) same = 0;
         }
     char what[128];
-    snprintf(what, sizeof what, "%s %zux%zux%zu: element == same element computed alone",
-             tb ? "NT" : "NN", m, n, k);
+    snprintf(what, sizeof what, "%s %zux%zux%zu beta=%.1f: element == same element computed alone",
+             tb ? "NT" : "NN", m, n, k, beta);
     check(what, same, "an element's value depends on its tile");
-    free(a); free(b); free(c);
+    free(a); free(b); free(c); free(c0);
 }
 
 /* The NN k-block parks a raw f32 partial in C. With beta == 0 the blocked
@@ -289,10 +294,12 @@ int main(int argc, char **argv) {
         run_case(&SHAPES[i], 1.0f, 0.0f);
         run_case(&SHAPES[i], 0.5f, 0.75f);
     }
-    tile_invariance(1, 23, 37, 131);
-    tile_invariance(0, 23, 37, 131);
-    tile_invariance(1, 50, 9, 3072);     /* several NT row chunks */
-    tile_invariance(0, 9, 70, 1000);     /* several NN k-blocks, ragged last */
+    tile_invariance(1, 23, 37, 131, 0.0f);
+    tile_invariance(0, 23, 37, 131, 0.0f);
+    tile_invariance(1, 37, 75, 131, 0.7f);   /* beta != 0: the store's rounding */
+    tile_invariance(0, 37, 75, 131, 0.7f);
+    tile_invariance(1, 50, 9, 3072, 0.0f);   /* several NT row chunks */
+    tile_invariance(0, 9, 70, 1000, 0.0f);   /* several NN k-blocks, ragged last */
     kblock_exact();
 
     float dummy = 0.0f;
