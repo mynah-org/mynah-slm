@@ -65,6 +65,29 @@ static void test_probe(void) {
     if (det == MYNAH_SLM_KERN_ID_AVX512VNNI) ok &= c->avx512vnni;
     if (det == MYNAH_SLM_KERN_ID_NEON_DOTPROD) ok &= c->arm64 && c->dotprod;
     check("the detected level is backed by the probed CPU flags", ok, d);
+
+    /* Never below what the binary was compiled for (review R6): the code
+     * around the kernels already uses those instructions. */
+    const int base = mynah_slm_isa_baseline();
+    int want_base = MYNAH_SLM_KERN_ID_SCALAR;
+#if defined(__x86_64__) && defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    want_base = MYNAH_SLM_KERN_ID_AVX2;
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+    want_base = MYNAH_SLM_KERN_ID_AVX512;
+#if defined(__AVX512VNNI__)
+    want_base = MYNAH_SLM_KERN_ID_AVX512VNNI;
+#endif
+#endif
+#elif defined(__aarch64__)
+    want_base = MYNAH_SLM_KERN_ID_NEON;
+#if defined(__ARM_FEATURE_DOTPROD)
+    want_base = MYNAH_SLM_KERN_ID_NEON_DOTPROD;
+#endif
+#endif
+    snprintf(d, sizeof d, "baseline %s, detected %s", mynah_slm_isa_level_name(base),
+             mynah_slm_isa_level_name(det));
+    check("the build baseline matches the compiler's macros and detection is never below it",
+          base == want_base && rank_of(det) >= rank_of(base), d);
 #if defined(__x86_64__)
     check("x86 never detects an arm level", c->x86 && !c->arm64 &&
           det != MYNAH_SLM_KERN_ID_NEON && det != MYNAH_SLM_KERN_ID_NEON_DOTPROD, d);

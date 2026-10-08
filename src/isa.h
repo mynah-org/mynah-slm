@@ -33,7 +33,9 @@ typedef struct {
 const mynah_slm_cpu *mynah_slm_cpu_caps(void);
 
 /* Level ids are kern.h's MYNAH_SLM_KERN_ID_*. */
-int         mynah_slm_isa_detected(void);   /* the highest level the CPU runs */
+int         mynah_slm_isa_detected(void);   /* the highest level the CPU runs: */
+                                            /* max(CPU probe, build baseline)  */
+int         mynah_slm_isa_baseline(void);   /* the level -march / -mcpu implies */
 int         mynah_slm_isa_ceiling(void);    /* after MYNAH_SLM_ISA */
 const char *mynah_slm_isa_level_name(int id);
 

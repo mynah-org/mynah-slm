@@ -112,27 +112,65 @@ static void probe(void) {
     g_cpu.i8mm    = sysctl_flag("hw.optional.arm.FEAT_I8MM");
     g_cpu.bf16    = sysctl_flag("hw.optional.arm.FEAT_BF16");
 #elif defined(__linux__)
+    /* The bits are kernel ABI (arch/arm64/include/uapi/asm/hwcap.h) and do
+     * not change; an older libc's <sys/auxv.h> just does not name them, and
+     * leaving the probe out then would read "no dotprod" on every CPU. */
+#if !defined(AT_HWCAP2)
+#define AT_HWCAP2 26
+#endif
+#if !defined(HWCAP_ASIMDDP)
+#define HWCAP_ASIMDDP (1UL << 20)
+#endif
+#if !defined(HWCAP_SVE)
+#define HWCAP_SVE (1UL << 22)
+#endif
+#if !defined(HWCAP2_I8MM)
+#define HWCAP2_I8MM (1UL << 13)
+#endif
+#if !defined(HWCAP2_BF16)
+#define HWCAP2_BF16 (1UL << 14)
+#endif
     const unsigned long hw = getauxval(AT_HWCAP), hw2 = getauxval(AT_HWCAP2);
-#if defined(HWCAP_ASIMDDP)
     g_cpu.dotprod = (hw & HWCAP_ASIMDDP) != 0;
-#endif
-#if defined(HWCAP_SVE)
-    g_cpu.sve = (hw & HWCAP_SVE) != 0;
-#endif
-#if defined(HWCAP2_I8MM)
-    g_cpu.i8mm = (hw2 & HWCAP2_I8MM) != 0;
-#endif
-#if defined(HWCAP2_BF16)
-    g_cpu.bf16 = (hw2 & HWCAP2_BF16) != 0;
-#endif
-    (void)hw; (void)hw2;
+    g_cpu.sve     = (hw & HWCAP_SVE) != 0;
+    g_cpu.i8mm    = (hw2 & HWCAP2_I8MM) != 0;
+    g_cpu.bf16    = (hw2 & HWCAP2_BF16) != 0;
 #endif
 #endif
 }
 
 /* ── levels ────────────────────────────────────────────────────────────────*/
 
-static int detect_level(void) {
+/* The level this BINARY was compiled for. Every instruction it allows is
+ * already in non-kernel code (the compiler used it wherever it liked), so a
+ * process that got this far is running on a CPU that executes it, whatever
+ * the probe says. And probes do under-report: Rosetta executes AVX2 but does
+ * not advertise it in CPUID, a hypervisor can hide XSAVE, an old libc lacks a
+ * HWCAP name. Never below the baseline, then — it cannot be less safe than
+ * the code around it. */
+int mynah_slm_isa_baseline(void) {
+#if defined(ISA_X86) && defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+#if defined(__AVX512VNNI__)
+    return MYNAH_SLM_KERN_ID_AVX512VNNI;
+#else
+    return MYNAH_SLM_KERN_ID_AVX512;
+#endif
+#else
+    return MYNAH_SLM_KERN_ID_AVX2;
+#endif
+#elif defined(ISA_ARM64)
+#if defined(__ARM_FEATURE_DOTPROD)
+    return MYNAH_SLM_KERN_ID_NEON_DOTPROD;
+#else
+    return MYNAH_SLM_KERN_ID_NEON;
+#endif
+#else
+    return MYNAH_SLM_KERN_ID_SCALAR;
+#endif
+}
+
+static int probe_level(void) {
 #if defined(ISA_X86)
     const mynah_slm_cpu *c = &g_cpu;
     if (!(c->avx2 && c->fma && c->f16c)) return MYNAH_SLM_KERN_ID_SCALAR;
@@ -144,6 +182,27 @@ static int detect_level(void) {
 #else
     return MYNAH_SLM_KERN_ID_SCALAR;
 #endif
+}
+
+static int rank(int id);
+static int g_probed = MYNAH_SLM_KERN_ID_SCALAR;   /* before the baseline raise */
+
+/* max(probe, baseline). When the baseline wins, the flags it implies are set
+ * too, so the report and every consumer of mynah_slm_cpu_caps() agree with
+ * the level, and --dispatch says it was raised. */
+static int detect_level(void) {
+    g_probed = probe_level();
+    const int base = mynah_slm_isa_baseline();
+    if (rank(base) <= rank(g_probed)) return g_probed;
+#if defined(ISA_X86)
+    g_cpu.avx2 = g_cpu.fma = g_cpu.f16c = 1;
+    if (base == MYNAH_SLM_KERN_ID_AVX512 || base == MYNAH_SLM_KERN_ID_AVX512VNNI)
+        g_cpu.avx512f = g_cpu.avx512bw = g_cpu.avx512vl = g_cpu.avx512dq = 1;
+    if (base == MYNAH_SLM_KERN_ID_AVX512VNNI) g_cpu.avx512vnni = 1;
+#elif defined(ISA_ARM64)
+    if (base == MYNAH_SLM_KERN_ID_NEON_DOTPROD) g_cpu.dotprod = 1;
+#endif
+    return base;
 }
 
 /* Position on this architecture's ladder; -1 = not a level here. */
@@ -387,6 +446,9 @@ int mynah_slm_isa_report(FILE *f) {
             mynah_slm_isa_level_name(g_ceiling));
     if (g_env_bad)     { fprintf(f, "  <- UNKNOWN on this architecture: fell back to SCALAR"); bad = 1; }
     if (g_env_clamped) { fprintf(f, "  <- REQUEST ABOVE THE CPU, clamped down"); bad = 1; }
+    if (g_probed != g_detected)
+        fprintf(f, "  (the CPU probe said %s; raised to this binary's compile-time baseline)",
+                mynah_slm_isa_level_name(g_probed));
     fprintf(f, "\n");
 
     const char *qn[N_OF(qmat_tables)], *an[N_OF(attn_tables)], *sn[N_OF(sgemm_tables)];
