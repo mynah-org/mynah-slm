@@ -52,3 +52,4 @@ same way.
 | [int8-q8_0-q6_k.md](int8-q8_0-q6_k.md) | K4 — int8-activation matvec for Q8_0 and Q6_K under `--fast`, the per-type decision and its numbers |
 | [bf16-native-matvec.md](bf16-native-matvec.md) | K6 — native BF16/F16 weight matvec: rejected, ingot is already at the read roof on the head and no shipped format has 2-byte weights |
 | [isa-runtime-dispatch.md](isa-runtime-dispatch.md) | K5 — runtime ISA dispatch for our kernels (per-ISA translation units, narrowing env, verify-on-first-use, `--dispatch`) so a portable binary is a fast one |
+| [serving-continuous-batching.md](serving-continuous-batching.md) | S1 — continuous batching: scheduler thread, per-request state, batched decode, slots behind `--slots` |

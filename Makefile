@@ -196,7 +196,13 @@ build/server/%.o: server/%.c $(HDR) $(wildcard server/*.h)
 	$(CC) $(CFLAGS) -iquote server -c $< -o $@
 
 # objects in build/ (never next to the sources: the variant builds — ubsan,
-# asan — must not pollute the normal one)
+# asan — must not pollute the normal one). Test objects also depend on the
+# test-side headers (tests/fixture_model.h); listed first so make 3.81, which
+# takes the first matching pattern, picks it for them.
+build/tests/%.o: tests/%.c $(HDR) $(wildcard tests/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 build/%.o: %.c $(HDR)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -225,7 +231,7 @@ $(OBJ): | $(INGOT_LIB)
 # test_ingot needs no model: it pins the container-layer contract (block
 # geometry, dequant coverage) so a bad subtree update fails here and not
 # three modules later.
-TESTS := tests/test_backend tests/test_batch tests/test_ingot tests/test_sgemm tests/test_threads tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer tests/test_tools tests/test_isa
+TESTS := tests/test_backend tests/test_batch tests/test_ingot tests/test_sgemm tests/test_threads tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer tests/test_tools tests/test_isa tests/test_synth
 
 # The parity harness is built like the others but driven separately: it dumps
 # activations, and tools/eval/compare.py is what judges them.
@@ -234,7 +240,10 @@ GOLDEN_DIR := tests/golden/it_hello
 DUMP_DIR   := build/dump/it_hello
 PROMPT     ?= Ciao! Come stai?
 
-tests/%: build/tests/%.o build/tests/npy.o $(OBJ) $(INGOT_LIB)
+# fixture_model.o is the synthetic checkpoint writer (tests/fixture_model.h):
+# linked into every test so any of them can build a model with no download.
+TEST_SUPPORT := build/tests/npy.o build/tests/fixture_model.o
+tests/%: build/tests/%.o $(TEST_SUPPORT) $(OBJ) $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
 test: $(TESTS) mynah-slm
