@@ -324,6 +324,79 @@ Reading it, with the control that would embarrass the explanation:
   the cheap hypothesis; the per-arm minimum-of-3 should have absorbed most of
   it. Re-measure on an idle host before reading anything into it.
 
+### S1-z — no zombie work: a client that leaves stops costing CPU
+
+Added to the queue by the user mid-task, done before the scheduler so that
+S1-d is built on it. Port of mynah-tts `sink_cancelled` (polled once per step,
+`stream_out_peer_gone`), its 5 s send timeout, and "backpressure is
+cancellation, never a blocking write".
+
+**Audit of the serialized server before this change** (from the coordinator,
+confirmed by reading `server/main.c` / `server/http.c` at `2f9977b`):
+
+| # | defect | consequence |
+|---|---|---|
+| 1 | a disconnect was noticed only when a token was WRITTEN (`answer_cb` → `http_write` fails) | never during a prefill (~10 s at 2275 tokens), never on the thinking channel (discarded, never written), never while a tool call accumulates, never in non-streaming mode: generation ran to max_tokens holding the model while every other client waited |
+| 2 | a client that left while QUEUED on `infer_mu` still got its whole generation | pure waste, in front of live clients |
+| 3 | no `SO_SNDTIMEO` | a client that stops reading without closing fills the TCP window; `send()` blocks forever inside the lock: the whole server stalls |
+| 4 | an unbounded detached thread per connection, no refusal | overload parks clients invisibly |
+
+**Fix.**
+
+- `http_peer_gone` / `http_fd_peer_gone`: one `poll(2)` with zero timeout
+  (`POLLIN | POLLRDHUP` on Linux), and a one-byte `MSG_PEEK | MSG_DONTWAIT`
+  when readable — EOF is gone, a pipelined byte is not. Sticky, and set too by
+  a failed or timed-out send. ~1 µs; asked once per step, so free against a
+  10-60 ms step.
+- `mynah_slm_gen_params.cancel`: polled before every prefill batch and every
+  decode step, on every channel; stop = `CANCELLED`, `timing.cancelled = 1`
+  (the CLI summary line says `CANCELLED`). generate() returns the tokens it
+  made. Granularity: one decode step, or one prefill batch (≤ `batch_max`,
+  256 tokens by default).
+- The serialization point is a gate (flag + condvar), not a bare mutex: a
+  queued request wakes every 20 ms, probes its client and leaves without
+  running; probed again once inside. The model is released at the step
+  boundary, the state freed, a log line written
+  (`[chatcmpl-N cancelled: client gone during decode|prefill, K tokens
+  generated of max_tokens M, prompt P]`), nothing sent.
+- Every accepted socket: `TCP_NODELAY` (was already set), `SO_SNDTIMEO` 5 s
+  (`--send-timeout-ms`), `SO_RCVTIMEO` 30 s while the request is read,
+  `MSG_NOSIGNAL`.
+- `--max-conns N` (default 64): one more connection gets
+  `503 + Retry-After: 1` at accept — request bytes drained without waiting,
+  then `shutdown(SHUT_WR)`, so the client reads the 503 rather than a reset
+  (the hole tts names in its own fail-fast path).
+- `/health`: `running`, `waiting`, `connections`, `rejected`, `cancelled`
+  (= `cancelled_queued` + `cancelled_running`).
+
+**Evidence (cloud x86, contended; model-free)**
+
+| check | result |
+|---|---|
+| `tests/test_http` (loopback TCP): idle alive; pipelined byte alive and not consumed; FIN gone after 1 probe; RST gone; fd -1 gone | PASS |
+| `tests/test_synth`: cancel hook fired on its first call (the prompt's only batch) → 0 tokens, `n_past` 0; fired before decode step 5 → exactly 4 tokens, `n_past` = prompt-1+4, `timing.cancelled` 1 | PASS, both fixtures |
+| `tests/test_server_cancel.sh` (`make test-server-cancel`) on the "slow" fixture (4 wide layers, noise, 8.5 ms/token here, so 8000 tokens ≈ 68 s): next request after a non-stream / stream / mid-prompt disconnect | 0.24 / 0.28 / 0.46 s (a 4-token request alone: 0.23 s) |
+| ... a client that left while queued | never run (`cancelled_queued` 1) |
+| ... CPU 1.3 s after the last client left (`/proc/pid/stat`) | 0 ticks in 1 s |
+| ... `/health` `cancelled`, log lines for decode and prefill | 6; present |
+| ... 4th connection with `--max-conns 3` | `503`, `Retry-After`, `rejected` 1 |
+| CONTROL: the same script against the pre-fix server (`2f9977b`, `CAP_ARGS=""`) | **all 11 checks FAIL**: the next request after each disconnect waited past curl's 60 s cap (the abandoned 8000-token generation runs ~115 s); the server burned 362 ticks/s (3.6 of 4 cores) with every client gone; no 503 at the cap |
+
+**Downstream** (validation matrix): with a real checkpoint, LOCAL weights,
+`make test-server` (its new case: a 2000-token request abandoned after 1 s,
+stream and non-stream, then an 8-token request within 3x its solo time + 2 s,
+`/health` `cancelled` ≥ 2) and `make test-server-cancel MODEL=...`
+(`bash tests/test_server_cancel.sh <model>`). By hand:
+`curl --max-time 1 ... max_tokens 4000` against a long generation, then
+`pidstat -p $(pgrep mynah-slm-server) 1` — CPU at idle within one step — and
+a second request's `ttft_ms` equal to its value on an idle server.
+
+**Not covered**: the hybrid short-conv path (same hook, no fixture); a client
+that half-closes its write side but keeps reading (POLLRDHUP calls it gone —
+HTTP/1.1 clients do not do that, and tts made the same call); prefill
+cancellation granularity is one batch, so a 256-token batch on a large model
+can still run ~1 s after the client left.
+
 ## Conclusion
 
 (open)

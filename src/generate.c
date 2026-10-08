@@ -41,7 +41,7 @@ size_t mynah_slm_gen_prefill_left(const mynah_slm_gen *g) {
 
 int mynah_slm_gen_prefill(mynah_slm_gen *g, mynah_slm_state *ws, mynah_slm_seq *q,
                           uint32_t budget) {
-    if (g->stop == MYNAH_SLM_STOP_ERROR) return -1;
+    if (g->stop == MYNAH_SLM_STOP_ERROR || g->stop == MYNAH_SLM_STOP_CANCELLED) return -1;
     if (g->decoding) return 1;
 
     /* Every prompt token but the last only needs to populate the KV cache, so
@@ -54,6 +54,9 @@ int mynah_slm_gen_prefill(mynah_slm_gen *g, mynah_slm_state *ws, mynah_slm_seq *
     const uint32_t bmax = mynah_slm_batch_max(ws);
     size_t left = budget ? budget : n_pre;
     while (g->prefilled < n_pre && left > 0) {
+        /* Before every batch: a prompt of thousands of tokens is seconds of
+         * work, and the client may already have left. */
+        if (mynah_slm_gen_check_cancel(g)) return -1;
         size_t take = n_pre - g->prefilled;
         if (take > bmax) take = bmax;
         if (take > left) take = left;
@@ -87,6 +90,15 @@ int mynah_slm_gen_wants_step(const mynah_slm_gen *g) {
 }
 
 uint32_t mynah_slm_gen_next_token(const mynah_slm_gen *g) { return g->next; }
+
+int mynah_slm_gen_check_cancel(mynah_slm_gen *g) {
+    if (g->stop == MYNAH_SLM_STOP_CANCELLED) return 1;
+    if (!g->p.cancel || g->stop != MYNAH_SLM_STOP_NONE) return 0;
+    if (!g->p.cancel(g->p.cancel_ctx)) return 0;
+    g->stop = MYNAH_SLM_STOP_CANCELLED;
+    if (g->t) g->t->cancelled = 1;
+    return 1;
+}
 
 void mynah_slm_gen_fail(mynah_slm_gen *g) {
     if (g->stop == MYNAH_SLM_STOP_NONE) g->stop = MYNAH_SLM_STOP_ERROR;
@@ -168,9 +180,17 @@ long mynah_slm_generate(mynah_slm_state *st, const mynah_slm_tokenizer *tok,
 
     mynah_slm_gen g;
     if (mynah_slm_gen_start(&g, tok, sam, p, t) != 0) return -1;
-    if (mynah_slm_gen_prefill(&g, st, &st->own, 0) != 1) return -1;
+    if (mynah_slm_gen_prefill(&g, st, &st->own, 0) != 1) {
+        if (g.stop != MYNAH_SLM_STOP_CANCELLED) return -1;
+        mynah_slm_gen_finish(&g);
+        return 0;                    /* cancelled during the prompt: nothing generated */
+    }
 
     while (mynah_slm_gen_wants_step(&g)) {
+        /* Before every step, whatever channel is open: thinking and tool
+         * tokens are never written, so a write failure cannot be the only
+         * way to notice the client left. */
+        if (mynah_slm_gen_check_cancel(&g)) break;
         if (mynah_slm_seq_forward(st, &st->own, mynah_slm_gen_next_token(&g),
                                   st->logits) != 0) {
             mynah_slm_gen_fail(&g);

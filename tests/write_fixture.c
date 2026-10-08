@@ -2,7 +2,7 @@
  * checkpoints to a path, for scripts and benches that want a model file and
  * cannot download one.
  *
- *   write_fixture <tiny|tiny-f32|06b> <out.gguf>
+ *   write_fixture <tiny|tiny-f32|slow|06b> <out.gguf>
  *
  * Noise for weights: these files exercise the engine, never the quality.
  *
@@ -14,12 +14,13 @@
 
 int main(int argc, char **argv) {
     if (argc != 3) {
-        fprintf(stderr, "usage: write_fixture <tiny|tiny-f32|06b> <out.gguf>\n");
+        fprintf(stderr, "usage: write_fixture <tiny|tiny-f32|slow|06b> <out.gguf>\n");
         return 2;
     }
     fixture_spec s;
     if      (!strcmp(argv[1], "tiny"))     fixture_spec_tiny(&s, 1);
     else if (!strcmp(argv[1], "tiny-f32")) fixture_spec_tiny(&s, 0);
+    else if (!strcmp(argv[1], "slow"))     fixture_spec_slow(&s);
     else if (!strcmp(argv[1], "06b"))      fixture_spec_06b_shape(&s);
     else { fprintf(stderr, "write_fixture: unknown spec '%s'\n", argv[1]); return 2; }
 

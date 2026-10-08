@@ -35,6 +35,13 @@ typedef struct {
  * a Q4_K row cannot run our own Q4_K matvec. */
 void fixture_spec_tiny(fixture_spec *s, int quant);
 
+/* Slow enough to cancel: 0.6B-wide layers (1024/3072, 8 query / 4 KV heads of
+ * 128) but only 4 of them, the ~280-token vocabulary, 8192 positions. A few
+ * ms per token on a laptop, so an 8000-token generation is tens of seconds —
+ * long enough that a request that keeps running after its client left is
+ * unmistakable — and ~25 MB, written in seconds. tests/test_server_cancel.sh. */
+void fixture_spec_slow(fixture_spec *s);
+
 /* The 0.6B GEOMETRY (28 layers, 1024/3072, 16/8 heads of 128, 151936 rows)
  * with noise for weights. ~400 MB at quant=1 and slow to write: for a bench
  * that needs real tensor shapes, never for `make test`. */

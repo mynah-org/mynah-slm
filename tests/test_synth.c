@@ -87,6 +87,13 @@ static int collect_cb(void *ctx, uint32_t id, const char *text, size_t len) {
 
 #define GEN_MAX 24
 
+typedef struct { int calls, fire_at; } cancel_probe;
+
+static int cancel_at(void *ctx) {
+    cancel_probe *p = ctx;
+    return ++p->calls >= p->fire_at;
+}
+
 /* The definition generate() has to agree with: forward one token at a time,
  * argmax, stop on EOS. No sampler, no channels, no batching. */
 static size_t greedy_ref(mynah_slm_state *st, const uint32_t *prompt, size_t n_prompt,
@@ -149,6 +156,37 @@ static void check_generate(mynah_slm_model_t *m, mynah_slm_tokenizer *tok) {
     printf("     %s\n", detail);
     check("generate() reports its decode timing", tm.n_gen == (uint32_t)produced &&
           tm.n_prompt == (uint32_t)n_prompt, "timing counters disagree");
+
+    /* Cancellation: the hook is asked before every prefill batch and every
+     * decode step, and the generation stops exactly there. Fired on its first
+     * call (the prompt's only batch), nothing is computed at all; call 1 + k is
+     * asked before decode step k, so firing there leaves k - 1 tokens. */
+    for (int fire_at = 1; fire_at <= 6; fire_at += 5) {
+        cancel_probe cp = { 0, fire_at };
+        collect c2;
+        memset(&c2, 0, sizeof c2);
+        mynah_slm_gen_params g2 = gp;
+        g2.cb_ctx = &c2;
+        g2.cancel = cancel_at;
+        g2.cancel_ctx = &cp;
+        mynah_slm_sampler *s3 = mynah_slm_sampler_new(&sp, vocab);
+        mynah_slm_timing t2;
+        mynah_slm_timing_reset(&t2);
+        mynah_slm_timing_start(&t2);
+        reset_poisoned(&st);
+        const long n = mynah_slm_generate(&st, tok, s3, &g2, &t2);
+        const long want = fire_at == 1 ? 0 : fire_at - 2;
+        const uint32_t want_past = fire_at == 1 ? 0 : (uint32_t)n_prompt - 1 + (uint32_t)want;
+        snprintf(detail, sizeof detail, "fired at call %d: %ld tokens (want %ld), n_past %u "
+                 "(want %u), cancelled flag %d, hook asked %d times",
+                 fire_at, n, want, st.own.n_past, want_past, t2.cancelled, cp.calls);
+        check(fire_at == 1 ? "a cancel during the prompt computes nothing"
+                           : "a cancel mid-decode stops at that step boundary",
+              n == want && st.own.n_past == want_past && t2.cancelled == 1 &&
+              cp.calls == fire_at, detail);
+        printf("     %s\n", detail);
+        mynah_slm_sampler_free(s3);
+    }
 
     /* The same generation driven by hand the way a scheduler drives it: a
      * workspace with no sequence of its own, a separate sequence, the prompt

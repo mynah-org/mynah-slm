@@ -198,6 +198,33 @@ F=$(curl -s -X POST "localhost:$PORT/v1/tokenize" \
 [ "${F:-0}" -gt 8 ] && ok "tokenize keeps control look-alikes as text ($F ids)" \
     || bad "tokenize keeps control look-alikes as text" "only $F ids — it parsed them as control"
 
+# ── no zombie work: a client that leaves stops costing CPU ───────────────────
+# A 2000-token generation is a minute of decode on a 0.6B. If the server kept
+# computing for a client that left, the request right behind it would wait
+# that long; with the per-step peer-gone probe it waits one step. Both shapes,
+# because non-streaming writes nothing until the end and so never notices a
+# disconnect through a failed write. (Model-free twin, with more cases:
+# tests/test_server_cancel.sh.)
+now() { python3 -c 'import time; print(time.time())'; }
+T=$(now); chat 8 '"ok"' >/dev/null; SHORT=$(python3 -c "print($(now) - $T)")
+LIMIT=$(python3 -c "print(round($SHORT * 3 + 2.0, 2))")
+LONGQ='{"messages":[{"role":"user","content":"Scrivi una storia lunghissima."}],"max_tokens":2000,"temperature":0'
+curl -s --max-time 1 -o /dev/null -X POST "localhost:$PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' -d "$LONGQ}"
+T=$(now); chat 8 '"ok"' >/dev/null; D=$(python3 -c "print(round($(now) - $T, 2))")
+python3 -c "import sys; sys.exit(0 if $D < $LIMIT else 1)" \
+    && ok "a non-stream client that left does not delay the next request (${D}s)" \
+    || bad "a non-stream client that left does not delay the next request" "${D}s vs ${LIMIT}s"
+curl -sN --max-time 1 -o /dev/null -X POST "localhost:$PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' -d "$LONGQ,\"stream\":true}"
+T=$(now); chat 8 '"ok"' >/dev/null; D=$(python3 -c "print(round($(now) - $T, 2))")
+python3 -c "import sys; sys.exit(0 if $D < $LIMIT else 1)" \
+    && ok "a streaming client that left does not delay the next request (${D}s)" \
+    || bad "a streaming client that left does not delay the next request" "${D}s vs ${LIMIT}s"
+CAN=$(curl -s "localhost:$PORT/health" | field "['cancelled']")
+[ "${CAN:-0}" -ge 2 ] && ok "/health counts both cancellations ($CAN)" \
+    || bad "/health counts both cancellations" "$CAN"
+
 echo
 [ $fail -eq 0 ] && echo "PASS" || echo "FAILED ($fail)"
 exit $fail

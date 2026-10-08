@@ -21,6 +21,9 @@ typedef struct {
     uint32_t n_prompt;
     uint32_t n_gen;
     int      n_threads;
+    /* Stopped because nobody wanted the rest (generate.h cancel hook); n_gen
+     * then says after how many tokens. */
+    int      cancelled;
 
     /* internal marks */
     double t0_;

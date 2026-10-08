@@ -1,12 +1,17 @@
 /* http.c — see http.h.
  * SPDX-License-Identifier: MIT */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE          /* POLLRDHUP on glibc */
+#endif
 #include "http.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,23 +21,73 @@
 #define MAX_BODY (4u * 1024u * 1024u)
 
 struct http_conn {
-    int  fd;
-    int  dead;
+    int        fd;
+    /* Set by a failed or timed-out send, or by the probe. Atomic because the
+     * probe may run on a thread that is not the writer's. */
+    atomic_int dead;
 };
 
+static atomic_int   g_live;
+static atomic_ulong g_rejected;
+
+int           http_live_connections(void)     { return atomic_load(&g_live); }
+unsigned long http_rejected_connections(void) { return atomic_load(&g_rejected); }
+
 int http_write(http_conn *c, const char *data, size_t len) {
-    if (c->dead) return -1;
+    if (atomic_load(&c->dead)) return -1;
     while (len > 0) {
+        /* MSG_NOSIGNAL where it exists; SIGPIPE is ignored process-wide too. */
+#ifdef MSG_NOSIGNAL
+        const ssize_t n = send(c->fd, data, len, MSG_NOSIGNAL);
+#else
         const ssize_t n = send(c->fd, data, len, 0);
+#endif
         if (n <= 0) {
-            if (errno == EINTR) continue;
-            c->dead = 1;          /* peer gone: tell the caller once, stay quiet after */
+            if (n < 0 && errno == EINTR) continue;
+            /* Peer gone, or SO_SNDTIMEO expired on a client that stopped
+             * reading: either way nobody is receiving. Tell the caller once,
+             * stay quiet after. */
+            atomic_store(&c->dead, 1);
             return -1;
         }
         data += n;
         len  -= (size_t)n;
     }
     return 0;
+}
+
+int http_fd_peer_gone(int fd) {
+    if (fd < 0) return 1;
+    struct pollfd p;
+    p.fd = fd;
+    p.events = POLLIN;
+#ifdef POLLRDHUP
+    p.events |= POLLRDHUP;        /* Linux: the peer's close, without a read */
+#endif
+    p.revents = 0;
+    const int ready = poll(&p, 1, 0);       /* zero timeout: never blocks */
+    if (ready < 0) return errno != EINTR && errno != EAGAIN;
+    if (ready == 0) return 0;
+    if (p.revents & (POLLHUP | POLLERR | POLLNVAL)) return 1;
+#ifdef POLLRDHUP
+    if (p.revents & POLLRDHUP) return 1;
+#endif
+    if (p.revents & POLLIN) {
+        /* Readable is either a pipelined byte or EOF; only a zero-length
+         * peek tells them apart, and it cannot block: poll said readable. */
+        char b;
+        const ssize_t n = recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (n == 0) return 1;
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return 1;
+    }
+    return 0;
+}
+
+int http_peer_gone(http_conn *c) {
+    if (atomic_load(&c->dead)) return 1;
+    if (!http_fd_peer_gone(c->fd)) return 0;
+    atomic_store(&c->dead, 1);
+    return 1;
 }
 
 static const char *status_text(int s) {
@@ -42,6 +97,7 @@ static const char *status_text(int s) {
         case 404: return "Not Found";
         case 413: return "Payload Too Large";
         case 500: return "Internal Server Error";
+        case 503: return "Service Unavailable";
         default:  return "Error";
     }
 }
@@ -70,6 +126,31 @@ void http_error(http_conn *c, int status, const char *message) {
     http_respond(c, status, "application/json", body, (size_t)n);
 }
 
+static int busy_body(char *body, size_t cap, const char *message) {
+    return snprintf(body, cap,
+        "{\"error\":{\"message\":\"%s\",\"type\":\"server_busy\"}}\n",
+        message ? message : "busy");
+}
+
+static int busy_head(char *head, size_t cap, int body_len, int retry_after_s) {
+    return snprintf(head, cap,
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Retry-After: %d\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n\r\n",
+        body_len, retry_after_s > 0 ? retry_after_s : 1);
+}
+
+void http_busy(http_conn *c, const char *message, int retry_after_s) {
+    char body[256], head[384];
+    const int nb = busy_body(body, sizeof body, message);
+    const int nh = busy_head(head, sizeof head, nb, retry_after_s);
+    http_write(c, head, (size_t)nh);
+    http_write(c, body, (size_t)nb);
+}
+
 void http_begin_sse(http_conn *c) {
     static const char head[] =
         "HTTP/1.1 200 OK\r\n"
@@ -89,7 +170,13 @@ typedef struct {
     int          fd;
     http_handler fn;
     void        *user;
+    int          send_timeout_ms, recv_timeout_ms;
 } conn_arg;
+
+static void set_timeout(int fd, int opt, int ms) {
+    struct timeval tv = { .tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000 };
+    setsockopt(fd, SOL_SOCKET, opt, &tv, sizeof tv);
+}
 
 /* Read until the header terminator, then exactly Content-Length more. A
  * fixed-size read would truncate a long prompt; a read-until-EOF would hang on
@@ -139,14 +226,19 @@ static void *serve_conn(void *arg) {
      * exactly the delay streaming exists to avoid. */
     const int one = 1;
     setsockopt(ca.fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    set_timeout(ca.fd, SO_SNDTIMEO, ca.send_timeout_ms);
+    set_timeout(ca.fd, SO_RCVTIMEO, ca.recv_timeout_ms);
 
     size_t len = 0, head_end = 0;
     char *raw = read_request(ca.fd, &len, &head_end);
 
-    http_conn conn = { .fd = ca.fd, .dead = 0 };
+    http_conn conn;
+    conn.fd = ca.fd;
+    atomic_init(&conn.dead, 0);
     if (!raw) {
         http_error(&conn, 400, "malformed request");
         close(ca.fd);
+        atomic_fetch_sub(&g_live, 1);
         return NULL;
     }
 
@@ -170,11 +262,42 @@ static void *serve_conn(void *arg) {
 
     free(raw);
     close(ca.fd);
+    atomic_fetch_sub(&g_live, 1);
     return NULL;
 }
 
+/* Over the cap: answer 503 + Retry-After at once and close. Whatever request
+ * bytes have already arrived are drained without waiting first, so the close
+ * is a FIN and the client reads the 503 instead of a reset (the hole mynah-tts
+ * names in its own fail-fast path). Never blocks the accept loop for long:
+ * a non-blocking drain and a short send timeout. */
+static void reject_busy(int fd) {
+    set_timeout(fd, SO_SNDTIMEO, 200);
+    char body[256], head[384];
+    const int nb = busy_body(body, sizeof body, "too many connections, retry shortly");
+    const int nh = busy_head(head, sizeof head, nb, 1);
+    char sink[4096];
+    while (recv(fd, sink, sizeof sink, MSG_DONTWAIT) > 0) {}
+#ifdef MSG_NOSIGNAL
+    send(fd, head, (size_t)nh, MSG_NOSIGNAL);
+    send(fd, body, (size_t)nb, MSG_NOSIGNAL);
+#else
+    send(fd, head, (size_t)nh, 0);
+    send(fd, body, (size_t)nb, 0);
+#endif
+    shutdown(fd, SHUT_WR);
+    while (recv(fd, sink, sizeof sink, MSG_DONTWAIT) > 0) {}
+    close(fd);
+    atomic_fetch_add(&g_rejected, 1);
+}
+
 int http_serve(const char *host, int port, http_handler fn, void *user,
-               volatile sig_atomic_t *stop, char *err, size_t errsz) {
+               const http_limits *limits, volatile sig_atomic_t *stop,
+               char *err, size_t errsz) {
+    const int max_conns = (limits && limits->max_conns > 0) ? limits->max_conns : 64;
+    const int send_ms = (limits && limits->send_timeout_ms > 0) ? limits->send_timeout_ms : 5000;
+    const int recv_ms = (limits && limits->recv_timeout_ms > 0) ? limits->recv_timeout_ms : 30000;
+
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { snprintf(err, errsz, "socket: %s", strerror(errno)); return 1; }
 
@@ -212,12 +335,20 @@ int http_serve(const char *host, int port, http_handler fn, void *user,
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
             break;
         }
+        /* The cap is checked at accept and the listener keeps being
+         * polled, so a full server refuses visibly instead of leaving
+         * clients in the kernel backlog where no metric sees the wait. */
+        if (atomic_load(&g_live) >= max_conns) { reject_busy(cfd); continue; }
+
         conn_arg *ca = malloc(sizeof *ca);
         if (!ca) { close(cfd); continue; }
-        *ca = (conn_arg){ .fd = cfd, .fn = fn, .user = user };
+        *ca = (conn_arg){ .fd = cfd, .fn = fn, .user = user,
+                          .send_timeout_ms = send_ms, .recv_timeout_ms = recv_ms };
 
+        atomic_fetch_add(&g_live, 1);
         pthread_t th;
         if (pthread_create(&th, NULL, serve_conn, ca) != 0) {
+            atomic_fetch_sub(&g_live, 1);
             close(cfd);
             free(ca);
             continue;

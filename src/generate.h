@@ -59,6 +59,19 @@ typedef struct {
     void              *cb_tool_ctx;
     long               tool_open;
     long               tool_close;
+
+    /* "Does anybody still want this?" Polled before EVERY decode step and
+     * before every prefill batch; non-zero stops the generation there
+     * (stop = CANCELLED) without computing another token.
+     *
+     * The channel callbacks cannot do this job: a disconnect is only noticed
+     * when a write fails, and nothing is written during a prefill, on the
+     * thinking channel (discarded), while a tool call accumulates, or at all
+     * in a non-streaming request. Without this a client that left keeps the
+     * CPU busy to max_tokens — zombie work, holding the model while everyone
+     * else waits. NULL = never cancelled (the CLI). */
+    int  (*cancel)(void *ctx);
+    void  *cancel_ctx;
 } mynah_slm_gen_params;
 
 /* Zero the params and DISABLE both channel splits.
@@ -69,7 +82,8 @@ typedef struct {
  * lose text. So the disabled value is -1 and it has to be written by someone. */
 void mynah_slm_gen_params_init(mynah_slm_gen_params *p);
 
-/* Runs to completion. Returns the number of tokens generated, or -1.
+/* Runs to completion, or until the cancel hook fires. Returns the number of
+ * tokens generated (also when cancelled), or -1 on failure.
  * `t` is filled in as it goes and is safe to print afterwards.
  *
  * A thin driver over mynah_slm_gen below, on the state's own sequence. */
@@ -104,6 +118,7 @@ typedef enum {
     MYNAH_SLM_STOP_LENGTH,     /* max_new reached */
     MYNAH_SLM_STOP_CALLBACK,   /* a channel callback asked to stop */
     MYNAH_SLM_STOP_ERROR,      /* the forward pass or the detokenizer failed */
+    MYNAH_SLM_STOP_CANCELLED,  /* the cancel hook said nobody wants it */
 } mynah_slm_stop;
 
 typedef struct {
@@ -137,7 +152,7 @@ int  mynah_slm_gen_start(mynah_slm_gen *g, const mynah_slm_tokenizer *tok,
  * batches no wider than the workspace allows. Every prompt token but the last
  * only populates the cache; the last is the first decode step's input.
  * Returns 1 when the prompt is done (and from then on), 0 when more remains,
- * -1 on failure (and sets stop = ERROR). */
+ * -1 on failure (stop = ERROR) or cancellation (stop = CANCELLED). */
 int  mynah_slm_gen_prefill(mynah_slm_gen *g, mynah_slm_state *ws, mynah_slm_seq *q,
                            uint32_t budget);
 
@@ -155,6 +170,11 @@ uint32_t mynah_slm_gen_next_token(const mynah_slm_gen *g);
  * sample, stop test, channel split, detokenize, callback. Returns 1 when the
  * generation wants another step, 0 when it has stopped. */
 int  mynah_slm_gen_accept_logits(mynah_slm_gen *g, float *logits);
+
+/* Polls the cancel hook (if any). Non-zero = cancelled (stop = CANCELLED),
+ * and every later call agrees. Drivers call it before each forward pass;
+ * gen_prefill calls it before each batch on its own. */
+int  mynah_slm_gen_check_cancel(mynah_slm_gen *g);
 
 /* Records a failed forward pass for this generation (stop = ERROR). */
 void mynah_slm_gen_fail(mynah_slm_gen *g);

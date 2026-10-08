@@ -12,7 +12,17 @@
  * requests up.
  *
  * So connections are accepted concurrently, parsed concurrently, and queued at
- * the model. A caller sees the queue as latency, never as an error.
+ * the model, up to --max-conns connections; one more is a 503 with
+ * Retry-After at accept.
+ *
+ * NO ZOMBIE WORK. A client that leaves stops costing CPU at the next step
+ * boundary: the peer-gone probe (http_peer_gone) is asked while a request
+ * waits for the model, again once it has it, before every prefill batch and
+ * before every decode step (generate.h's cancel hook) — not only when a token
+ * happens to be written, which never happens during a prefill, on the
+ * thinking channel, while a tool call accumulates, or in a non-streaming
+ * request. Every socket has a send timeout, so a client that stops reading
+ * cannot pin the model inside send() either.
  *
  * SPDX-License-Identifier: MIT */
 #include "arch_qwen3.h"
@@ -34,6 +44,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct {
     mynah_slm_model_t   *model;
@@ -41,7 +52,17 @@ typedef struct {
     const char          *model_name;
     uint32_t             n_ctx;
 
-    pthread_mutex_t infer_mu;    /* the serialization point */
+    /* The serialization point: one request inside the model at a time.
+     * A flag under a mutex rather than the mutex itself, so a waiter can
+     * wake up every few ms, see that its client left, and leave the queue
+     * without ever running. */
+    pthread_mutex_t gate_mu;
+    pthread_cond_t  gate_cv;
+    int             gate_busy;
+    unsigned        gate_waiting;
+
+    /* Requests whose client left: before the model (queued) and inside it. */
+    unsigned long   cancelled_queued, cancelled_running;
 
     /* Rolling decode t/s, so /health shows a regression in production rather
      * than only in a benchmark. */
@@ -54,6 +75,39 @@ typedef struct {
      * would share an id and a client correlating logs would merge them. */
     unsigned long next_id;
 } server_ctx;
+
+/* ── the serialization gate ──────────────────────────────────────────────── */
+
+/* Enter the model, or give up because the client is gone. Polls the client
+ * every 20 ms while queued: a disconnect while waiting costs no inference. */
+static int gate_enter(server_ctx *c, http_conn *conn) {
+    pthread_mutex_lock(&c->gate_mu);
+    c->gate_waiting++;
+    while (c->gate_busy) {
+        if (http_peer_gone(conn)) {
+            c->gate_waiting--;
+            c->cancelled_queued++;
+            pthread_mutex_unlock(&c->gate_mu);
+            return -1;
+        }
+        struct timespec dl;
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_nsec += 20 * 1000000L;
+        if (dl.tv_nsec >= 1000000000L) { dl.tv_nsec -= 1000000000L; dl.tv_sec++; }
+        pthread_cond_timedwait(&c->gate_cv, &c->gate_mu, &dl);
+    }
+    c->gate_busy = 1;
+    c->gate_waiting--;
+    pthread_mutex_unlock(&c->gate_mu);
+    return 0;
+}
+
+static void gate_leave(server_ctx *c) {
+    pthread_mutex_lock(&c->gate_mu);
+    c->gate_busy = 0;
+    pthread_cond_broadcast(&c->gate_cv);
+    pthread_mutex_unlock(&c->gate_mu);
+}
 
 static volatile sig_atomic_t g_stop;
 static void on_signal(int s) { (void)s; g_stop = 1; }
@@ -80,6 +134,18 @@ typedef struct {
     size_t used, cap;
     int   failed;
 } emit_ctx;
+
+/* The generation's cancel hook (generate.h): asked before every prefill batch
+ * and every decode step. A failed write counts as gone too. */
+typedef struct {
+    http_conn *conn;
+    emit_ctx  *answer;
+} cancel_ctx;
+
+static int chat_cancel(void *ctx) {
+    cancel_ctx *cc = ctx;
+    return cc->answer->failed || http_peer_gone(cc->conn);
+}
 
 static int emit_append(emit_ctx *e, const char *text, size_t len) {
     if (e->used + len + 1 > e->cap) {
@@ -132,11 +198,21 @@ static void handle_health(server_ctx *c, http_conn *conn) {
     const unsigned n = c->n_stat;
     pthread_mutex_unlock(&c->stat_mu);
 
-    char body[512];
+    pthread_mutex_lock(&c->gate_mu);
+    const unsigned waiting = c->gate_waiting;
+    const int busy = c->gate_busy;
+    const unsigned long cq = c->cancelled_queued, cr = c->cancelled_running;
+    pthread_mutex_unlock(&c->gate_mu);
+
+    char body[768];
     const int len = snprintf(body, sizeof body,
         "{\"status\":\"ok\",\"model\":\"%s\",\"n_ctx\":%u,\"threads\":%d,"
-        "\"recent_requests\":%u,\"recent_decode_tok_s\":%.2f}\n",
-        c->model_name, c->n_ctx, mynah_slm_threads_count(), n, avg);
+        "\"recent_requests\":%u,\"recent_decode_tok_s\":%.2f,"
+        "\"running\":%d,\"waiting\":%u,\"connections\":%d,\"rejected\":%lu,"
+        "\"cancelled\":%lu,\"cancelled_queued\":%lu,\"cancelled_running\":%lu}\n",
+        c->model_name, c->n_ctx, mynah_slm_threads_count(), n, avg,
+        busy, waiting, http_live_connections(), http_rejected_connections(),
+        cq + cr, cq, cr);
     http_respond(conn, 200, "application/json", body, (size_t)len);
 }
 
@@ -339,8 +415,22 @@ static void handle_chat(server_ctx *c, http_conn *conn,
     mynah_slm_timing_reset(&tm);
     tm.n_threads = mynah_slm_threads_count();
 
-    /* ── the serialization point ── */
-    pthread_mutex_lock(&c->infer_mu);
+    /* ── the serialization point ──
+     * Asked before queueing and again once inside: a client that left while
+     * the request was parsed or queued costs no inference at all. */
+    const int entered = gate_enter(c, conn) == 0;
+    if (!entered || http_peer_gone(conn)) {
+        if (entered) {
+            pthread_mutex_lock(&c->gate_mu);
+            c->cancelled_queued++;
+            pthread_mutex_unlock(&c->gate_mu);
+            gate_leave(c);
+        }
+        fprintf(stderr, "[%s cancelled while queued: client gone, 0 tokens computed]\n",
+                req_id);
+        free(ids); free(text);
+        goto cleanup_msgs;
+    }
 
     mynah_slm_timing_start(&tm);
     mynah_slm_state st;
@@ -352,7 +442,7 @@ static void handle_chat(server_ctx *c, http_conn *conn,
     if (mynah_slm_state_init_kv(&st, c->model, want < c->n_ctx ? want : c->n_ctx,
                                 MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_BF16,
                                 err, sizeof err) != 0) {
-        pthread_mutex_unlock(&c->infer_mu);
+        gate_leave(c);
         http_error(conn, 500, err);
         free(ids); free(text);
         goto cleanup_msgs;
@@ -379,12 +469,30 @@ static void handle_chat(server_ctx *c, http_conn *conn,
         gp.tool_close = mynah_slm_token_find(c->tok, cf->call_close);
         gp.cb_tool = tool_cb; gp.cb_tool_ctx = &e_tool;
     }
+    cancel_ctx cc = { .conn = conn, .answer = &e };
+    gp.cancel = chat_cancel; gp.cancel_ctx = &cc;
     mynah_slm_generate(&st, c->tok, sam, &gp, &tm);
 
     mynah_slm_sampler_free(sam);
     mynah_slm_state_free(&st);
-    pthread_mutex_unlock(&c->infer_mu);
+    gate_leave(c);
     /* ── end serialization ── */
+
+    /* Gone mid-request: the model was released at the step boundary above.
+     * Nobody is left to answer; say so in the log, with how far it got. */
+    if (tm.cancelled || e.failed) {
+        pthread_mutex_lock(&c->gate_mu);
+        c->cancelled_running++;
+        pthread_mutex_unlock(&c->gate_mu);
+        fprintf(stderr, "[%s cancelled: client gone during %s, %u tokens generated "
+                        "of max_tokens %d, prompt %ld]\n",
+                req_id, tm.n_prompt ? "decode" : "prefill", tm.n_gen, max_new, n_prompt);
+        free(e_tool.buf);
+        free(e.buf);
+        free(ids);
+        free(text);
+        goto cleanup_msgs;
+    }
 
     record_tok_s(c, mynah_slm_decode_tok_s(&tm));
 
@@ -523,14 +631,18 @@ static void usage_text(FILE *f) {
         "  POST /v1/chat/completions  (+ \"stream\": true for SSE)\n"
         "  POST /v1/tokenize\n"
         "\n"
-        "Inference is serialized: one request at a time, all threads. Queueing\n"
-        "shows up as latency, never as an error.\n",
+        "  --max-conns N        connections at once; one more gets 503 (default 64)\n"
+        "  --send-timeout-ms N  a client that stops reading is dropped (default 5000)\n"
+        "\n"
+        "Inference is serialized: one request at a time, all threads. A client\n"
+        "that disconnects stops costing CPU at the next step boundary.\n",
         mynah_slm_version());
 }
 
 int main(int argc, char **argv) {
     const char *model_path = NULL, *host = "127.0.0.1";
     int port = 8080, n_ctx = 0, threads = 0;
+    http_limits limits = { 0, 0, 0 };
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -540,6 +652,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--host") && v)    { host = v; i++; }
         else if (!strcmp(a, "--ctx") && v)     { n_ctx = atoi(v); i++; }
         else if ((!strcmp(a, "-t") || !strcmp(a, "--threads")) && v) { threads = atoi(v); i++; }
+        else if (!strcmp(a, "--max-conns") && v)       { limits.max_conns = atoi(v); i++; }
+        else if (!strcmp(a, "--send-timeout-ms") && v) { limits.send_timeout_ms = atoi(v); i++; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage_text(stdout); return 0; }
         else { fprintf(stderr, "mynah-slm-server: unknown option '%s'\n", a); return 2; }
     }
@@ -553,7 +667,8 @@ int main(int argc, char **argv) {
     char err[256];
     server_ctx ctx;
     memset(&ctx, 0, sizeof ctx);
-    pthread_mutex_init(&ctx.infer_mu, NULL);
+    pthread_mutex_init(&ctx.gate_mu, NULL);
+    pthread_cond_init(&ctx.gate_cv, NULL);
     pthread_mutex_init(&ctx.stat_mu, NULL);
 
     ctx.model = mynah_slm_load(model_path, err, sizeof err);
@@ -570,7 +685,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "mynah-slm-server %s | %s | ctx %u | %d threads | http://%s:%d\n",
             mynah_slm_version(), ctx.model_name, ctx.n_ctx, nth, host, port);
 
-    const int rc = http_serve(host, port, on_request, &ctx, &g_stop, err, sizeof err);
+    const int rc = http_serve(host, port, on_request, &ctx, &limits, &g_stop, err, sizeof err);
     if (rc != 0) fprintf(stderr, "mynah-slm-server: %s\n", err);
 
     mynah_slm_tokenizer_free(ctx.tok);

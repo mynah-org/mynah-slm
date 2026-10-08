@@ -162,6 +162,7 @@ help:
 	@echo "  test         unit tests + parity (exit 77 = skipped, model missing)"
 	@echo "  test-parity  C forward pass vs the numpy oracle, stage by stage"
 	@echo "  test-server  end-to-end HTTP checks (needs a minute of generation)"
+	@echo "  test-server-cancel  disconnects cost no CPU, 503 at the cap (no model needed)"
 	@echo "  bench        per-tensor matvec throughput"
 	@echo "  cuda         opt-in CUDA build in build/cuda/ (CUDA_ARCH=sm_89; needs nvcc)"
 	@echo "  cuda-test    build and run the CUDA self-test (skips without a device)"
@@ -232,7 +233,7 @@ $(OBJ): | $(INGOT_LIB)
 # test_ingot needs no model: it pins the container-layer contract (block
 # geometry, dequant coverage) so a bad subtree update fails here and not
 # three modules later.
-TESTS := tests/test_backend tests/test_batch tests/test_ingot tests/test_sgemm tests/test_threads tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer tests/test_tools tests/test_isa tests/test_synth
+TESTS := tests/test_backend tests/test_batch tests/test_ingot tests/test_sgemm tests/test_threads tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer tests/test_tools tests/test_isa tests/test_synth tests/test_http
 
 # The parity harness is built like the others but driven separately: it dumps
 # activations, and tools/eval/compare.py is what judges them.
@@ -244,6 +245,10 @@ PROMPT     ?= Ciao! Come stai?
 # fixture_model.o is the synthetic checkpoint writer (tests/fixture_model.h):
 # linked into every test so any of them can build a model with no download.
 TEST_SUPPORT := build/tests/npy.o build/tests/fixture_model.o
+
+# The peer-gone probe lives in the server's HTTP layer; its test links it.
+tests/test_http: build/tests/test_http.o build/server/http.o $(TEST_SUPPORT) $(OBJ) $(INGOT_LIB)
+	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 tests/%: build/tests/%.o $(TEST_SUPPORT) $(OBJ) $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
@@ -297,9 +302,18 @@ bench-decode: $(BENCH_DECODE)
 # SSE framing, and that reasoning never reaches content. Separate from `test`
 # because it spends a minute of real generation.
 test-server: mynah-slm-server
-	@sh tests/test_server.sh "$(MODEL)"; rc=$$?; \
+	@bash tests/test_server.sh "$(MODEL)"; rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP test-server: model missing"; exit 0; \
 	  else exit $$rc; fi
+
+# No zombie work, model-free: a client that leaves (streaming, non-streaming,
+# during its prompt, while queued) stops costing CPU at the next step and the
+# next request is served at once; the connection cap answers 503 +
+# Retry-After. Writes tests/fixture_model.c's "slow" fixture (~25 MB, noise
+# weights). About a minute; Linux adds a CPU-idle check from /proc.
+test-server-cancel: mynah-slm-server tests/write_fixture
+	@bash tests/test_server_cancel.sh; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP test-server-cancel"; exit 0; else exit $$rc; fi
 
 # Regenerate the oracle's reference activations. Slow (no KV cache, on purpose)
 # and only needed when the prompt or the dumped stages change.
@@ -533,4 +547,4 @@ dist: mynah-slm mynah-slm-server libmynah_slm.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot bench-qmat dispatch bench-decode
+.PHONY: all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot bench-qmat dispatch bench-decode test-server-cancel
