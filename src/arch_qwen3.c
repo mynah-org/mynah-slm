@@ -827,42 +827,72 @@ static void ws_chunk(void *ctx, int i) {
         j->rc = -1;              /* benign race: any failure sets the same -1 */
 }
 
+/* Where no weight-stationary kernel takes the tensor — ingot's types (Q6_K
+ * and Q8_0 with f32 activations: the head and ffn_down of a Q4_K_M file), or
+ * a batch whose rows do not all take the same kernel of ours — the rows still
+ * walk the weight ONCE from memory: a tile of rows is multiplied by every row
+ * of the batch while it sits in L1/L2, by exactly the call the solo path makes
+ * for that row range (ours if it takes the token, else ingot's). A row's
+ * result does not depend on the range it was computed in — the solo path's
+ * own thread split relies on the same property — so this is the solo answer
+ * too; it saves the memory traffic, not the per-token decode work. */
+#define WS_TILE_ROWS 16
+
+static void ws_tile_chunk(void *ctx, int i) {
+    ws_job *j = ctx;
+    const size_t first = (size_t)i * j->rows_per_chunk;
+    if (first >= j->rows) return;
+    size_t end = first + j->rows_per_chunk;
+    if (end > j->rows) end = j->rows;
+    for (size_t r0 = first; r0 < end; r0 += WS_TILE_ROWS) {
+        const size_t nr = end - r0 < WS_TILE_ROWS ? end - r0 : WS_TILE_ROWS;
+        const uint8_t *tile = j->base + r0 * j->row_bytes;
+        for (size_t t = 0; t < j->ntok; t++) {
+            const float *x = j->in + t * j->cols;
+            float *o = j->out + t * j->rows + r0;
+            if (j->prep && mynah_slm_matvec(j->type, tile, nr, j->cols, x, &j->prep[t], o) == 0)
+                continue;
+            if (ingot_matvec(j->type, tile, nr, j->cols, x, o) != 0)
+                j->rc = -1;      /* benign race: any failure sets the same -1 */
+        }
+    }
+}
+
 /* 0 done, 1 declined (the caller does the rows one projection at a time —
- * the solo path, so nothing changes), -1 error. It declines exactly where the
- * solo path would not run one kernel of ours for every row: ingot's types,
- * int8 off for Q8_0/Q6_K, a non-finite row on the int8 path. */
+ * the solo path), -1 error. */
 static int project_ws(mynah_slm_state *s, const ingot_tensor *w, const float *in,
                       float *out, uint32_t n) {
     const mynah_slm_model_t *m = s->model;
     const size_t cols = (size_t)w->ne[0];
     const size_t rows = (w->rank >= 2) ? (size_t)w->ne[1] : 1;
     uint64_t block_elems = 0, block_bytes = 0;
-    if (!s->mprep || !mynah_slm_matvec_have(w->type) || cols % 32 != 0 ||
-        cols / 32 > MYNAH_SLM_XSUM_MAX ||
-        ingot_type_geometry(w->type, &block_elems, &block_bytes) != 0 ||
+    if (!s->mprep || ingot_type_geometry(w->type, &block_elems, &block_bytes) != 0 ||
         block_elems == 0 || cols % block_elems != 0)
         return 1;
     const uint8_t *base = ingot_gguf_data(m->gguf, w);
     if (!base) return -1;
 
-    /* The same preparation the solo path makes, once per row. */
-    for (uint32_t b = 0; b < n; b++)
-        mynah_slm_matvec_prepare(in + (size_t)b * cols, cols, &s->mprep[b]);
-    if (!mynah_slm_matvec_ws_ok(w->type, cols, n, s->mprep)) return 1;
+    /* The same preparation the solo path makes, once per row, and only where
+     * the solo path makes it. */
+    const int ours = mynah_slm_matvec_have(w->type) && cols % 32 == 0 &&
+                     cols / 32 <= MYNAH_SLM_XSUM_MAX;
+    if (ours)
+        for (uint32_t b = 0; b < n; b++)
+            mynah_slm_matvec_prepare(in + (size_t)b * cols, cols, &s->mprep[b]);
+    const int stationary = ours && mynah_slm_matvec_ws_ok(w->type, cols, n, s->mprep);
 
-    const int nth = mynah_slm_threads_count();
-    if (nth <= 1 || rows < 64)
-        return mynah_slm_matvec_ws(w->type, base, rows, cols, n, in, cols, s->mprep,
-                                   out, rows) == 0 ? 0 : -1;
-    int chunks = nth * 4;
-    if ((size_t)chunks > rows) chunks = (int)rows;
     ws_job j = {
-        .base = base, .out = out, .in = in, .prep = s->mprep,
+        .base = base, .out = out, .in = in, .prep = ours ? s->mprep : NULL,
         .cols = cols, .row_bytes = (cols / block_elems) * block_bytes,
-        .rows_per_chunk = (rows + (size_t)chunks - 1) / (size_t)chunks,
         .rows = rows, .ntok = n, .type = w->type, .rc = 0,
     };
-    mynah_slm_parallel_for(chunks, ws_chunk, &j);
+    const int nth = mynah_slm_threads_count();
+    int chunks = (nth <= 1 || rows < 64) ? 1 : nth * 4;
+    if ((size_t)chunks > rows) chunks = (int)rows;
+    j.rows_per_chunk = (rows + (size_t)chunks - 1) / (size_t)chunks;
+    void (*fn)(void *, int) = stationary ? ws_chunk : ws_tile_chunk;
+    if (chunks == 1) fn(&j, 0);
+    else             mynah_slm_parallel_for(chunks, fn, &j);
     return j.rc;
 }
 

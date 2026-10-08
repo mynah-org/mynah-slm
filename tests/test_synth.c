@@ -605,7 +605,8 @@ static void run(const char *label, int quant) {
     char detail[96];
     snprintf(detail, sizeof detail, "%lu weight-stationary calls",
              (unsigned long)mynah_slm_matvec_ws_count());
-    check(quant ? "[ws] the weight-stationary kernels ran" : "[ws] declined every F32 tensor",
+    check(quant ? "[ws] the weight-stationary kernels ran"
+                : "[ws] no weight-stationary kernel took an F32 tensor (tiled solo calls)",
           quant ? mynah_slm_matvec_ws_count() > 0 : mynah_slm_matvec_ws_count() == 0, detail);
     printf("     %s\n", detail);
     if (quant) {
