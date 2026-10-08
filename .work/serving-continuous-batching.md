@@ -149,10 +149,75 @@ Two things the fixture found on its first run, both kept as evidence:
    fails all four checks. This blind spot was in `test_batch` too, which is
    the gate `docs/perf.md` quotes for the batched prefill.
 
+### S1-b — per-request state, split from what the model shares
+
+**Problem.** `mynah_slm_state` is one sequence's KV cache *and* every scratch
+buffer *and* the RoPE table, built per request. N sequences on one model would
+mean N copies of ~19 MB of batch scratch (`docs/perf.md`, width 256) and N RoPE
+tables for nothing, and no way for one step to see two sequences. And
+`mynah_slm_generate` is a closed loop — prefill, then decode to the end — so a
+scheduler cannot take one step of it.
+
+**Split** (ownership, not copying — the sibling rule is "copy the ownership"):
+
+| | lives in | why |
+|---|---|---|
+| KV cache, `n_past`, `n_ctx`, short-conv history | `mynah_slm_seq` — per request | the only state that is a function of the sequence |
+| sampler (penalty history, RNG), the three detokenizers, the channel (answer / think / tool), the prompt cursor, the step count, timings | `mynah_slm_gen` — per request | ditto, at the token level |
+| scratch, batch scratch, the dequantization strip, the RoPE table | `mynah_slm_state` — per scheduler | a pure function of (model, capacity); one step runs at a time, so one copy serves every sequence. tts measured the same thing for its RoPE table (`kv-window-allocation.md`: 6.1 MB per context, now shared) |
+
+`mynah_slm_state` keeps a `mynah_slm_seq own`, and the single-sequence API
+(`state_init[_kv]`, `forward`, `forward_batch`, `state_reset`, `generate`) is
+unchanged in signature and behaviour: it is the per-sequence API applied to
+`own`. A workspace with no `own` (`mynah_slm_state_init_workspace`) is what a
+scheduler holds.
+
+`mynah_slm_generate` becomes a driver over `mynah_slm_gen`: `gen_prefill`
+(up to N prompt tokens per call — the slice), `gen_next_token`,
+`gen_accept_logits` (sample, stop test, channel split, detokenize, callback),
+`gen_finish`. ONE implementation of the token loop, used by the CLI, the
+serialized server and the scheduler — rule 2, and the qwen-asr lesson it
+comes from.
+
+**KV per request, at admission.** `mynah_slm_seq_reserve` sizes the cache to
+what the request can use (prompt + max_tokens, capped by the server's
+context), REUSES the slot's existing allocation when it is big enough and of
+the same precision, and reallocates only otherwise — so a steady-state
+admission allocates nothing, and nothing ever allocates in the token loop.
+Ported from asr PR #3's slot (`stream` "pooled: opened lazily, reset per
+session") and tts's per-request KV sizing; NOT ported: asr's ring/slide KV
+layouts (an encoder's sliding window — a decoder's history only grows) and
+tts's windowed compaction (no Qwen3 layer is windowed).
+
+**Gate** (`tests/test_synth`): (1) two sequences interleaved token by token on
+ONE workspace produce logits bit-identical (memcmp) to each run alone on its
+own state — the split shares nothing a sequence can see; (2) `generate()` on
+the fixture's tokenizer emits the same ids and text as before the refactor
+(greedy, recorded from the pre-refactor binary), and a hand-driven
+`gen_prefill` in slices of 5 + `gen_accept_logits` loop emits the same ids as
+`generate()`; (3) `seq_reserve` reuses a big-enough allocation (same
+pointer) and reallocates a too-small one.
+
+(2) was written as "`generate()` == a hand-written greedy loop" (forward one
+token at a time, argmax, stop on EOS) rather than against recorded ids, so it
+does not pin the fixture's weights; it was run and PASSED on the
+pre-refactor `generate()` first, then on the new one.
+
+**Result (2026-10-08, cloud x86, both fixtures)**: all PASS — two bf16-KV
+sequences interleaved on one workspace equal each alone by memcmp (logits and
+6 greedy ids); a 400-position sequence on a 256-position workspace is refused;
+`generate()` == greedy reference (24 ids); hand-driven `gen` with 6 prefill
+slices == `generate()` (24 ids, same text, stop = LENGTH); `seq_reserve`
+reuses / regrows / retypes as specified.
+
+**Not covered**: the hybrid short-conv path on a sequence (no LFM2 fixture);
+the CLI and the server still call the unchanged single-sequence API, so they
+exercise `own` only.
+
 ## Conclusion
 
 (open)
 
 ## Next action
 
-S1-a, then S1-b (per-request state split).
+S1-b, then S1-c (batched decode across sequences).

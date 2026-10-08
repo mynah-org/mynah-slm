@@ -48,7 +48,7 @@ static double rel_diff(const float *a, const float *b, size_t n, size_t *worst) 
  * slot late survived a plain reset. */
 static void reset_poisoned(mynah_slm_state *st) {
     mynah_slm_state_reset(st);
-    const mynah_slm_kv *kv = &st->kv;
+    const mynah_slm_kv *kv = &st->own.kv;
     const size_t positions = (size_t)kv->n_layers * kv->n_ctx;
     memset(kv->k, 0xff, positions * kv->pos_bytes_k);
     memset(kv->v, 0xff, positions * kv->pos_bytes_v);
@@ -111,7 +111,7 @@ int main(int argc, char **argv) {
     for (long i = 0; i + 1 < n_tok; i++)
         if (mynah_slm_forward(&st, ids[i], NULL) != 0) { printf("FAIL forward\n"); return 1; }
     if (mynah_slm_forward(&st, ids[n_tok - 1], ref) != 0) { printf("FAIL forward\n"); return 1; }
-    const uint32_t past_ref = st.n_past;
+    const uint32_t past_ref = st.own.n_past;
     const size_t   pick_ref = argmax(ref, vocab);
 
     /* ── one batch for the whole prompt ───────────────────────────────────── */
@@ -146,12 +146,12 @@ int main(int argc, char **argv) {
         char detail[256];
         snprintf(detail, sizeof detail,
                  "width %u: rel=%.2e at %zu, argmax %zu vs %zu, n_past %u vs %u",
-                 width, rel, worst, pick, pick_ref, st.n_past, past_ref);
+                 width, rel, worst, pick, pick_ref, st.own.n_past, past_ref);
 
         /* 1e-4 is the same tolerance the parity gate holds layer 0 to. A
          * reorder lands two orders of magnitude below it; anything that does
          * not is a different computation wearing the same name. */
-        check(cases[k].name, rel < 1e-4 && pick == pick_ref && st.n_past == past_ref, detail);
+        check(cases[k].name, rel < 1e-4 && pick == pick_ref && st.own.n_past == past_ref, detail);
         printf("     %s\n", detail);
     }
 

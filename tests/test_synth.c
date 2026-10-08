@@ -15,6 +15,8 @@
  * SPDX-License-Identifier: MIT */
 #include "arch_qwen3.h"
 #include "fixture_model.h"
+#include "generate.h"
+#include "sampler.h"
 #include "model.h"
 #include "mynah_slm.h"
 #include "threads.h"
@@ -51,7 +53,7 @@ static double rel_diff(const float *a, const float *b, size_t n) {
  * survived until this existed. 0xFF bytes are NaN in f32 and in bf16. */
 static void reset_poisoned(mynah_slm_state *st) {
     mynah_slm_state_reset(st);
-    const mynah_slm_kv *kv = &st->kv;
+    const mynah_slm_kv *kv = &st->own.kv;
     const size_t positions = (size_t)kv->n_layers * kv->n_ctx;
     memset(kv->k, 0xff, positions * kv->pos_bytes_k);
     memset(kv->v, 0xff, positions * kv->pos_bytes_v);
@@ -69,6 +71,244 @@ static const char *TEXT =
     "Il carbone che alimentava le fornaci arrivava dal nord. Die Fabrik lief "
     "Tag und Nacht. The ledger for 1887 lists twelve names. \xe6\xb8\xaf\xe3\x81\xab"
     "\xe3\x81\xaf\xe8\x88\xb9\xe3\x81\x8c\xe4\xb8\xa6\xe3\x82\x93\xe3\x81\xa7.";
+
+/* ── generate() against a hand-written greedy loop ───────────────────────── */
+
+typedef struct { uint32_t ids[64]; size_t n; char text[1024]; size_t len; } collect;
+
+static int collect_cb(void *ctx, uint32_t id, const char *text, size_t len) {
+    collect *c = ctx;
+    if (len == 0 && id == 0) return 0;               /* the end-of-stream flush */
+    if (c->n < 64) c->ids[c->n++] = id;
+    if (c->len + len < sizeof c->text) { memcpy(c->text + c->len, text, len); c->len += len; }
+    c->text[c->len] = '\0';
+    return 0;
+}
+
+#define GEN_MAX 24
+
+/* The definition generate() has to agree with: forward one token at a time,
+ * argmax, stop on EOS. No sampler, no channels, no batching. */
+static size_t greedy_ref(mynah_slm_state *st, const uint32_t *prompt, size_t n_prompt,
+                         uint32_t eos, uint32_t vocab, uint32_t *out) {
+    mynah_slm_state_reset(st);
+    for (size_t i = 0; i + 1 < n_prompt; i++) mynah_slm_forward(st, prompt[i], NULL);
+    uint32_t next = prompt[n_prompt - 1];
+    size_t n = 0;
+    for (int step = 0; step < GEN_MAX; step++) {
+        if (mynah_slm_forward(st, next, st->logits) != 0) break;
+        const uint32_t id = (uint32_t)argmax(st->logits, vocab);
+        if (id == eos) break;
+        out[n++] = id;
+        next = id;
+    }
+    return n;
+}
+
+static void check_generate(mynah_slm_model_t *m, mynah_slm_tokenizer *tok) {
+    const char *prompt_text = "<|im_start|>user\nCiao! Come stai?<|im_end|>\n<|im_start|>assistant\n";
+    uint32_t prompt[128];
+    const long n_prompt = mynah_slm_tokenize(tok, prompt_text, 1, prompt, 128);
+    const uint32_t eos = mynah_slm_tokenizer_eos(tok);
+    const uint32_t vocab = mynah_slm_vocab_size(m);
+    char err[256];
+
+    mynah_slm_state st;
+    if (mynah_slm_state_init_kv(&st, m, (uint32_t)n_prompt + GEN_MAX + 8, MYNAH_SLM_KV_F32,
+                                MYNAH_SLM_KV_F32, err, sizeof err) != 0) {
+        check("generate state", 0, err);
+        return;
+    }
+    uint32_t ref[GEN_MAX];
+    const size_t n_ref = greedy_ref(&st, prompt, (size_t)n_prompt, eos, vocab, ref);
+
+    mynah_slm_sampler_params sp;
+    mynah_slm_sampler_defaults(&sp);
+    sp.temp = 0.0f;
+    mynah_slm_sampler *sam = mynah_slm_sampler_new(&sp, vocab);
+
+    collect got;
+    memset(&got, 0, sizeof got);
+    mynah_slm_gen_params gp;
+    mynah_slm_gen_params_init(&gp);
+    gp.prompt = prompt; gp.n_prompt = (size_t)n_prompt;
+    gp.max_new = GEN_MAX;
+    gp.eos = &eos; gp.n_eos = 1;
+    gp.cb = collect_cb; gp.cb_ctx = &got;
+    mynah_slm_timing tm;
+    mynah_slm_timing_reset(&tm);
+    mynah_slm_timing_start(&tm);
+    mynah_slm_state_reset(&st);
+    const long produced = mynah_slm_generate(&st, tok, sam, &gp, &tm);
+
+    char detail[160];
+    snprintf(detail, sizeof detail, "%zu ids vs %zu from the reference loop, produced %ld",
+             got.n, n_ref, produced);
+    check("generate() == a hand-written greedy loop, id for id",
+          got.n == n_ref && memcmp(got.ids, ref, n_ref * sizeof *ref) == 0, detail);
+    printf("     %s\n", detail);
+    check("generate() reports its decode timing", tm.n_gen == (uint32_t)produced &&
+          tm.n_prompt == (uint32_t)n_prompt, "timing counters disagree");
+
+    /* The same generation driven by hand the way a scheduler drives it: a
+     * workspace with no sequence of its own, a separate sequence, the prompt
+     * in slices of 5, then one accept_logits per forward. */
+    {
+        mynah_slm_state ws;
+        mynah_slm_seq q;
+        memset(&q, 0, sizeof q);
+        int ok = mynah_slm_state_init_workspace(&ws, m, 256, err, sizeof err) == 0 &&
+                 mynah_slm_seq_reserve(&q, m, (uint32_t)n_prompt + GEN_MAX + 8,
+                                       MYNAH_SLM_KV_F32, MYNAH_SLM_KV_F32, err, sizeof err) == 0;
+        check("a workspace and a separate sequence", ok, err);
+        if (ok) {
+            mynah_slm_sampler *s2 = mynah_slm_sampler_new(&sp, vocab);
+            collect hand;
+            memset(&hand, 0, sizeof hand);
+            gp.cb_ctx = &hand;
+            mynah_slm_gen g;
+            mynah_slm_gen_start(&g, tok, s2, &gp, NULL);
+            int slices = 0, rc;
+            while ((rc = mynah_slm_gen_prefill(&g, &ws, &q, 5)) == 0) slices++;
+            while (rc == 1 && mynah_slm_gen_wants_step(&g)) {
+                if (mynah_slm_seq_forward(&ws, &q, mynah_slm_gen_next_token(&g), ws.logits) != 0) {
+                    mynah_slm_gen_fail(&g);
+                    break;
+                }
+                mynah_slm_gen_accept_logits(&g, ws.logits);
+            }
+            mynah_slm_gen_finish(&g);
+            snprintf(detail, sizeof detail, "%d+1 prefill slices, %zu ids vs %zu, stop %d",
+                     slices, hand.n, got.n, (int)g.stop);
+            check("a sliced, hand-driven gen == generate(), id for id",
+                  rc == 1 && hand.n == got.n &&
+                  memcmp(hand.ids, got.ids, got.n * sizeof *got.ids) == 0 &&
+                  strcmp(hand.text, got.text) == 0, detail);
+            printf("     %s\n", detail);
+            mynah_slm_sampler_free(s2);
+        }
+        mynah_slm_seq_free(&q);
+        mynah_slm_state_free(&ws);
+    }
+
+    mynah_slm_sampler_free(sam);
+    mynah_slm_state_free(&st);
+}
+
+/* ── per-request state: what a sequence owns, and only that ─────────────── */
+
+/* Two sequences advanced in lockstep on ONE workspace must each get, bit for
+ * bit, the logits it gets alone on a state of its own: the workspace holds
+ * nothing a sequence can see. memcmp, not a tolerance — the arithmetic is the
+ * same calls in the same order, so anything else is shared state leaking. */
+static void check_two_sequences(mynah_slm_model_t *m, const uint32_t *ids, long n_tok) {
+    char err[256] = "";
+    const uint32_t vocab = mynah_slm_vocab_size(m);
+    const long half = n_tok / 2;
+    const uint32_t *pa = ids, *pb = ids + half;           /* two different prompts */
+    const long na = half, nb = n_tok - half;
+
+    float *alone_a = malloc(vocab * sizeof(float)), *alone_b = malloc(vocab * sizeof(float));
+    float *mix_a = malloc(vocab * sizeof(float)), *mix_b = malloc(vocab * sizeof(float));
+    mynah_slm_state sa, sb, ws;
+    mynah_slm_seq qa, qb;
+    memset(&sa, 0, sizeof sa); memset(&sb, 0, sizeof sb); memset(&ws, 0, sizeof ws);
+    memset(&qa, 0, sizeof qa); memset(&qb, 0, sizeof qb);
+    int ok = mynah_slm_state_init_kv(&sa, m, 256, MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_BF16, err, sizeof err) == 0 &&
+             mynah_slm_state_init_kv(&sb, m, 256, MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_BF16, err, sizeof err) == 0 &&
+             mynah_slm_state_init_workspace(&ws, m, 256, err, sizeof err) == 0 &&
+             mynah_slm_seq_reserve(&qa, m, 128, MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_BF16, err, sizeof err) == 0 &&
+             mynah_slm_seq_reserve(&qb, m, 200, MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_BF16, err, sizeof err) == 0;
+    check("two sequences and a workspace", ok, err);
+    if (!ok) goto out;
+
+    /* Alone: a prefill in batches of 9, then 6 greedy steps. */
+    uint32_t gen_a[6], gen_b[6];
+    for (int which = 0; which < 2; which++) {
+        mynah_slm_state *st = which ? &sb : &sa;
+        const uint32_t *p = which ? pb : pa;
+        const long n = which ? nb : na;
+        float *lg = which ? alone_b : alone_a;
+        for (long i = 0; i + 1 < n; i += 9) {
+            long take = (n - 1) - i;
+            if (take > 9) take = 9;
+            mynah_slm_forward_batch(st, p + i, (uint32_t)take, NULL);
+        }
+        uint32_t next = p[n - 1];
+        for (int g = 0; g < 6; g++) {
+            mynah_slm_forward(st, next, lg);
+            next = (uint32_t)argmax(lg, vocab);
+            (which ? gen_b : gen_a)[g] = next;
+        }
+    }
+
+    /* Interleaved: a's slice, b's slice, a's step, b's step... */
+    long ia = 0, ib = 0;
+    while (ia + 1 < na || ib + 1 < nb) {
+        if (ia + 1 < na) {
+            long t = (na - 1) - ia;
+            if (t > 9) t = 9;
+            mynah_slm_seq_forward_batch(&ws, &qa, pa + ia, (uint32_t)t, NULL);
+            ia += t;
+        }
+        if (ib + 1 < nb) {
+            long t = (nb - 1) - ib;
+            if (t > 9) t = 9;
+            mynah_slm_seq_forward_batch(&ws, &qb, pb + ib, (uint32_t)t, NULL);
+            ib += t;
+        }
+    }
+    uint32_t a_next = pa[na - 1], b_next = pb[nb - 1];
+    int same_ids = 1;
+    for (int g = 0; g < 6; g++) {
+        mynah_slm_seq_forward(&ws, &qa, a_next, mix_a);
+        mynah_slm_seq_forward(&ws, &qb, b_next, mix_b);
+        a_next = (uint32_t)argmax(mix_a, vocab);
+        b_next = (uint32_t)argmax(mix_b, vocab);
+        if (a_next != gen_a[g] || b_next != gen_b[g]) same_ids = 0;
+    }
+    check("two sequences interleaved on one workspace == each alone (memcmp)",
+          same_ids && memcmp(mix_a, alone_a, vocab * sizeof(float)) == 0 &&
+          memcmp(mix_b, alone_b, vocab * sizeof(float)) == 0, "logits or ids differ");
+
+    /* A sequence bigger than the workspace's capacity is refused, not run
+     * past the end of the scratch and the RoPE table. */
+    {
+        mynah_slm_seq big;
+        memset(&big, 0, sizeof big);
+        if (mynah_slm_seq_reserve(&big, m, 400, MYNAH_SLM_KV_F32, MYNAH_SLM_KV_F32,
+                                  err, sizeof err) == 0)
+            check("a sequence wider than the workspace is refused",
+                  mynah_slm_seq_forward(&ws, &big, pa[0], NULL) == -1, "it ran");
+        mynah_slm_seq_free(&big);
+    }
+
+    /* Pooled reuse: a big-enough slot is reset in place, a small one grows. */
+    {
+        mynah_slm_seq r;
+        memset(&r, 0, sizeof r);
+        mynah_slm_seq_reserve(&r, m, 100, MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_BF16, err, sizeof err);
+        const void *k0 = r.kv.k;
+        r.n_past = 42;
+        mynah_slm_seq_reserve(&r, m, 60, MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_BF16, err, sizeof err);
+        const int reused = r.kv.k == k0 && r.n_past == 0 && r.n_ctx == 100;
+        mynah_slm_seq_reserve(&r, m, 300, MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_BF16, err, sizeof err);
+        const int grown = r.n_ctx == 300 && r.n_past == 0;
+        mynah_slm_seq_reserve(&r, m, 50, MYNAH_SLM_KV_F32, MYNAH_SLM_KV_F32, err, sizeof err);
+        const int retyped = r.kv.type_k == MYNAH_SLM_KV_F32 && r.n_ctx == 50;
+        check("seq_reserve reuses a big-enough cache, regrows a small one, retypes",
+              reused && grown && retyped, "reserve did not reuse/grow/retype as specified");
+        mynah_slm_seq_free(&r);
+    }
+
+out:
+    mynah_slm_seq_free(&qa);
+    mynah_slm_seq_free(&qb);
+    mynah_slm_state_free(&sa);
+    mynah_slm_state_free(&sb);
+    mynah_slm_state_free(&ws);
+    free(alone_a); free(alone_b); free(mix_a); free(mix_b);
+}
 
 static void run(const char *label, int quant) {
     printf("\n-- %s fixture --\n", label);
@@ -121,7 +361,7 @@ static void run(const char *label, int quant) {
 
     for (long i = 0; i + 1 < n_tok; i++) mynah_slm_forward(&st, ids[i], NULL);
     mynah_slm_forward(&st, ids[n_tok - 1], ref);
-    const uint32_t past_ref = st.n_past;
+    const uint32_t past_ref = st.own.n_past;
     const size_t pick_ref = argmax(ref, vocab);
 
     const uint32_t widths[] = { (uint32_t)n_tok, 7, 13 };
@@ -147,10 +387,10 @@ static void run(const char *label, int quant) {
         char what[96], detail[160];
         snprintf(what, sizeof what, "batched prefill at width %u == one token at a time", width);
         snprintf(detail, sizeof detail, "rel=%.2e, argmax %zu vs %zu, n_past %u vs %u",
-                 rel, argmax(got, vocab), pick_ref, st.n_past, past_ref);
+                 rel, argmax(got, vocab), pick_ref, st.own.n_past, past_ref);
         /* The same 1e-4 test_batch holds a real checkpoint to; a reorder lands
          * orders of magnitude under it. */
-        check(what, rel < 1e-4 && argmax(got, vocab) == pick_ref && st.n_past == past_ref, detail);
+        check(what, rel < 1e-4 && argmax(got, vocab) == pick_ref && st.own.n_past == past_ref, detail);
         printf("     %s\n", detail);
     }
 
@@ -179,6 +419,8 @@ static void run(const char *label, int quant) {
     printf("     worst rel over the widths: %.2e\n", worst);
 
     mynah_slm_state_free(&st);
+    check_generate(m, tok);
+    check_two_sequences(m, ids, n_tok);
 out:
     free(ref); free(got); free(ids);
     mynah_slm_tokenizer_free(tok);

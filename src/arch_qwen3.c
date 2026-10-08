@@ -129,49 +129,122 @@ static float *alloc_f32(size_t n) {
     return mynah_slm_aligned_alloc(n * sizeof(float));
 }
 
-int mynah_slm_state_init(mynah_slm_state *s, const mynah_slm_model_t *m,
-                         uint32_t n_ctx, char *err, size_t errsz) {
+int mynah_slm_kv_types_from_env(mynah_slm_kv_type *kv_k, mynah_slm_kv_type *kv_v) {
     mynah_slm_kv_type k = MYNAH_SLM_KV_F32, v = MYNAH_SLM_KV_F32;
     const char *e = getenv("MYNAH_SLM_KV");
     if (e) { mynah_slm_kv_type_parse(e, &k); v = k; }
     if ((e = getenv("MYNAH_SLM_KV_K")) != NULL) mynah_slm_kv_type_parse(e, &k);
     if ((e = getenv("MYNAH_SLM_KV_V")) != NULL) mynah_slm_kv_type_parse(e, &v);
+    *kv_k = k;
+    *kv_v = v;
+    return 0;
+}
+
+int mynah_slm_state_init(mynah_slm_state *s, const mynah_slm_model_t *m,
+                         uint32_t n_ctx, char *err, size_t errsz) {
+    mynah_slm_kv_type k, v;
+    mynah_slm_kv_types_from_env(&k, &v);
     return mynah_slm_state_init_kv(s, m, n_ctx, k, v, err, errsz);
 }
 
-int mynah_slm_state_init_kv(mynah_slm_state *s, const mynah_slm_model_t *m,
-                            uint32_t n_ctx, mynah_slm_kv_type kv_k,
-                            mynah_slm_kv_type kv_v, char *err, size_t errsz) {
-    memset(s, 0, sizeof *s);
-    s->kv_k = kv_k;
-    s->kv_v = kv_v;
-    const mynah_slm_config *c = &m->cfg;
-
-    /* A hybrid model needs a FIR length to size its state with, and the layer
-     * map and the metadata have to agree about that. Neither is derivable from
-     * the other, so disagreement is a broken file rather than a default to
-     * paper over. */
+/* A hybrid model needs a FIR length to size its state with, and the layer map
+ * and the metadata have to agree about that. Neither is derivable from the
+ * other, so disagreement is a broken file rather than a default to paper over. */
+static int check_conv_config(const mynah_slm_config *c, char *err, size_t errsz) {
     if (c->n_attn_layers < c->n_layers && c->conv_taps < 2) {
         snprintf(err, errsz,
                  "%s has %u short-conv layers but no usable %s.shortconv.l_cache",
                  c->arch, c->n_layers - c->n_attn_layers, c->arch);
         return -1;
     }
+    return 0;
+}
 
+static size_t conv_hist_floats(const mynah_slm_config *c) {
+    const uint32_t n_conv = c->n_layers - c->n_attn_layers;
+    return n_conv ? (size_t)n_conv * (c->conv_taps - 1) * c->d_model : 0;
+}
+
+/* ── one sequence ─────────────────────────────────────────────────────────── */
+
+int mynah_slm_seq_init(mynah_slm_seq *q, const mynah_slm_model_t *m, uint32_t n_ctx,
+                       mynah_slm_kv_type kv_k, mynah_slm_kv_type kv_v,
+                       char *err, size_t errsz) {
+    memset(q, 0, sizeof *q);
+    const mynah_slm_config *c = &m->cfg;
+    if (check_conv_config(c, err, errsz) != 0) return -1;
     if (n_ctx == 0 || n_ctx > c->n_ctx) n_ctx = c->n_ctx;
-    s->model = m;
-    s->n_ctx = n_ctx;
 
-    if (mynah_slm_rope_init(&s->rope, c->head_dim, n_ctx, c->rope_theta,
-                            c->rope_interleaved) != 0) {
-        snprintf(err, errsz, "cannot build the RoPE table for %u positions", n_ctx);
-        return -1;
+    q->model = m;
+    q->n_ctx = n_ctx;
+
+    const size_t hist = conv_hist_floats(c);
+    if (hist) {
+        q->conv_hist = alloc_f32(hist);
+        if (q->conv_hist) memset(q->conv_hist, 0, hist * sizeof *q->conv_hist);
     }
-
     /* One contiguous cache per layer for K and for V, laid out
      * [pos][n_kv_heads * head_dim] so a position is contiguous — that is the
      * order the attention kernel walks. Allocated once, never grown inside the
      * token loop. */
+    if ((hist && !q->conv_hist) ||
+        mynah_slm_kv_init(&q->kv, kv_k, kv_v, c->n_attn_layers, n_ctx,
+                          c->n_kv_heads, c->head_dim) != 0) {
+        snprintf(err, errsz, "out of memory for a %u-position context", n_ctx);
+        mynah_slm_seq_free(q);
+        return -1;
+    }
+    return 0;
+}
+
+void mynah_slm_seq_free(mynah_slm_seq *q) {
+    if (!q) return;
+    mynah_slm_kv_free(&q->kv);
+    mynah_slm_aligned_free(q->conv_hist);
+    memset(q, 0, sizeof *q);
+}
+
+void mynah_slm_seq_reset(mynah_slm_seq *q) {
+    q->n_past = 0;
+    /* The conv history is history too. Leaving it behind would carry two
+     * tokens of the previous conversation into the next one — invisible in the
+     * KV cache, which the n_past reset does clear, and wrong on the first two
+     * tokens of every turn after the first. */
+    if (q->conv_hist && q->model) {
+        const size_t hist = conv_hist_floats(&q->model->cfg);
+        memset(q->conv_hist, 0, hist * sizeof *q->conv_hist);
+    }
+}
+
+int mynah_slm_seq_reserve(mynah_slm_seq *q, const mynah_slm_model_t *m, uint32_t n_ctx,
+                          mynah_slm_kv_type kv_k, mynah_slm_kv_type kv_v,
+                          char *err, size_t errsz) {
+    if (n_ctx == 0 || n_ctx > m->cfg.n_ctx) n_ctx = m->cfg.n_ctx;
+    if (q->model == m && q->kv.k && q->n_ctx >= n_ctx &&
+        q->kv.type_k == kv_k && q->kv.type_v == kv_v) {
+        mynah_slm_seq_reset(q);
+        return 0;
+    }
+    mynah_slm_seq_free(q);
+    return mynah_slm_seq_init(q, m, n_ctx, kv_k, kv_v, err, errsz);
+}
+
+/* ── the workspace ────────────────────────────────────────────────────────── */
+
+static int workspace_alloc(mynah_slm_state *s, const mynah_slm_model_t *m,
+                           uint32_t ctx_cap, char *err, size_t errsz) {
+    const mynah_slm_config *c = &m->cfg;
+    if (check_conv_config(c, err, errsz) != 0) return -1;
+
+    if (ctx_cap == 0 || ctx_cap > c->n_ctx) ctx_cap = c->n_ctx;
+    s->model = m;
+    s->ctx_cap = ctx_cap;
+
+    if (mynah_slm_rope_init(&s->rope, c->head_dim, ctx_cap, c->rope_theta,
+                            c->rope_interleaved) != 0) {
+        snprintf(err, errsz, "cannot build the RoPE table for %u positions", ctx_cap);
+        return -1;
+    }
 
     s->x       = alloc_f32(c->d_model);
     s->h       = alloc_f32(c->d_model);
@@ -180,8 +253,8 @@ int mynah_slm_state_init_kv(mynah_slm_state *s, const mynah_slm_model_t *m,
     s->proj    = alloc_f32(c->d_model);
     s->gate    = alloc_f32(c->d_ff);
     s->up      = alloc_f32(c->d_ff);
-    s->scores    = alloc_f32(n_ctx);
-    s->scores_mt = alloc_f32((size_t)n_ctx * c->n_heads);
+    s->scores    = alloc_f32(ctx_cap);
+    s->scores_mt = alloc_f32((size_t)ctx_cap * c->n_heads);
     s->logits  = alloc_f32(c->vocab_size);
     s->embed_row = alloc_f32(c->d_model);
 
@@ -197,7 +270,7 @@ int mynah_slm_state_init_kv(mynah_slm_state *s, const mynah_slm_model_t *m,
         const long v = strtol(env, NULL, 10);
         if (v >= 1 && v <= 4096) batch = (uint32_t)v;
     }
-    if (batch > n_ctx) batch = n_ctx;
+    if (batch > ctx_cap) batch = ctx_cap;
     s->batch_max = batch;
 
     /* The widest input a projection sees: ffn_down reads d_ff, everything else
@@ -212,30 +285,23 @@ int mynah_slm_state_init_kv(mynah_slm_state *s, const mynah_slm_model_t *m,
     s->bgate = alloc_f32((size_t)batch * c->d_ff);
     s->bup   = alloc_f32((size_t)batch * c->d_ff);
     s->strip = alloc_f32((size_t)MYNAH_SLM_STRIP_ROWS * max_cols);
-    /* One head's scores for the whole batch: [batch][n_ctx]. Large enough to
-     * be worth stating — 1.2 MB at a 2000-token context — and still an order
-     * of magnitude under the KV cache it reads. */
-    s->bscores = alloc_f32((size_t)batch * n_ctx);
+    /* One head's scores for the whole batch: [batch][ctx_cap]. Large enough
+     * to be worth stating — 1.2 MB at a 2000-token context — and still an
+     * order of magnitude under the KV cache it reads. */
+    s->bscores = alloc_f32((size_t)batch * ctx_cap);
     s->bk      = alloc_f32((size_t)batch * c->kv_dim);
     s->bv      = alloc_f32((size_t)batch * c->kv_dim);
-    s->kgather = alloc_f32((size_t)n_ctx * c->head_dim);
-    s->vgather = alloc_f32((size_t)n_ctx * c->head_dim);
+    s->kgather = alloc_f32((size_t)ctx_cap * c->head_dim);
+    s->vgather = alloc_f32((size_t)ctx_cap * c->head_dim);
 
-    /* Short-conv scratch and state, only when the model has conv layers. The
-     * history is what survives between tokens; the other three are per-batch
-     * working room, allocated at full batch width like every other scratch so
-     * prefill never allocates either. */
-    const uint32_t n_conv = c->n_layers - c->n_attn_layers;
+    /* Short-conv working room, only when the model has conv layers. The
+     * history itself is per sequence (mynah_slm_seq). */
     int conv_ok = 1;
-    if (n_conv > 0) {
-        s->conv_hist = alloc_f32((size_t)n_conv * (c->conv_taps - 1) * c->d_model);
+    if (c->n_layers > c->n_attn_layers) {
         s->conv_bcx  = alloc_f32((size_t)batch * 3u * c->d_model);
         s->conv_bx   = alloc_f32((size_t)batch * c->d_model);
         s->conv_y    = alloc_f32((size_t)batch * c->d_model);
-        conv_ok = s->conv_hist && s->conv_bcx && s->conv_bx && s->conv_y;
-        if (s->conv_hist)
-            memset(s->conv_hist, 0,
-                   (size_t)n_conv * (c->conv_taps - 1) * c->d_model * sizeof *s->conv_hist);
+        conv_ok = s->conv_bcx && s->conv_bx && s->conv_y;
     }
 
     if (!s->x || !s->h || !s->q || !s->attn ||
@@ -243,10 +309,31 @@ int mynah_slm_state_init_kv(mynah_slm_state *s, const mynah_slm_model_t *m,
         !s->logits || !s->embed_row || !s->bx || !s->bh || !s->bq ||
         !s->battn || !s->bproj || !s->bgate || !s->bup || !s->strip ||
         !s->bscores || !s->bk || !s->bv || !s->kgather || !s->vgather ||
-        !conv_ok ||
-        mynah_slm_kv_init(&s->kv, s->kv_k, s->kv_v, c->n_attn_layers, n_ctx,
-                          c->n_kv_heads, c->head_dim) != 0) {
-        snprintf(err, errsz, "out of memory for a %u-position context", n_ctx);
+        !conv_ok) {
+        snprintf(err, errsz, "out of memory for a %u-position workspace", ctx_cap);
+        return -1;
+    }
+    return 0;
+}
+
+int mynah_slm_state_init_workspace(mynah_slm_state *s, const mynah_slm_model_t *m,
+                                   uint32_t ctx_cap, char *err, size_t errsz) {
+    memset(s, 0, sizeof *s);
+    if (workspace_alloc(s, m, ctx_cap, err, errsz) != 0) {
+        mynah_slm_state_free(s);
+        return -1;
+    }
+    return 0;
+}
+
+int mynah_slm_state_init_kv(mynah_slm_state *s, const mynah_slm_model_t *m,
+                            uint32_t n_ctx, mynah_slm_kv_type kv_k,
+                            mynah_slm_kv_type kv_v, char *err, size_t errsz) {
+    memset(s, 0, sizeof *s);
+    s->kv_k = kv_k;
+    s->kv_v = kv_v;
+    if (workspace_alloc(s, m, n_ctx, err, errsz) != 0 ||
+        mynah_slm_seq_init(&s->own, m, s->ctx_cap, kv_k, kv_v, err, errsz) != 0) {
         mynah_slm_state_free(s);
         return -1;
     }
@@ -257,8 +344,8 @@ uint32_t mynah_slm_batch_max(const mynah_slm_state *s) { return s->batch_max; }
 
 void mynah_slm_state_free(mynah_slm_state *s) {
     if (!s) return;
+    mynah_slm_seq_free(&s->own);
     mynah_slm_rope_free(&s->rope);
-    mynah_slm_kv_free(&s->kv);
     mynah_slm_aligned_free(s->x);
     mynah_slm_aligned_free(s->h);
     mynah_slm_aligned_free(s->q);
@@ -283,7 +370,6 @@ void mynah_slm_state_free(mynah_slm_state *s) {
     mynah_slm_aligned_free(s->bv);
     mynah_slm_aligned_free(s->kgather);
     mynah_slm_aligned_free(s->vgather);
-    mynah_slm_aligned_free(s->conv_hist);
     mynah_slm_aligned_free(s->conv_bcx);
     mynah_slm_aligned_free(s->conv_bx);
     mynah_slm_aligned_free(s->conv_y);
@@ -291,17 +377,13 @@ void mynah_slm_state_free(mynah_slm_state *s) {
 }
 
 void mynah_slm_state_reset(mynah_slm_state *s) {
-    s->n_past = 0;
-    /* The conv history is history too. Leaving it behind would carry two
-     * tokens of the previous conversation into the next one — invisible in the
-     * KV cache, which the n_past reset does clear, and wrong on the first two
-     * tokens of every turn after the first. */
-    if (s->conv_hist) {
-        const mynah_slm_config *c = &s->model->cfg;
-        const uint32_t n_conv = c->n_layers - c->n_attn_layers;
-        memset(s->conv_hist, 0,
-               (size_t)n_conv * (c->conv_taps - 1) * c->d_model * sizeof *s->conv_hist);
-    }
+    mynah_slm_seq_reset(&s->own);
+}
+
+/* A sequence may run on a workspace only if the workspace's scratch and RoPE
+ * table reach every position it can hold. */
+static int seq_fits(const mynah_slm_state *s, const mynah_slm_seq *q) {
+    return q && q->model == s->model && q->kv.k && q->n_ctx <= s->ctx_cap;
 }
 
 /* Read one row of the embedding matrix into f32.
@@ -313,6 +395,8 @@ void mynah_slm_state_reset(mynah_slm_state *s) {
 static int embed_row(const mynah_slm_model_t *m, uint32_t token, float *out) {
     const ingot_tensor *e = m->embed;
     const uint32_t d = m->cfg.d_model;
+    /* An id past the table would read whatever follows it in the mapping. */
+    if (token >= m->cfg.vocab_size) return -1;
 
     uint64_t block_elems = 0, block_bytes = 0;
     if (ingot_type_geometry(e->type, &block_elems, &block_bytes) != 0) return -1;
@@ -330,8 +414,14 @@ static int embed_row(const mynah_slm_model_t *m, uint32_t token, float *out) {
 
 int mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
                             uint32_t n, float *logits_out) {
-    if (!s || !tokens || n == 0) return -1;
-    if (n == 1) return mynah_slm_forward(s, tokens[0], logits_out);
+    if (!s) return -1;
+    return mynah_slm_seq_forward_batch(s, &s->own, tokens, n, logits_out);
+}
+
+int mynah_slm_seq_forward_batch(mynah_slm_state *s, mynah_slm_seq *q,
+                                const uint32_t *tokens, uint32_t n, float *logits_out) {
+    if (!s || !tokens || n == 0 || !seq_fits(s, q)) return -1;
+    if (n == 1) return mynah_slm_seq_forward(s, q, tokens[0], logits_out);
     if (n > s->batch_max) return -1;
 
     const mynah_slm_model_t *m = s->model;
@@ -344,14 +434,14 @@ int mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
      * Prefill is therefore slow on LFM2 today, and honestly so. */
     if (c->n_attn_layers < c->n_layers) {
         for (uint32_t t = 0; t < n; t++)
-            if (mynah_slm_forward(s, tokens[t],
-                                  (t + 1 == n) ? logits_out : NULL) != 0)
+            if (mynah_slm_seq_forward(s, q, tokens[t],
+                                      (t + 1 == n) ? logits_out : NULL) != 0)
                 return -1;
         return 0;
     }
 
-    if (s->n_past + n > s->n_ctx) return -1;
-    const uint32_t pos0 = s->n_past;
+    if (q->n_past + n > q->n_ctx) return -1;
+    const uint32_t pos0 = q->n_past;
 
     for (uint32_t t = 0; t < n; t++) {
         float *row = s->bx + (size_t)t * c->d_model;
@@ -361,9 +451,9 @@ int mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
         if (s->on_embed) s->on_embed(s->on_layer_ctx, row, c->d_model);
     }
 
-    const int kv_is_f32 = (s->kv.type_k == MYNAH_SLM_KV_F32 &&
-                           s->kv.type_v == MYNAH_SLM_KV_F32);
-    const size_t per_layer = (size_t)s->n_ctx * c->kv_dim;
+    const int kv_is_f32 = (q->kv.type_k == MYNAH_SLM_KV_F32 &&
+                           q->kv.type_v == MYNAH_SLM_KV_F32);
+    const size_t per_layer = (size_t)q->n_ctx * c->kv_dim;
 
     for (uint32_t l = 0; l < c->n_layers; l++) {
         const mynah_slm_layer *w = &m->layers[l];
@@ -402,21 +492,21 @@ int mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
             mynah_slm_rope_apply(&s->rope, q_row, c->n_heads,    pos0 + t);
             mynah_slm_rope_apply(&s->rope, k_row, c->n_kv_heads, pos0 + t);
 
-            mynah_slm_kv_put_k(&s->kv, l, pos0 + t, k_row);
-            mynah_slm_kv_put_v(&s->kv, l, pos0 + t, v_slot + (size_t)t * c->kv_dim);
+            mynah_slm_kv_put_k(&q->kv, l, pos0 + t, k_row);
+            mynah_slm_kv_put_v(&q->kv, l, pos0 + t, v_slot + (size_t)t * c->kv_dim);
         }
 
         /* One pass over the history for the whole batch instead of one per
          * query. The triangle is handled by masking inside the kernel. */
         if (kv_is_f32)
             mynah_slm_attention_batch(s->battn, s->bq,
-                                      (const float *)s->kv.k + (size_t)l * per_layer,
-                                      (const float *)s->kv.v + (size_t)l * per_layer,
+                                      (const float *)q->kv.k + (size_t)l * per_layer,
+                                      (const float *)q->kv.v + (size_t)l * per_layer,
                                       pos0, n, c->n_heads, c->n_kv_heads,
                                       c->head_dim, c->q_dim, c->attn_scale,
                                       s->bscores);
         else
-            mynah_slm_attention_kv_batch(s->battn, s->bq, &s->kv, l, pos0, n,
+            mynah_slm_attention_kv_batch(s->battn, s->bq, &q->kv, l, pos0, n,
                                          c->n_heads, c->n_kv_heads, c->head_dim,
                                          c->q_dim, c->attn_scale, s->bscores,
                                          s->kgather, s->vgather);
@@ -464,7 +554,7 @@ int mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
                                      c->d_model);
     }
 
-    s->n_past += n;
+    q->n_past += n;
 
     if (logits_out) {
         const ingot_tensor *head = m->lm_head ? m->lm_head : m->embed;
@@ -487,8 +577,8 @@ int mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
  *
  * `in` and `out` must not alias: out is written token by token while in is
  * still being read. */
-static int shortconv(mynah_slm_state *s, const mynah_slm_layer *w, uint32_t l,
-                     const float *in, float *out, uint32_t n) {
+static int shortconv(mynah_slm_state *s, mynah_slm_seq *q, const mynah_slm_layer *w,
+                     uint32_t l, const float *in, float *out, uint32_t n) {
     const mynah_slm_model_t *m = s->model;
     const mynah_slm_config  *c = &m->cfg;
     const uint32_t d = c->d_model;
@@ -505,7 +595,7 @@ static int shortconv(mynah_slm_state *s, const mynah_slm_layer *w, uint32_t l,
     }
 
     /* op_slot, not l: 22 conv states for 30 layers. */
-    float *hist = s->conv_hist +
+    float *hist = q->conv_hist +
                   (size_t)c->op_slot[l] * (c->conv_taps - 1) * d;
     mynah_slm_shortconv_fir(s->conv_y, s->conv_bx, n,
                             (const float *)ingot_gguf_data(m->gguf, w->conv_w),
@@ -522,11 +612,17 @@ static int shortconv(mynah_slm_state *s, const mynah_slm_layer *w, uint32_t l,
 }
 
 int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
+    return mynah_slm_seq_forward(s, &s->own, token, logits_out);
+}
+
+int mynah_slm_seq_forward(mynah_slm_state *s, mynah_slm_seq *q, uint32_t token,
+                          float *logits_out) {
+    if (!s || !seq_fits(s, q)) return -1;
     const mynah_slm_model_t *m = s->model;
     const mynah_slm_config  *c = &m->cfg;
 
-    if (s->n_past >= s->n_ctx) return -1;          /* context exhausted */
-    const uint32_t pos  = s->n_past;
+    if (q->n_past >= q->n_ctx) return -1;          /* context exhausted */
+    const uint32_t pos  = q->n_past;
     const uint32_t n_kv = pos + 1;
 
     if (embed_row(m, token, s->x) != 0) return -1;
@@ -536,9 +632,9 @@ int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
         for (uint32_t i = 0; i < c->d_model; i++) s->x[i] *= c->embed_scale;
     if (s->on_embed) s->on_embed(s->on_layer_ctx, s->x, c->d_model);
 
-    const int kv_is_f32 = (s->kv.type_k == MYNAH_SLM_KV_F32 &&
-                           s->kv.type_v == MYNAH_SLM_KV_F32);
-    const size_t per_layer = (size_t)s->n_ctx * c->kv_dim;
+    const int kv_is_f32 = (q->kv.type_k == MYNAH_SLM_KV_F32 &&
+                           q->kv.type_v == MYNAH_SLM_KV_F32);
+    const size_t per_layer = (size_t)q->n_ctx * c->kv_dim;
 
     for (uint32_t l = 0; l < c->n_layers; l++) {
         const mynah_slm_layer *w = &m->layers[l];
@@ -555,7 +651,7 @@ int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
         /* A conv layer replaces the whole attention block and nothing else:
          * same pre-norm, same residual, same FFN after it. */
         if (c->layer_op[l] == MYNAH_SLM_OP_SHORTCONV) {
-            if (shortconv(s, w, l, s->h, s->proj, 1) != 0) return -1;
+            if (shortconv(s, q, w, l, s->h, s->proj, 1) != 0) return -1;
             goto residual;
         }
 
@@ -578,17 +674,17 @@ int mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out) {
         /* Stored AFTER RoPE, because RoPE is what will have been applied to
          * the cached value. Encoding first would store a different tensor. */
         const uint32_t kvl = c->op_slot[l];
-        mynah_slm_kv_put_k(&s->kv, kvl, pos, k_slot);
-        mynah_slm_kv_put_v(&s->kv, kvl, pos, v_slot);
+        mynah_slm_kv_put_k(&q->kv, kvl, pos, k_slot);
+        mynah_slm_kv_put_v(&q->kv, kvl, pos, v_slot);
 
         if (kv_is_f32)
             mynah_slm_attention_mt(s->attn, s->q,
-                                   (const float *)s->kv.k + (size_t)kvl * per_layer,
-                                   (const float *)s->kv.v + (size_t)kvl * per_layer,
+                                   (const float *)q->kv.k + (size_t)kvl * per_layer,
+                                   (const float *)q->kv.v + (size_t)kvl * per_layer,
                                    n_kv, c->n_heads, c->n_kv_heads, c->head_dim,
                                    c->attn_scale, s->scores_mt);
         else
-            mynah_slm_attention_kv_mt(s->attn, s->q, &s->kv, kvl, n_kv,
+            mynah_slm_attention_kv_mt(s->attn, s->q, &q->kv, kvl, n_kv,
                                       c->n_heads, c->n_kv_heads, c->head_dim,
                                       c->attn_scale, s->scores_mt);
 
@@ -626,7 +722,7 @@ residual:
     if (c->logit_scale != 1.0f)
         for (uint32_t i = 0; i < c->vocab_size; i++) s->logits[i] /= c->logit_scale;
 
-    s->n_past++;
+    q->n_past++;
     if (logits_out) memcpy(logits_out, s->logits, c->vocab_size * sizeof(float));
     return 0;
 }

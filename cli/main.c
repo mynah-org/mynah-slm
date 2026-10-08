@@ -333,7 +333,7 @@ static int cmd_ppl(const char *model_path, const char *path, int threads,
            mynah_slm_kv_type_name(kv_k), mynah_slm_kv_type_name(kv_v),
            scored, mean, exp(mean),
            n_bytes ? (nll / 0.6931471805599453) / (double)n_bytes : 0.0,
-           (double)mynah_slm_kv_bytes(&st.kv) / (1024.0 * 1024.0));
+           (double)mynah_slm_kv_bytes(&st.own.kv) / (1024.0 * 1024.0));
 
     free(logits); free(ids); free(text);
     mynah_slm_state_free(&st);

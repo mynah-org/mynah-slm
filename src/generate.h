@@ -70,9 +70,97 @@ typedef struct {
 void mynah_slm_gen_params_init(mynah_slm_gen_params *p);
 
 /* Runs to completion. Returns the number of tokens generated, or -1.
- * `t` is filled in as it goes and is safe to print afterwards. */
+ * `t` is filled in as it goes and is safe to print afterwards.
+ *
+ * A thin driver over mynah_slm_gen below, on the state's own sequence. */
 long mynah_slm_generate(mynah_slm_state *st, const mynah_slm_tokenizer *tok,
                         mynah_slm_sampler *sam, const mynah_slm_gen_params *p,
                         mynah_slm_timing *t);
+
+/* ── one generation, one step at a time ────────────────────────────────────
+ * Everything generate() keeps between tokens, as a value: the prompt cursor,
+ * the token to feed next, the step count, which channel is open, the three
+ * detokenizers. With it a caller other than generate() — a scheduler running
+ * many of these on one model — can take ONE step of a generation, or one
+ * slice of its prompt, and come back later.
+ *
+ * It is THE token loop: generate() is written on top of it, so the CLI, the
+ * serialized server and the scheduler cannot drift apart (rule 2).
+ *
+ *     gen_start
+ *     while (gen_prefill(g, ws, seq, slice) == 0) ;      prompt, in slices
+ *     while (gen_wants_step(g)) {
+ *         forward(seq, gen_next_token(g)) -> logits      alone or batched
+ *         gen_accept_logits(g, logits);                  sample, stop, emit
+ *     }
+ *     gen_finish                                          flush, end timing
+ *
+ * The params, tokenizer, sampler and timing are BORROWED and must outlive it;
+ * so must the prompt array the params point at. */
+
+typedef enum {
+    MYNAH_SLM_STOP_NONE = 0,   /* still running */
+    MYNAH_SLM_STOP_EOS,        /* a terminator was sampled */
+    MYNAH_SLM_STOP_LENGTH,     /* max_new reached */
+    MYNAH_SLM_STOP_CALLBACK,   /* a channel callback asked to stop */
+    MYNAH_SLM_STOP_ERROR,      /* the forward pass or the detokenizer failed */
+} mynah_slm_stop;
+
+typedef struct {
+    mynah_slm_gen_params p;
+    const mynah_slm_tokenizer *tok;
+    mynah_slm_sampler *sam;
+    mynah_slm_timing  *t;
+
+    size_t   prefilled;    /* prompt tokens already in the cache */
+    int      decoding;     /* prefill finished */
+    uint32_t next;         /* the token the next decode step feeds */
+    uint32_t step;         /* decode steps taken */
+    long     produced;     /* generated tokens, a terminator included */
+    int      chan;
+    mynah_slm_stop stop;
+    int      finished;     /* gen_finish ran */
+
+    /* One detokenizer PER CHANNEL. A shared one would carry a half-finished
+     * UTF-8 sequence across a marker and complete it on the wrong side. */
+    mynah_slm_detok d[3];
+} mynah_slm_gen;
+
+/* Arms a generation. Nothing is computed. Returns 0, or -1 on an empty
+ * prompt. The caller starts `t` (mynah_slm_timing_start) when it wants the
+ * clock to start — at admission, for a server. */
+int  mynah_slm_gen_start(mynah_slm_gen *g, const mynah_slm_tokenizer *tok,
+                         mynah_slm_sampler *sam, const mynah_slm_gen_params *p,
+                         mynah_slm_timing *t);
+
+/* Feeds up to `budget` more prompt tokens (0 = all that remain) into `q`, in
+ * batches no wider than the workspace allows. Every prompt token but the last
+ * only populates the cache; the last is the first decode step's input.
+ * Returns 1 when the prompt is done (and from then on), 0 when more remains,
+ * -1 on failure (and sets stop = ERROR). */
+int  mynah_slm_gen_prefill(mynah_slm_gen *g, mynah_slm_state *ws, mynah_slm_seq *q,
+                           uint32_t budget);
+
+/* Prompt tokens still to prefill. */
+size_t mynah_slm_gen_prefill_left(const mynah_slm_gen *g);
+
+/* Does this generation want a decode step: prefill done, not stopped, and
+ * fewer than max_new steps taken. */
+int  mynah_slm_gen_wants_step(const mynah_slm_gen *g);
+
+/* The token the next decode step must feed to the forward pass. */
+uint32_t mynah_slm_gen_next_token(const mynah_slm_gen *g);
+
+/* Consumes the logits of that step (modified in place by the sampler):
+ * sample, stop test, channel split, detokenize, callback. Returns 1 when the
+ * generation wants another step, 0 when it has stopped. */
+int  mynah_slm_gen_accept_logits(mynah_slm_gen *g, float *logits);
+
+/* Records a failed forward pass for this generation (stop = ERROR). */
+void mynah_slm_gen_fail(mynah_slm_gen *g);
+
+/* Closes the decode clock and flushes every channel's held bytes through its
+ * callback. Idempotent. */
+void mynah_slm_gen_finish(mynah_slm_gen *g);
 
 #endif /* MYNAH_SLM_GENERATE_H */

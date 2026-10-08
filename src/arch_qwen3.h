@@ -18,27 +18,26 @@
 typedef void (*mynah_slm_layer_cb)(void *ctx, uint32_t layer, const float *x, uint32_t dim);
 typedef void (*mynah_slm_final_cb)(void *ctx, const float *x, uint32_t dim);
 
-typedef struct {
+/* ── one sequence ──────────────────────────────────────────────────────────
+ * Everything that is a function of ONE token history, and nothing else: the
+ * KV cache, how far into it we are, and the short-conv history of a hybrid
+ * family. A request owns one; a scheduler holds many and runs them all on one
+ * workspace (below), because everything else a forward pass touches is a
+ * function of the model and the capacity, not of the sequence.
+ *
+ * Sized per request (prompt + max_tokens, capped), never to the model's
+ * context: a 40960-position cache per request would be most of the machine.
+ * mynah_slm_seq_reserve() reuses the allocation when it is big enough, so a
+ * slot that serves request after request allocates once. */
+typedef struct mynah_slm_seq {
     const mynah_slm_model_t *model;
-    mynah_slm_rope           rope;
-
-    uint32_t n_ctx;     /* allocated positions */
-    uint32_t n_past;    /* positions already in the cache */
-
-    /* The precision K and V are KEPT at, SEPARATELY — they are not equally
-     * sensitive. A key goes through the softmax exponent, where an error is
-     * amplified before it is normalized; a value is averaged with weights that
-     * sum to one, where errors partly cancel. Measured, that difference is
-     * worth several bits (docs/perf.md).
-     *
-     * f32 is the reference the parity gate was set on; anything else trades
-     * quality for bytes and has to be measured, never assumed. */
-    mynah_slm_kv_type kv_k, kv_v;   /* requested; the cache is built from these */
+    uint32_t n_ctx;     /* positions the cache holds */
+    uint32_t n_past;    /* positions already in it */
 
     /* [n_attn_layers][n_ctx][kv_dim], K and V possibly at different
-     * precisions. A position is contiguous, which is the order attention
-     * walks. Indexed by cfg.op_slot[layer], NOT by layer: on a hybrid model
-     * only 8 of 30 layers have a cache at all. */
+     * precisions (see kv_k/kv_v below). A position is contiguous, which is
+     * the order attention walks. Indexed by cfg.op_slot[layer], NOT by layer:
+     * on a hybrid model only 8 of 30 layers have a cache at all. */
     mynah_slm_kv kv;
 
     /* ── short-conv state, for hybrid families ──────────────────────────────
@@ -50,6 +49,56 @@ typedef struct {
      * architecture is interesting on a CPU: only 8 of 30 layers hold anything
      * that grows per token. NULL when the model has no conv layers. */
     float   *conv_hist;
+} mynah_slm_seq;
+
+/* Allocates a cache of n_ctx positions (clamped to the model's context).
+ * Returns 0, or -1 with nothing allocated and the reason in err. */
+int  mynah_slm_seq_init(mynah_slm_seq *q, const mynah_slm_model_t *m, uint32_t n_ctx,
+                        mynah_slm_kv_type kv_k, mynah_slm_kv_type kv_v,
+                        char *err, size_t errsz);
+void mynah_slm_seq_free(mynah_slm_seq *q);
+
+/* Empty the history; every allocation kept. */
+void mynah_slm_seq_reset(mynah_slm_seq *q);
+
+/* Make `q` an EMPTY sequence of at least n_ctx positions at these
+ * precisions, reusing what it already holds when that is big enough and of
+ * the same types — the admission-time call of a pooled slot. Allocates only
+ * when it must, and never from inside the token loop. `q` may be zeroed
+ * (never used). Returns 0, or -1 leaving `q` freed (zeroed). */
+int  mynah_slm_seq_reserve(mynah_slm_seq *q, const mynah_slm_model_t *m, uint32_t n_ctx,
+                           mynah_slm_kv_type kv_k, mynah_slm_kv_type kv_v,
+                           char *err, size_t errsz);
+
+/* ── the workspace ─────────────────────────────────────────────────────────
+ * Model-shared state: scratch, batch scratch, the RoPE table. One forward pass
+ * runs at a time on it, for whichever sequence it is handed. `own` is the
+ * sequence the single-sequence API (mynah_slm_forward & co.) runs on — empty
+ * (n_ctx 0) in a workspace a scheduler holds. */
+typedef struct {
+    const mynah_slm_model_t *model;
+    mynah_slm_rope           rope;
+
+    /* Positions the scratch and the RoPE table are sized for: the most any
+     * sequence run on this workspace may hold. */
+    uint32_t ctx_cap;
+
+    /* The precision K and V are KEPT at, SEPARATELY — they are not equally
+     * sensitive. A key goes through the softmax exponent, where an error is
+     * amplified before it is normalized; a value is averaged with weights that
+     * sum to one, where errors partly cancel. Measured, that difference is
+     * worth several bits (docs/perf.md).
+     *
+     * f32 is the reference the parity gate was set on; anything else trades
+     * quality for bytes and has to be measured, never assumed. These are what
+     * `own` was built with. */
+    mynah_slm_kv_type kv_k, kv_v;
+
+    mynah_slm_seq own;
+
+    /* Per-batch working room for the short-conv layers, allocated at full
+     * batch width like every other scratch so prefill never allocates. NULL
+     * when the model has no conv layers. */
     float   *conv_bcx;    /* [batch_max][3 * d_model] — B, C and x, in that order */
     float   *conv_bx;     /* [batch_max][d_model]     — the gated FIR input      */
     float   *conv_y;      /* [batch_max][d_model]     — the FIR output           */
@@ -61,8 +110,8 @@ typedef struct {
     float *attn;       /* attention output         [q_dim]    */
     float *proj;       /* projection output        [d_model]  */
     float *gate, *up;  /*                          [d_ff]     */
-    float *scores;     /* attention scores         [n_ctx]    */
-    /* Per-head scores, [n_heads][n_ctx]. Heads run concurrently and a shared
+    float *scores;     /* attention scores         [ctx_cap]  */
+    /* Per-head scores, [n_heads][ctx_cap]. Heads run concurrently and a shared
      * scores buffer would be the single piece of state that makes them
      * dependent — the classic way a threaded attention goes subtly wrong. */
     float *scores_mt;
@@ -76,12 +125,12 @@ typedef struct {
     uint32_t batch_max;               /* rows these hold */
     float *bx, *bh, *bq, *battn, *bproj, *bgate, *bup;
     float *strip;                     /* [STRIP_ROWS * max_cols] */
-    float *bscores;                   /* [batch_max * n_ctx] attention scores */
+    float *bscores;                   /* [batch_max * ctx_cap] attention scores */
     /* K and V are computed in f32 and then ENCODED into the cache, so they
      * need a landing place first. At f32 the encode is a memcpy; paying it
      * keeps one code path instead of two. */
     float *bk, *bv;                   /* [batch_max * kv_dim] */
-    float *kgather, *vgather;         /* [n_ctx * head_dim], batched attention */
+    float *kgather, *vgather;         /* [ctx_cap * head_dim], batched attention */
 
     mynah_slm_final_cb on_embed;   /* the residual stream before layer 0 */
     mynah_slm_layer_cb on_layer;
@@ -110,6 +159,15 @@ int  mynah_slm_state_init(mynah_slm_state *s, const mynah_slm_model_t *m,
                           uint32_t n_ctx, char *err, size_t errsz);
 void mynah_slm_state_free(mynah_slm_state *s);
 
+/* The precisions mynah_slm_state_init() would pick: f32, or what
+ * MYNAH_SLM_KV / _K / _V say. Always returns 0. */
+int  mynah_slm_kv_types_from_env(mynah_slm_kv_type *kv_k, mynah_slm_kv_type *kv_v);
+
+/* A workspace with no sequence of its own, for a caller that brings its own
+ * (a scheduler). ctx_cap bounds every sequence later run on it. */
+int  mynah_slm_state_init_workspace(mynah_slm_state *s, const mynah_slm_model_t *m,
+                                    uint32_t ctx_cap, char *err, size_t errsz);
+
 /* Drop the history without reallocating. */
 void mynah_slm_state_reset(mynah_slm_state *s);
 
@@ -130,6 +188,15 @@ int  mynah_slm_forward(mynah_slm_state *s, uint32_t token, float *logits_out);
  * path verbatim, so decode never changes shape. */
 int  mynah_slm_forward_batch(mynah_slm_state *s, const uint32_t *tokens,
                              uint32_t n, float *logits_out);
+
+/* The same two calls on a sequence the caller owns, run on `ws`'s scratch.
+ * mynah_slm_forward(s, ...) is exactly mynah_slm_seq_forward(s, &s->own, ...).
+ * -1 when the sequence is full, belongs to another model, or holds more
+ * positions than the workspace was sized for. Logits also land in ws->logits. */
+int  mynah_slm_seq_forward(mynah_slm_state *ws, mynah_slm_seq *q, uint32_t token,
+                           float *logits_out);
+int  mynah_slm_seq_forward_batch(mynah_slm_state *ws, mynah_slm_seq *q,
+                                 const uint32_t *tokens, uint32_t n, float *logits_out);
 
 /* Rows the batch scratch was sized for. `MYNAH_SLM_BATCH` in the environment
  * overrides the default — it is how the width gets measured rather than
