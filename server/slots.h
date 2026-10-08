@@ -57,6 +57,7 @@ typedef struct {
     double queue_ms;        /* arrival to admission */
     int    header_sent;     /* the SSE header went out (at admission) */
     int    client_gone;
+    int    shutdown;        /* cancelled because the server is stopping */
     char   error[192];      /* why it was refused or failed */
 } slots_result;
 
@@ -73,14 +74,18 @@ int  slots_start(mynah_slm_model_t *m, const mynah_slm_tokenizer *tok,
  *   slots_shutdown  marks the engine STOPPING (every later slots_run and
  *                   slots_health refuses, under a lock, without touching the
  *                   queue or the scheduler), closes the queue and joins the
- *                   scheduler thread. Nothing is freed.
+ *                   scheduler thread. Nothing is freed. The join is
+ *                   BOUNDED: every request still queued is cancelled at
+ *                   once (result.shutdown = 1, never admitted), and every
+ *                   live one at its next step once `grace_ms` has passed —
+ *                   one step or one prefill slice, not max_tokens.
  *   slots_free      waits, at most `wait_ms`, for the last thread inside
  *                   slots_run / slots_health to leave, then frees the queue,
  *                   the scheduler, the slots and the workspace. Returns 0, or
  *                   -1 when a thread is still inside: then NOTHING is freed
  *                   (the process is exiting; a leak is safe, a free under a
  *                   running thread is not). */
-void slots_shutdown(void);
+void slots_shutdown(int grace_ms);
 int  slots_free(int wait_ms);
 
 /* Runs one request on the calling connection thread: enqueue, then write

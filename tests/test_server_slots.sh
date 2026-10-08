@@ -230,6 +230,64 @@ echo "$R2" | grep -q " 503 " && ok "/health read after SIGTERM gets 503 ($R2)" \
     || bad "the server exits cleanly after a late request" "rc $RC; $(grep -A3 Sanitizer "$TMP/down.log" | head -8)"
 fi
 
+if want 8; then
+# ── 8. SIGTERM is a bounded shutdown, in both modes ──────────────────────────
+# Review R1: the scheduler used to drain every admitted AND queued job to
+# max_tokens before exiting (and the serialized server ran the current one
+# to the end). Now queued requests get 503 at once and running ones stop at
+# their next step with a final error event, so the process exits within
+# about a second (the accept loop's poll) instead of minutes.
+for MODE in 1 2; do
+    start "$TMP/term$MODE.log" --slots $MODE
+    python3 - "$PORT" "$SRV" > "$TMP/term$MODE.out" 2>&1 <<'PY'
+import json, os, signal, socket, sys, time
+port, pid = int(sys.argv[1]), int(sys.argv[2])
+b = json.dumps({'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 2500,
+                'stream': True, 'temperature': 0}).encode()
+req = b'POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n' % len(b) + b
+socks = []
+for _ in range(3):
+    s = socket.create_connection(('127.0.0.1', port)); s.sendall(req); socks.append(s)
+time.sleep(1.0)
+t = time.time()
+os.kill(pid, signal.SIGTERM)
+for _ in range(300):                      # 30 s at most
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        break
+    if open('/proc/%d/stat' % pid).read().split()[2] == 'Z':
+        break
+    time.sleep(0.1)
+print('exit_s %.1f' % (time.time() - t))
+for s in socks:
+    s.settimeout(2); data = b''
+    try:
+        while True:
+            c = s.recv(1 << 20)
+            if not c: break
+            data += c
+    except Exception:
+        pass
+    end = data[-200:]
+    ok = (b' 503 ' in data[:40]) or (b'server_shutdown' in end and end.endswith(b'data: [DONE]\n\n'))
+    print('client', 'final' if ok else 'NO-FINAL', len(data), repr(end[-90:]))
+PY
+    for _ in $(seq 100); do kill -0 $SRV 2>/dev/null || break; sleep 0.1; done
+    if kill -0 $SRV 2>/dev/null; then kill -9 $SRV; fi
+    wait $SRV 2>/dev/null; SRV=""
+    EX=$(awk '/^exit_s/ {print $2}' "$TMP/term$MODE.out")
+    python3 -c "import sys; sys.exit(0 if float('${EX:-99}') < 5.0 else 1)" \
+        && ok "--slots $MODE: SIGTERM with 3 long streams (running and queued) exits in ${EX}s" \
+        || bad "--slots $MODE: SIGTERM is a bounded shutdown" "exit after ${EX:-never}s"
+    N=$(grep -c "^client final" "$TMP/term$MODE.out")
+    [ "$N" -eq 3 ] && ok "--slots $MODE: every client got a final answer (error event + [DONE], or 503)" \
+        || bad "--slots $MODE: every client got a final answer" "$(cat "$TMP/term$MODE.out")"
+    grep -q "Sanitizer" "$TMP/term$MODE.log" && bad "--slots $MODE: no sanitizer report" \
+        "$(grep -A3 Sanitizer "$TMP/term$MODE.log" | head -8)"
+done
+fi
+
 echo
 [ $fail -eq 0 ] && echo "PASS" || { echo "FAILED ($fail)"; tail -n 20 "$TMP"/*.log; }
 exit $fail

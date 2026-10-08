@@ -47,6 +47,9 @@ typedef struct slots_req {
     /* Set by the writer (send failed / peer gone) or by an append that
      * found the client too slow; read by the scheduler's cancel poll. */
     atomic_int gone;
+    /* Set by the scheduler when it cancelled this request because the
+     * server is stopping (not because the client left). */
+    atomic_int shutdown;
 } slots_req;
 
 /* ── the engine ───────────────────────────────────────────────────────────── */
@@ -83,6 +86,13 @@ static struct {
     pthread_cond_t  life_cv;
     int             stopping;
     unsigned        users;
+
+    /* Shutdown deadline: once `halting` is set, queued requests are
+     * cancelled at once and live ones when the clock passes halt_at.
+     * halt_at is written before the release store and read after the
+     * acquire load. */
+    atomic_int      halting;
+    double          halt_at;
     const char     *product;        /* resolved before the thread starts */
 
     /* step scratch, scheduler thread only */
@@ -305,6 +315,13 @@ static int e_cancelled(void *ud, void *job) {
     slots_req *r = job;
     if (atomic_load(&r->gone)) return 1;
     if (http_peer_gone(r->conn)) { atomic_store(&r->gone, 1); return 1; }
+    /* Stopping: nobody new is admitted, and a live request runs on only
+     * for the grace period. Bounded shutdown, not a drain to max_tokens. */
+    if (atomic_load_explicit(&S.halting, memory_order_acquire) &&
+        (!r->started || mynah_slm_now() >= S.halt_at)) {
+        atomic_store(&r->shutdown, 1);
+        return 1;
+    }
     return 0;
 }
 
@@ -340,6 +357,7 @@ int slots_start(mynah_slm_model_t *m, const mynah_slm_tokenizer *tok,
     const uint32_t queue = queue_cap ? queue_cap : S.n_slots * 2;
     S.capacity = S.n_slots + queue;
     atomic_init(&S.in_flight, 0);
+    atomic_init(&S.halting, 0);
     /* The ring holds everything that may be in flight, so a push the
      * counter allowed can never fail on it. */
     S.q = mynah_slm_jobq_new(S.capacity);
@@ -368,10 +386,12 @@ int slots_start(mynah_slm_model_t *m, const mynah_slm_tokenizer *tok,
     return 0;
 }
 
-void slots_shutdown(void) {
+void slots_shutdown(int grace_ms) {
     pthread_mutex_lock(&S.life_mu);
     S.stopping = 1;
     pthread_mutex_unlock(&S.life_mu);
+    S.halt_at = mynah_slm_now() + (grace_ms > 0 ? grace_ms : 0) / 1000.0;
+    atomic_store_explicit(&S.halting, 1, memory_order_release);
     if (!S.running) return;
     /* The queue and the scheduler stay valid: a thread already inside
      * slots_run may still push (refused: closed) or wait for its retire. */
@@ -426,6 +446,7 @@ static int run_entered(http_conn *conn, const slots_params *p, slots_result *out
     pthread_mutex_init(&r->mu, NULL);
     pthread_cond_init(&r->cv, NULL);
     atomic_init(&r->gone, 0);
+    atomic_init(&r->shutdown, 0);
 
     if (atomic_fetch_add(&S.in_flight, 1) >= S.capacity ||
         mynah_slm_jobq_push(S.q, r) != 0) {
@@ -485,6 +506,7 @@ static int run_entered(http_conn *conn, const slots_params *p, slots_result *out
     out->tm = r->tm;
     out->queue_ms = r->admitted_at > 0.0 ? (r->admitted_at - r->created) * 1000.0 : 0.0;
     out->client_gone = atomic_load(&r->gone);
+    out->shutdown = atomic_load(&r->shutdown);
     if (r->oom && out->outcome == MYNAH_SLM_JOB_DONE) out->outcome = MYNAH_SLM_JOB_FAILED;
     snprintf(out->error, sizeof out->error, "%s", r->error);
     pthread_mutex_unlock(&r->mu);

@@ -90,14 +90,50 @@ typedef struct {
     unsigned long next_id;
 } server_ctx;
 
+static volatile sig_atomic_t g_stop;
+static void on_signal(int s) { (void)s; g_stop = 1; }
+
+/* Set by main once the accept loop has returned (g_stop is the signal
+ * handler's flag; this is the one other threads read). From then on new
+ * work and /health answer 503, queued requests leave with a 503, and a
+ * running generation stops at its next step once g_halt_at has passed
+ * (--shutdown-grace-ms; written before the release store). */
+static atomic_int g_shutting_down;
+static double     g_halt_at;
+
+static int shutdown_due(void) {
+    return atomic_load_explicit(&g_shutting_down, memory_order_acquire) &&
+           mynah_slm_now() >= g_halt_at;
+}
+
+/* The answer to a request the shutdown cut short: an error event when the
+ * stream has started, else a 503 the client can retry elsewhere. */
+static void send_shutdown(http_conn *conn, int header_sent) {
+    if (header_sent) {
+        static const char frame[] =
+            "data: {\"error\":{\"message\":\"the server is shutting down\","
+            "\"type\":\"server_shutdown\"}}\n\ndata: [DONE]\n\n";
+        http_write(conn, frame, sizeof frame - 1);
+    } else {
+        http_busy(conn, "the server is shutting down", 1);
+    }
+}
+
 /* ── the serialization gate ──────────────────────────────────────────────── */
 
-/* Enter the model, or give up because the client is gone. Polls the client
- * every 20 ms while queued: a disconnect while waiting costs no inference. */
+/* Enter the model, or give up because the client is gone (-1) or the
+ * server is shutting down (-2). Polls the client every 20 ms while queued: a
+ * disconnect while waiting costs no inference. */
 static int gate_enter(server_ctx *c, http_conn *conn) {
     pthread_mutex_lock(&c->gate_mu);
     c->gate_waiting++;
-    while (c->gate_busy) {
+    for (;;) {
+        if (atomic_load(&g_shutting_down)) {
+            c->gate_waiting--;
+            pthread_mutex_unlock(&c->gate_mu);
+            return -2;
+        }
+        if (!c->gate_busy) break;
         if (http_peer_gone(conn)) {
             c->gate_waiting--;
             c->cancelled_queued++;
@@ -123,13 +159,6 @@ static void gate_leave(server_ctx *c) {
     pthread_mutex_unlock(&c->gate_mu);
 }
 
-static volatile sig_atomic_t g_stop;
-static void on_signal(int s) { (void)s; g_stop = 1; }
-
-/* Set by main once the accept loop has returned (g_stop is the signal
- * handler's flag; this is the one other threads read). From then on new
- * work and /health answer 503. */
-static atomic_int g_shutting_down;
 
 static void record_tok_s(server_ctx *c, double v) {
     pthread_mutex_lock(&c->stat_mu);
@@ -159,11 +188,14 @@ typedef struct {
 typedef struct {
     http_conn *conn;
     emit_ctx  *answer;
+    int        shutdown;     /* stopped because the server is stopping */
 } cancel_ctx;
 
 static int chat_cancel(void *ctx) {
     cancel_ctx *cc = ctx;
-    return cc->answer->failed || http_peer_gone(cc->conn);
+    if (cc->answer->failed || http_peer_gone(cc->conn)) return 1;
+    if (shutdown_due()) { cc->shutdown = 1; return 1; }
+    return 0;
 }
 
 static int emit_append(emit_ctx *e, const char *text, size_t len) {
@@ -433,7 +465,11 @@ static void chat_slots(server_ctx *c, http_conn *conn, const uint32_t *ids, size
         return;
     }
 
-    if (r.outcome == MYNAH_SLM_JOB_CANCELLED || r.client_gone) {
+    if (r.shutdown && !r.client_gone) {
+        fprintf(stderr, "[%s stopped: the server is shutting down, %u tokens generated of "
+                        "max_tokens %d, queued %.1f ms]\n", req_id, r.tm.n_gen, max_new, r.queue_ms);
+        send_shutdown(conn, r.header_sent);
+    } else if (r.outcome == MYNAH_SLM_JOB_CANCELLED || r.client_gone) {
         pthread_mutex_lock(&c->gate_mu);
         if (r.tm.t0_ == 0.0) c->cancelled_queued++; else c->cancelled_running++;
         pthread_mutex_unlock(&c->gate_mu);
@@ -645,7 +681,14 @@ static void handle_chat(server_ctx *c, http_conn *conn,
     /* ── the serialization point ──
      * Asked before queueing and again once inside: a client that left while
      * the request was parsed or queued costs no inference at all. */
-    const int entered = gate_enter(c, conn) == 0;
+    const int gate = gate_enter(c, conn);
+    const int entered = gate == 0;
+    if (gate == -2) {
+        fprintf(stderr, "[%s refused while queued: the server is shutting down]\n", req_id);
+        send_shutdown(conn, stream);
+        free(ids); free(text);
+        goto cleanup_msgs;
+    }
     if (!entered || http_peer_gone(conn)) {
         if (entered) {
             pthread_mutex_lock(&c->gate_mu);
@@ -704,6 +747,18 @@ static void handle_chat(server_ctx *c, http_conn *conn,
     mynah_slm_state_free(&st);
     gate_leave(c);
     /* ── end serialization ── */
+
+    /* Cut short by the shutdown, with the client still there: tell it. */
+    if (cc.shutdown && !e.failed && !http_peer_gone(conn)) {
+        fprintf(stderr, "[%s stopped: the server is shutting down, %u tokens generated "
+                        "of max_tokens %d]\n", req_id, tm.n_gen, max_new);
+        send_shutdown(conn, stream);
+        free(e_tool.buf);
+        free(e.buf);
+        free(ids);
+        free(text);
+        goto cleanup_msgs;
+    }
 
     /* Gone mid-request: the model was released at the step boundary above.
      * Nobody is left to answer; say so in the log, with how far it got. */
@@ -786,6 +841,9 @@ static void usage_text(FILE *f) {
         "                       one scheduler thread (default 1 = serialized)\n"
         "  --queue N            requests waiting for a slot before a 503 (default 2N)\n"
         "  --send-timeout-ms N  a client that stops reading is dropped (default 5000)\n"
+        "  --shutdown-grace-ms N  on SIGTERM/SIGINT, running requests get N ms more\n"
+        "                       before they are stopped with an error event / 503;\n"
+        "                       queued ones get 503 at once (default 0)\n"
         "\n"
         "By default inference is serialized: one request at a time, all threads.\n"
         "With --slots N one scheduler thread steps up to N requests together.\n"
@@ -797,7 +855,7 @@ int main(int argc, char **argv) {
     const char *model_path = NULL, *host = "127.0.0.1";
     int port = 8080, n_ctx = 0, threads = 0;
     http_limits limits = { 0, 0, 0 };
-    int slots = 1, queue = 0;
+    int slots = 1, queue = 0, grace_ms = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -811,6 +869,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--slots") && v)           { slots = atoi(v); i++; }
         else if (!strcmp(a, "--queue") && v)           { queue = atoi(v); i++; }
         else if (!strcmp(a, "--send-timeout-ms") && v) { limits.send_timeout_ms = atoi(v); i++; }
+        else if (!strcmp(a, "--shutdown-grace-ms") && v) { grace_ms = atoi(v); i++; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage_text(stdout); return 0; }
         else { fprintf(stderr, "mynah-slm-server: unknown option '%s'\n", a); return 2; }
     }
@@ -856,8 +915,9 @@ int main(int argc, char **argv) {
      * engine is first marked stopping (later requests and /health answer
      * 503 without touching it), then its scheduler is joined, and only once
      * every connection has left is anything freed. */
-    atomic_store(&g_shutting_down, 1);
-    if (ctx.slots > 1) slots_shutdown();
+    g_halt_at = mynah_slm_now() + (grace_ms > 0 ? grace_ms : 0) / 1000.0;
+    atomic_store_explicit(&g_shutting_down, 1, memory_order_release);
+    if (ctx.slots > 1) slots_shutdown(grace_ms);
 
     /* Connection threads are detached and use the model and the tokenizer:
      * freeing those under a live one is a use-after-free, and even after the
