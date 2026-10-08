@@ -16,7 +16,7 @@
  * the other rows to mean anything.
  *
  *   make bench-qmat                         (all suites, 1 and 4 threads)
- *   tests/bench_qmat k3 [rounds] [threads]  e.g. tests/bench_qmat k3 21 4
+ *   tests/bench_qmat k3|k4|k6 [rounds] [threads]  e.g. tests/bench_qmat k3 21 4
  *
  * SPDX-License-Identifier: MIT */
 #include "kernels.h"
@@ -45,6 +45,8 @@
  * Kept here, not in src/, because it is a measurement baseline and nothing
  * else: the engine must not carry a second kernel for the sake of a bench.
  * Delete it with the K3 note's evidence when nobody needs to re-run that A/B. */
+#if (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) || defined(__AVX2__)
+#define BENCH_HAVE_OLD_INT8 1
 static float old_f16(const unsigned char *p) {
     const uint16_t h = (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
     return ingot_f16_to_f32(h);
@@ -63,8 +65,6 @@ static void old_scale_min(const unsigned char *scales, int index,
     }
 }
 
-#if (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) || defined(__AVX2__)
-#define BENCH_HAVE_OLD_INT8 1
 #if defined(__AVX2__)
 static inline int old_hsum256i(__m256i v) {
     __m128i a = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
@@ -385,6 +385,62 @@ static int suite_k4(int rounds) {
     return rc;
 }
 
+/* K6: is a dense 2-byte matvec already at the memory roof? A = a pure
+ * streaming read of the same bytes with the same row split (the roof this
+ * process can reach), B = ingot's BF16 / F16 matvec. If B is within a few
+ * percent of A, no dot-product instruction — BFDOT, VDPBF16PS — can make
+ * decode faster, and K6 is not worth writing (.work/bf16-native-matvec.md). */
+static int side_roof(const bctx *c, const unsigned char *w, size_t n, float *out) {
+    for (size_t r = 0; r < n; r++) {
+        const unsigned char *p = w + r * c->row_bytes;
+        uint64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        size_t i = 0;
+        for (; i + 32 <= c->row_bytes; i += 32) {
+            uint64_t v[4];
+            memcpy(v, p + i, sizeof v);
+            a0 += v[0]; a1 += v[1]; a2 += v[2]; a3 += v[3];
+        }
+        out[r] = (float)((a0 ^ a1 ^ a2 ^ a3) & 0xffu);
+    }
+    return 0;
+}
+
+static int suite_k6(int rounds) {
+    int rc = 0;
+    const int types[] = { INGOT_TYPE_BF16, INGOT_TYPE_F16 };
+    for (size_t t = 0; t < sizeof types / sizeof *types; t++) {
+        const int type = types[t];
+        printf("\nK6 — %s matvec vs the read roof: A = streaming read of the same bytes, "
+               "B = ingot %s matvec (A/B near 1.00x = at the roof)\n",
+               ingot_type_name(type), ingot_type_name(type));
+        header();
+        for (size_t s = 0; s < sizeof k_shapes / sizeof *k_shapes; s++) {
+            const shape *sh = &k_shapes[s];
+            if (sh->cols != 1024) continue;                 /* one width is enough */
+            const size_t row_bytes = sh->cols * 2;
+            unsigned char *w = mynah_slm_aligned_alloc(sh->rows * row_bytes);
+            float *x = mynah_slm_aligned_alloc(sh->cols * sizeof *x);
+            if (!w || !x) { printf("FAIL alloc\n"); return -1; }
+            qfx_rng r = { 99 + s };
+            for (size_t i = 0; i < sh->rows * sh->cols; i++) {
+                const float v = qfx_uniform(&r, -0.05f, 0.05f);
+                const uint16_t h = type == INGOT_TYPE_BF16 ? ingot_f32_to_bf16(v)
+                                                           : ingot_f32_to_f16(v);
+                memcpy(w + 2 * i, &h, 2);
+            }
+            qfx_activations(x, sh->cols, 3 + s);
+            const bctx c = { type, sh->cols, row_bytes, x, NULL };
+            rc |= ab(sh->name, "read", side_roof, "ingot", side_ingot, &c, w, sh->rows,
+                     rounds, 1e300);
+            const double mb = (double)sh->rows * (double)row_bytes / 1e6;
+            printf("|   (%.1f MB per call) | | | | | | | | |\n", mb);
+            mynah_slm_aligned_free(w);
+            mynah_slm_aligned_free(x);
+        }
+    }
+    return rc;
+}
+
 int main(int argc, char **argv) {
     const char *suite = argc > 1 ? argv[1] : "all";
     const int rounds = argc > 2 ? atoi(argv[2]) : 15;
@@ -403,6 +459,7 @@ int main(int argc, char **argv) {
         printf("\n== %d thread(s) ==\n", mynah_slm_threads_count());
         if (!strcmp(suite, "all") || !strcmp(suite, "k3")) rc |= suite_k3(rounds);
         if (!strcmp(suite, "all") || !strcmp(suite, "k4")) rc |= suite_k4(rounds);
+        if (!strcmp(suite, "all") || !strcmp(suite, "k6")) rc |= suite_k6(rounds);
         const char *comma = strchr(p, ',');
         if (!comma) break;
         p = comma + 1;
