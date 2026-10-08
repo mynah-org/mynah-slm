@@ -372,10 +372,13 @@ CUDA_CU_OBJ     := $(patsubst %.cu,$(CUDA_BUILD)/%.o,$(wildcard gpu/cuda/*.cu))
 # + the per-ISA kernel TUs (src/kern.h). They carry no CUDA code, so they are
 # shared with the CPU build rather than rebuilt under build/cuda/.
 CUDA_SRC_OBJ    := $(SRC:%.c=$(CUDA_BUILD)/%.o) $(KERN_OBJ)
-CUDA_TEST_OBJ   := $(CUDA_BUILD)/gpu/cuda/self_test.o $(CUDA_BUILD)/gpu/cuda/test_cuda.o
+# + the synthetic checkpoint writer: the self-test runs a whole decode step
+# on a fixture it writes itself (check_forward).
+CUDA_TEST_OBJ   := $(CUDA_BUILD)/gpu/cuda/self_test.o $(CUDA_BUILD)/gpu/cuda/test_cuda.o \
+                   $(CUDA_BUILD)/tests/fixture_model.o
 CUDA_ARCH_STAMP := $(CUDA_BUILD)/.cuda-arch
 
-$(CUDA_BUILD)/%.o: %.c $(CUDA_HDR)
+$(CUDA_BUILD)/%.o: %.c $(CUDA_HDR) $(wildcard tests/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -DMYNAH_SLM_ENABLE_CUDA -iquote gpu/cuda -c $< -o $@
 

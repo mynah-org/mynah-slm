@@ -543,6 +543,65 @@ serialized path and the server's own tests — a change with its own gate
 (`make test-server-slots` with `--device cpu-backend` byte-equal to the
 default), not a footnote to this one.
 
+### G2-d — the CUDA self-test runs a whole decode step
+
+`gpu/cuda/self_test.c` `check_forward` (F32 and Q4_K_M-mix): writes the
+tiny fixture with an untied head (so the greedy ids depend on the prompt)
+to a temp file, loads it like a checkpoint, creates the backend forward on
+BOTH the CPU and the CUDA backend (KV bf16), then:
+
+| Check | Gate |
+|---|---|
+| prefill 16 (device matmat + causal batch attention) + 7, last prompt logits | `max\|gpu − cpu\| <= 2e-4 · max\|cpu\|` |
+| 8 decode steps, both fed the CPU's pick, logits every step | same, per step |
+| the same 8 greedy ids through the device's 4-byte argmax (true greedy, its own picks) | identical while the CPU's top-2 margin > 2 × tol; a closer pair is printed as a tie and stops the comparison (the histories may part there) — on this fixture the smallest margin is 3.8e-3 (F32) / 1.5e-2 (Q4) against 2 × 4.1e-4, so all 8 are gated |
+| 3 rows at different positions, slots of a DEVICE pool, 4 multi steps | each row vs the CPU multi row, same tolerance |
+| the same rows stepped alone on the device | **bitwise**: the CUDA matmat is the GEMV kernel per row, every other op per row/head |
+
+The 2e-4 is twice the loosest per-op gate (attention, 1e-4): the per-op
+differences are reorders carried through 2 layers, RMSNorm and the head; a
+wiring bug costs O(max). Runs last in the self-test because it flushes both
+weight caches (the fixture's mapping goes away, and the caches are keyed by
+host pointer). `make cuda` links `tests/fixture_model.c` into `test_cuda`.
+
+What ran here: `make cuda` sm_89 and sm_80 (`BLAS=none`) compile and link
+it; `build/cuda/test_cuda` still exits 77 with no FAIL. The check's own
+logic was exercised by compiling `self_test.c` into a scratch harness with
+the CPU backend on BOTH sides: 10/10 ok, err 0 everywhere (as it must be),
+tolerances 3.4e-4 … 4.4e-4, the margins above. Bugs that harness found in
+the check before commit: the tie gate used a tolerance that stayed 0 when
+every err was 0, and a 17-token row prefill exceeded the 16-wide forward.
+
+**Not run: every line of it on a device.**
+
+### Downstream (L4 = sm_89, L40S = sm_89, A100 = sm_80, H100 = sm_90)
+
+```
+git checkout <branch> && make clean
+make cuda CUDA_ARCH=sm_89            # sm_80 / sm_90 for A100 / H100
+make cuda-test CUDA_ARCH=sm_89       # every kernel + check_forward; expect 0 FAIL
+compute-sanitizer --tool memcheck  build/cuda/test_cuda
+compute-sanitizer --tool racecheck build/cuda/test_cuda
+make test-device MYNAH_SLM_BIN=build/cuda/mynah-slm   # cuda now RUNS: "SKIP ... has a device"
+# CLI on the slow fixture, device vs reference (sampled ids should match
+# while the logits stay inside the gate; greedy is the cleaner first read):
+make tests/write_fixture && tests/write_fixture slow /tmp/slow.gguf
+build/cuda/mynah-slm run -m /tmp/slow.gguf -p "The ledger" --raw --temp 0 -n 64 --device cpu  > /tmp/a.txt
+build/cuda/mynah-slm run -m /tmp/slow.gguf -p "The ledger" --raw --temp 0 -n 64 --device cuda > /tmp/b.txt
+cmp /tmp/a.txt /tmp/b.txt   # a split after a near-tie is not by itself a bug: check_forward is the gate
+# then a real checkpoint, staged locally (never from the NAS):
+build/cuda/mynah-slm run -m models-local/<Q4_K_M>.gguf -p "Ciao! Come stai?" -n 128 --temp 0 --device cuda
+nsys profile -o g2 build/cuda/mynah-slm run -m models-local/<Q4_K_M>.gguf -p "..." -n 128 --temp 0 --device cuda
+```
+
+Read the nsys trace before quoting a tok/s: our kernels present, one
+`cudaStreamSynchronize` per token (the logits d2h), no host op between
+layers. Expect the decode to be launch-bound at first (~13 launches per
+layer, per-row RoPE/attention launches in a multi step): the speed work —
+CUDA graphs per width bucket, the 4-byte argmax for pure-greedy sampling,
+pinned host logits, a fused per-row RoPE/append/attention over the table —
+each gets its own A/B against this correct-first version.
+
 ## Conclusion
 
 G1-a: **KEEP** — the boundary exists, the CPU side of it is the engine's own
@@ -551,6 +610,12 @@ G1-b: **INCONCLUSIVE** until `make cuda-test` runs on a GPU. Compile/link on
 three architectures and the bitwise host half are real evidence for the
 layouts; none of it is evidence that a kernel launches or that a warp
 reduction is right.
+G2-a/b/c: **KEEP** — on the CPU backend the backend forward, the
+`--device` routing and the multi-sequence step are the reference to the bit
+(memcmp, mutation-checked); the default path is unchanged.
+G2-d: **INCONCLUSIVE** — written, compiled, its logic exercised with the CPU
+on both sides; whether the device agrees is the first `make cuda-test` on a
+GPU.
 
 ## Next action
 

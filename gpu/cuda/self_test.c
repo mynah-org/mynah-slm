@@ -40,13 +40,33 @@
  *                         sides; online softmax vs two-pass softmax.
  *   argmax                the exact index the CPU gives: ties to the first,
  *                         NaN never taken, x[0] NaN gives 0.
+ *   whole forward pass    2e-4 * max|cpu logits|, per logits row (G2-d,
+ *                         check_forward): twice the loosest per-op gate
+ *                         (attention, 1e-4) — the per-op differences are
+ *                         reorders that pass through 2 layers, RMSNorm and
+ *                         the head; a wiring bug costs O(max), not 1e-4.
+ *                         Greedy ids identical wherever the CPU's top-2
+ *                         margin exceeds 2 x that tolerance (the most two
+ *                         logits inside the gate can close); a closer pair
+ *                         is printed as a tie and not gated.
+ *   multi-sequence step   each row == the same row stepped alone ON THE
+ *                         DEVICE, bitwise: the CUDA matmat runs the GEMV
+ *                         kernel once per row (tokens on grid.y) and the
+ *                         other ops are per row / per head, so batching
+ *                         changes no arithmetic there.
  *
  * SPDX-License-Identifier: MIT */
 #include "cuda_self_test.h"
 
 #include "backend.h"
+#include "forward_backend.h"
 #include "kernels.h"
+#include "model.h"
+#include "mynah_slm.h"
 #include "qmat.h"
+
+/* the synthetic checkpoint writer the CPU tests use (tests/fixture_model.h) */
+#include "../../tests/fixture_model.h"
 
 #include "ingot/dtype.h"
 #include "ingot/quant.h"
@@ -55,6 +75,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 typedef struct {
     FILE *log;
@@ -483,6 +504,219 @@ static void check_slots(ctx *c) {
     mynah_slm_backend_slots_destroy(c->gpu, p);
 }
 
+/* ── a whole decode step on a tiny synthetic model (G2-d) ──────────────── */
+
+static uint32_t argmax_host(const float *x, size_t n, double *margin) {
+    size_t a = 0;
+    for (size_t i = 1; i < n; i++) if (x[i] > x[a]) a = i;
+    double second = -1e30;
+    for (size_t i = 0; i < n; i++) if (i != a && (double)x[i] > second) second = (double)x[i];
+    if (margin) *margin = (double)x[a] - second;
+    return (uint32_t)a;
+}
+
+/* One logits row against the CPU's: err and tol, reported. */
+static int report_row(ctx *c, const char *what, const float *gpu, const float *cpu, size_t n) {
+    const double tol = 2e-4 * max_abs(cpu, n);
+    const double e = max_diff(gpu, cpu, n);
+    report(c, what, e <= tol, e, tol);
+    return e <= tol;
+}
+
+/* The tiny fixture (2 layers, d 256, 8/2 heads of 64, untied head so the
+ * greedy ids depend on the prompt), written to a temp file and loaded like a
+ * checkpoint, run through src/forward_backend.c on BOTH backends: prefill
+ * (matmat + causal batch attention), the last prompt logits, 8 decode steps
+ * teacher-forced on the CPU's picks (logits compared every step), the same 8
+ * greedy ids through the device's 4-byte argmax, then a 3-row multi step
+ * over a device slot pool. Every number comes from the fixture's config. */
+static void check_forward(ctx *c, int quant) {
+    char what[128], path[256];
+    const char *qn = quant ? "Q4_K_M-mix" : "F32";
+    fixture_spec spec;
+    fixture_spec_tiny(&spec, quant);
+    spec.untied = 1;
+    if (fixture_write_temp(path, sizeof path, &spec, c->err, sizeof c->err) != 0) {
+        fail(c, "forward: write the fixture");
+        return;
+    }
+    mynah_slm_model_t *m = mynah_slm_load(path, c->err, sizeof c->err);
+    if (!m) { fail(c, "forward: load the fixture"); unlink(path); return; }
+
+    enum { NP = 23, STEPS = 8, ROWS = 3 };
+    const mynah_slm_bfwd_desc d = { 128, 16, ROWS, MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_BF16 };
+    mynah_slm_bfwd *fc = NULL, *fg = NULL;
+    mynah_slm_bseq qc, qg, qa;
+    memset(&qc, 0, sizeof qc); memset(&qg, 0, sizeof qg); memset(&qa, 0, sizeof qa);
+    mynah_slm_bslots *pool = NULL;
+    mynah_slm_bseq rc_[ROWS], rg[ROWS], rs[ROWS];
+    memset(rc_, 0, sizeof rc_); memset(rg, 0, sizeof rg); memset(rs, 0, sizeof rs);
+    float *lc = NULL, *lg = NULL, *mc = NULL, *mg = NULL, *solo = NULL;
+
+    snprintf(what, sizeof what, "forward %s: create on cpu and cuda", qn);
+    if (mynah_slm_bfwd_create(c->cpu, m, &d, &fc, c->err, sizeof c->err) != 0 ||
+        mynah_slm_bfwd_create(c->gpu, m, &d, &fg, c->err, sizeof c->err) != 0) {
+        fail(c, what);
+        goto out;
+    }
+    const size_t V = mynah_slm_bfwd_vocab(fc);
+    lc = malloc(V * sizeof *lc);
+    lg = malloc(V * sizeof *lg);
+    mc = malloc((size_t)ROWS * V * sizeof *mc);
+    mg = malloc((size_t)ROWS * V * sizeof *mg);
+    solo = malloc(V * sizeof *solo);
+    uint32_t ids[NP];
+    for (int i = 0; i < NP; i++) ids[i] = (uint32_t)(40 + (i * 7) % 60) % (uint32_t)V;
+
+    /* Prefill: one 16-wide batch (device matmat + causal attention), then
+     * 7 with the last token's logits. */
+    if (!lc || !lg || !mc || !mg || !solo ||
+        mynah_slm_bseq_init(fc, &qc, 128, c->err, sizeof c->err) != 0 ||
+        mynah_slm_bseq_init(fg, &qg, 128, c->err, sizeof c->err) != 0 ||
+        mynah_slm_bseq_init(fg, &qa, 128, c->err, sizeof c->err) != 0 ||
+        mynah_slm_bfwd_prefill(fc, &qc, ids, 16, NULL, c->err, sizeof c->err) != 0 ||
+        mynah_slm_bfwd_prefill(fc, &qc, ids + 16, NP - 16, lc, c->err, sizeof c->err) != 0 ||
+        mynah_slm_bfwd_prefill(fg, &qg, ids, 16, NULL, c->err, sizeof c->err) != 0 ||
+        mynah_slm_bfwd_prefill(fg, &qg, ids + 16, NP - 16, lg, c->err, sizeof c->err) != 0) {
+        snprintf(what, sizeof what, "forward %s: prefill", qn);
+        fail(c, what);
+        goto out;
+    }
+    snprintf(what, sizeof what, "forward %s: prefill, last prompt logits", qn);
+    report_row(c, what, lg, lc, V);
+
+    /* 8 decode steps, both fed the CPU's pick, logits every step. */
+    uint32_t pick[STEPS + 1];
+    double margin[STEPS + 1], worst_m = 1e30;
+    pick[0] = argmax_host(lc, V, &margin[0]);
+    int steps_ok = 1;
+    double worst_e = 0.0, worst_tol = 0.0, max_tol = 0.0;
+    for (int st = 0; st < STEPS; st++) {
+        if (mynah_slm_bfwd_step(fc, &qc, pick[st], lc, c->err, sizeof c->err) != 0 ||
+            mynah_slm_bfwd_step(fg, &qg, pick[st], lg, c->err, sizeof c->err) != 0) {
+            snprintf(what, sizeof what, "forward %s: decode step %d", qn, st);
+            fail(c, what);
+            goto out;
+        }
+        const double tol = 2e-4 * max_abs(lc, V), e = max_diff(lg, lc, V);
+        if (e > tol) steps_ok = 0;
+        if (tol > max_tol) max_tol = tol;
+        if (st == 0 || e * worst_tol > worst_e * tol) {   /* the worst e / tol */
+            worst_e = e;
+            worst_tol = tol;
+        }
+        pick[st + 1] = argmax_host(lc, V, &margin[st + 1]);
+    }
+    snprintf(what, sizeof what, "forward %s: %d decode steps, logits every step", qn, STEPS);
+    report(c, what, steps_ok, worst_e, worst_tol);
+
+    /* The same greedy run through the device argmax (4 bytes per token). */
+    uint32_t g[STEPS];
+    int ids_ok = 1, ties = 0;
+    if (mynah_slm_bfwd_prefill(fg, &qa, ids, 16, NULL, c->err, sizeof c->err) != 0 ||
+        mynah_slm_bfwd_prefill(fg, &qa, ids + 16, NP - 17, NULL, c->err, sizeof c->err) != 0) {
+        fail(c, "forward: argmax prefill");
+        goto out;
+    }
+    uint32_t next = ids[NP - 1];
+    for (int st = 0; st < STEPS; st++) {
+        if (mynah_slm_bfwd_step_argmax(fg, &qa, next, &g[st], c->err, sizeof c->err) != 0) {
+            fail(c, "forward: argmax step");
+            goto out;
+        }
+        next = g[st];
+        if (margin[st] < worst_m) worst_m = margin[st];
+        if (margin[st] <= 2.0 * max_tol) {
+            ties++;
+            fprintf(c->log, "     step %d: cpu top-2 margin %.3g within 2 x tol, not gated\n",
+                    st, margin[st]);
+            break;                    /* the histories may part here */
+        }
+        if (g[st] != pick[st]) { ids_ok = 0; break; }
+    }
+    snprintf(what, sizeof what, "forward %s: %d greedy ids via device argmax == cpu", qn, STEPS);
+    report(c, what, ids_ok, (double)ties, 0);
+    fprintf(c->log, "     smallest cpu top-2 margin %.3g (gate 2 x %.3g)\n", worst_m, max_tol);
+
+    /* 3 rows over a device slot pool, one multi step at a time. */
+    {
+        mynah_slm_bslots_desc pd;
+        memset(&pd, 0, sizeof pd);
+        mynah_slm_bfwd_kv_desc(fg, 128, &pd.kv);
+        pd.n_slots = ROWS;
+        if (mynah_slm_backend_slots_create(c->gpu, &pd, &pool, c->err, sizeof c->err) != 0) {
+            fail(c, "forward: device slot pool");
+            goto out;
+        }
+        mynah_slm_bseq *bc[ROWS], *bg[ROWS];
+        uint32_t tok[ROWS];
+        for (uint32_t r = 0; r < ROWS; r++) {
+            uint32_t slot = 0;
+            uint64_t gen = 0;
+            const uint32_t len = 4 + 5 * r;       /* rows at different positions */
+            if (mynah_slm_backend_slot_acquire(c->gpu, pool, &slot, &gen, c->err, sizeof c->err) != 0 ||
+                mynah_slm_bseq_bind(fg, &rg[r], mynah_slm_backend_slot_kv(pool, slot),
+                                    c->err, sizeof c->err) != 0 ||
+                mynah_slm_bseq_init(fc, &rc_[r], 128, c->err, sizeof c->err) != 0 ||
+                mynah_slm_bseq_init(fg, &rs[r], 128, c->err, sizeof c->err) != 0 ||
+                mynah_slm_bfwd_prefill(fc, &rc_[r], ids + r, len, NULL, c->err, sizeof c->err) != 0 ||
+                mynah_slm_bfwd_prefill(fg, &rg[r], ids + r, len, NULL, c->err, sizeof c->err) != 0 ||
+                mynah_slm_bfwd_prefill(fg, &rs[r], ids + r, len, NULL, c->err, sizeof c->err) != 0) {
+                fail(c, "forward: multi rows");
+                goto out;
+            }
+            bc[r] = &rc_[r];
+            bg[r] = &rg[r];
+            tok[r] = ids[r + len];
+        }
+        int rows_ok = 1, solo_ok = 1;
+        double we = 0.0, wt = 0.0;
+        for (int st = 0; st < 4; st++) {
+            if (mynah_slm_bfwd_multi(fc, bc, tok, ROWS, mc, c->err, sizeof c->err) != 0 ||
+                mynah_slm_bfwd_multi(fg, bg, tok, ROWS, mg, c->err, sizeof c->err) != 0) {
+                fail(c, "forward: multi step");
+                goto out;
+            }
+            for (uint32_t r = 0; r < ROWS; r++) {
+                const float *cr = mc + (size_t)r * V, *gr = mg + (size_t)r * V;
+                const double tol = 2e-4 * max_abs(cr, V), e = max_diff(gr, cr, V);
+                if (e > tol) rows_ok = 0;
+                if (e > we || wt == 0.0) { we = e; wt = tol; }
+                if (mynah_slm_bfwd_step(fg, &rs[r], tok[r], solo, c->err, sizeof c->err) != 0) {
+                    fail(c, "forward: solo step");
+                    goto out;
+                }
+                if (memcmp(solo, gr, V * sizeof(float)) != 0) solo_ok = 0;
+                tok[r] = argmax_host(cr, V, NULL);
+            }
+        }
+        snprintf(what, sizeof what, "forward %s: multi step, %d rows x 4 steps == cpu", qn, ROWS);
+        report(c, what, rows_ok, we, wt);
+        snprintf(what, sizeof what, "forward %s: device multi rows == device solo (bitwise)", qn);
+        report(c, what, solo_ok, solo_ok ? 0.0 : 1.0, 0);
+    }
+
+out:
+    for (uint32_t r = 0; r < ROWS; r++) {
+        mynah_slm_bseq_free(fc, &rc_[r]);
+        mynah_slm_bseq_free(fg, &rg[r]);
+        mynah_slm_bseq_free(fg, &rs[r]);
+    }
+    mynah_slm_backend_slots_destroy(c->gpu, pool);
+    mynah_slm_bseq_free(fc, &qc);
+    mynah_slm_bseq_free(fg, &qg);
+    mynah_slm_bseq_free(fg, &qa);
+    mynah_slm_bfwd_free(fc);
+    mynah_slm_bfwd_free(fg);
+    /* The weight caches are keyed by host pointer: the next fixture may be
+     * mapped at the same address, so both caches go before the unmap. */
+    mynah_slm_backend_weights_flush(c->cpu);
+    mynah_slm_backend_weights_flush(c->gpu);
+    mynah_slm_free(m);
+    unlink(path);
+    free(lc); free(lg); free(mc); free(mg); free(solo);
+}
+
 int mynah_slm_cuda_self_test(FILE *log) {
     ctx c;
     memset(&c, 0, sizeof c);
@@ -524,6 +758,9 @@ int mynah_slm_cuda_self_test(FILE *log) {
     check_argmax(&c);
     check_refusals(&c);
     check_slots(&c);
+    /* Last: it flushes both weight caches (the fixture is unmapped after). */
+    check_forward(&c, 0);
+    check_forward(&c, 1);
 
     mynah_slm_backend_close(c.gpu);
     mynah_slm_backend_close(c.cpu);
