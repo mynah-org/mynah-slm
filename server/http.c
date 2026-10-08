@@ -15,8 +15,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <time.h>
+#ifdef __linux__
+#include <linux/sockios.h>    /* SIOCOUTQ */
+#endif
 #include <unistd.h>
 
 #define MAX_BODY (4u * 1024u * 1024u)
@@ -32,9 +36,15 @@ struct http_conn {
      * last wrote (monotonic seconds). */
     int        head_sent;
     double     last_write;
+    /* http_send_stalled's state, writer thread only */
+    unsigned long long sent;            /* bytes handed to the kernel */
+    unsigned long long acked_seen;      /* sent - unacked, last time it moved */
+    double     acked_at;                /* when it last moved; 0 = nothing pending */
 };
 
 static int g_probe_ms = 250;
+static int g_send_ms = 5000;
+static int g_stream_sndbuf = 64 * 1024;
 
 static double mono_s(void) {
     struct timespec ts;
@@ -68,8 +78,32 @@ int http_write(http_conn *c, const char *data, size_t len) {
         }
         data += n;
         len  -= (size_t)n;
+        c->sent += (unsigned long long)n;
     }
     return 0;
+}
+
+int http_send_stalled(http_conn *c) {
+    if (atomic_load(&c->dead)) return 1;
+#if defined(__linux__) && defined(SIOCOUTQ)
+    int unacked = 0;
+    if (ioctl(c->fd, SIOCOUTQ, &unacked) != 0 || unacked <= 0) {
+        c->acked_at = 0.0;                    /* nothing pending: not stalled */
+        return 0;
+    }
+    const unsigned long long acked = c->sent - (unsigned long long)unacked;
+    const double now = mono_s();
+    if (c->acked_at == 0.0 || acked != c->acked_seen) {
+        c->acked_seen = acked;
+        c->acked_at = now;
+        return 0;
+    }
+    if ((now - c->acked_at) * 1000.0 < g_send_ms) return 0;
+    atomic_store(&c->dead, 1);
+    return 1;
+#else
+    return 0;
+#endif
 }
 
 int http_fd_probe(int fd) {
@@ -221,6 +255,10 @@ void http_begin_sse(http_conn *c) {
         "Connection: close\r\n\r\n";
     if (c->head_sent) return;
     c->head_sent = 1;
+    /* A stream lives long and is written to in small pieces: cap what a
+     * client that stopped reading can leave parked in our kernel. */
+    if (g_stream_sndbuf > 0)
+        setsockopt(c->fd, SOL_SOCKET, SO_SNDBUF, &g_stream_sndbuf, sizeof g_stream_sndbuf);
     http_write(c, head, sizeof head - 1);
 }
 
@@ -389,6 +427,8 @@ int http_serve(const char *host, int port, http_handler fn, void *user,
     const int send_ms = (limits && limits->send_timeout_ms > 0) ? limits->send_timeout_ms : 5000;
     const int recv_ms = (limits && limits->recv_timeout_ms > 0) ? limits->recv_timeout_ms : 30000;
     if (limits && limits->probe_interval_ms > 0) g_probe_ms = limits->probe_interval_ms;
+    g_send_ms = send_ms;
+    if (limits && limits->stream_sndbuf_bytes) g_stream_sndbuf = limits->stream_sndbuf_bytes;
     const int head_ms = (limits && limits->header_timeout_ms > 0) ? limits->header_timeout_ms : 10000;
     const int body_ms = (limits && limits->body_timeout_ms > 0) ? limits->body_timeout_ms : 30000;
 

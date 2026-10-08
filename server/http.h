@@ -47,6 +47,10 @@ typedef struct {
      * 0 = 10000 / 30000 ms. */
     int header_timeout_ms;
     int body_timeout_ms;
+    /* SO_SNDBUF for a streaming response (set by http_begin_sse), so the
+     * bytes a client that stopped reading can park in the kernel are
+     * bounded. 0 = 64 KiB; -1 = leave the system's autotuning. */
+    int stream_sndbuf_bytes;
 } http_limits;
 
 /* Accept loop. Returns when *stop becomes non-zero (a signal handler sets it)
@@ -107,6 +111,16 @@ int http_peer_eof(http_conn *c);
  * comment line (":\n\n") or one byte of JSON whitespace, both ignored by a
  * client. Call it from the thread that writes the response. */
 void http_keepalive(http_conn *c, int sse);
+
+/* Is the client still taking what we send? Linux: the bytes the peer has
+ * acknowledged (sent - SIOCOUTQ) must advance while anything is unacked; a
+ * client whose acknowledged count has not moved for the send timeout has
+ * stopped reading, and the connection is marked dead (1). A send() blocked
+ * on a full buffer is bounded by SO_SNDTIMEO already; this catches the
+ * client whose kernel buffers are still absorbing the stream, which with
+ * an autotuned send buffer can be minutes. Elsewhere: 0 (the capped send
+ * buffer and SO_SNDTIMEO are the bound). Writer thread only. */
+int http_send_stalled(http_conn *c);
 
 /* Has the response been started (status line written)? */
 int http_head_sent(const http_conn *c);

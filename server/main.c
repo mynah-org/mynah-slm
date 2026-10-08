@@ -200,6 +200,9 @@ static int chat_cancel(void *ctx) {
      * next step. */
     http_keepalive(cc->conn, cc->answer->stream);
     if (cc->answer->failed || http_peer_gone(cc->conn)) return 1;
+    /* A client that stopped reading: its kernel buffers can absorb a
+     * stream for minutes before a send() would block. */
+    if (http_send_stalled(cc->conn)) return 1;
     if (shutdown_due()) { cc->shutdown = 1; return 1; }
     return 0;
 }
@@ -859,6 +862,9 @@ static void usage_text(FILE *f) {
         "  --header-timeout-ms N  request headers must arrive within N ms of accept,\n"
         "  --body-timeout-ms N    the body within N ms after them; else 408\n"
         "                       (defaults 10000 / 30000)\n"
+        "  --stream-sndbuf-kb N SO_SNDBUF of a streaming response (default 64;\n"
+        "                       0 = system autotuning). A client whose acknowledged\n"
+        "                       bytes stop moving for --send-timeout-ms is dropped\n"
         "  --shutdown-grace-ms N  on SIGTERM/SIGINT, running requests get N ms more\n"
         "                       before they are stopped with an error event / 503;\n"
         "                       queued ones get 503 at once (default 0)\n"
@@ -872,7 +878,7 @@ static void usage_text(FILE *f) {
 int main(int argc, char **argv) {
     const char *model_path = NULL, *host = "127.0.0.1";
     int port = 8080, n_ctx = 0, threads = 0;
-    http_limits limits = { 0, 0, 0, 0, 0, 0 };
+    http_limits limits = { 0, 0, 0, 0, 0, 0, 0 };
     int slots = 1, queue = 0, grace_ms = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -891,6 +897,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--probe-interval-ms") && v) { limits.probe_interval_ms = atoi(v); i++; }
         else if (!strcmp(a, "--header-timeout-ms") && v) { limits.header_timeout_ms = atoi(v); i++; }
         else if (!strcmp(a, "--body-timeout-ms") && v)   { limits.body_timeout_ms = atoi(v); i++; }
+        else if (!strcmp(a, "--stream-sndbuf-kb") && v) {
+            const int kb = atoi(v);
+            limits.stream_sndbuf_bytes = kb > 0 ? kb * 1024 : -1;
+            i++;
+        }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage_text(stdout); return 0; }
         else { fprintf(stderr, "mynah-slm-server: unknown option '%s'\n", a); return 2; }
     }

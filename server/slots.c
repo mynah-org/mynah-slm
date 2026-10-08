@@ -500,6 +500,9 @@ static int run_entered(http_conn *conn, const slots_params *p, slots_result *out
         if (!atomic_load(&r->gone)) {
             pthread_mutex_unlock(&r->mu);
             http_keepalive(conn, p->stream);
+            /* Stopped reading: the acknowledged byte count has not moved
+             * for the send timeout. Reaped at the next iteration. */
+            if (http_send_stalled(conn)) atomic_store(&r->gone, 1);
             pthread_mutex_lock(&r->mu);
             if (http_head_sent(conn) && p->stream) out->header_sent = 1;
             /* Frames may have arrived while unlocked: their signal is gone. */

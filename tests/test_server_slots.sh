@@ -494,6 +494,49 @@ grep -q "^drippers.*408" "$TMP/loris.out" && ok "... and the drippers got 408" \
     || bad "a request past its header deadline gets 408" "$(grep drippers "$TMP/loris.out")"
 fi
 
+if want 13; then
+# ── 13. a stream client that stops reading is cancelled, in bounded time ─────
+# Review R4: a client that never reads (receive buffer 4 KiB) was still
+# being generated for after 80 s: the autotuned send buffer absorbed the
+# stream, so neither the 1 MiB pending cap nor the send timeout ever fired.
+# Now: the acknowledged byte count must move within --send-timeout-ms
+# (here 2000) while bytes are pending, and a stream's SO_SNDBUF is capped.
+# Bound: fill the client's window (well under a second here) + 2 s.
+for MODE in 1 2; do
+    start "$TMP/slowr$MODE.log" --slots $MODE --send-timeout-ms 2000
+    python3 - "$PORT" > "$TMP/slowr$MODE.out" 2>&1 <<'PY'
+import json, socket, sys, time
+port = int(sys.argv[1])
+def health():
+    s = socket.create_connection(('127.0.0.1', port)); s.sendall(b'GET /health HTTP/1.1\r\n\r\n')
+    r = b''
+    while True:
+        c = s.recv(65536)
+        if not c: break
+        r += c
+    return json.loads(r.split(b'\r\n\r\n', 1)[1])
+b = json.dumps({'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 6000,
+                'stream': True, 'temperature': 0}).encode()
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+s.connect(('127.0.0.1', port))
+s.sendall(b'POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n' % len(b) + b)
+t0 = time.time(); took = None
+while time.time() - t0 < 20:
+    time.sleep(0.25)
+    h = health()
+    if h.get('slot_cancelled', h['cancelled_running']) >= 1:
+        took = time.time() - t0; break
+print('cancelled_after', '%.1f' % took if took is not None else 'never')
+s.close()
+PY
+    stop
+    T=$(awk '/^cancelled_after/ {print $2}' "$TMP/slowr$MODE.out")
+    [ "$T" != never ] && python3 -c "import sys; sys.exit(0 if float('$T') < 10 else 1)" \
+        && ok "--slots $MODE: a stream client that stopped reading was cancelled after ${T}s" \
+        || bad "--slots $MODE: a stream client that stopped reading is cancelled within 10 s" "$(cat "$TMP/slowr$MODE.out")"
+done
+fi
+
 if grep -l "Sanitizer" "$TMP"/*.log >/dev/null 2>&1; then
     bad "no sanitizer report in any server log" "$(grep -h -A3 Sanitizer "$TMP"/*.log | head -12)"
 fi
