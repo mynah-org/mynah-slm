@@ -317,7 +317,9 @@ else
 endif
 CUDA_HDR        := $(HDR) $(wildcard gpu/cuda/*.h)
 CUDA_CU_OBJ     := $(patsubst %.cu,$(CUDA_BUILD)/%.o,$(wildcard gpu/cuda/*.cu))
-CUDA_SRC_OBJ    := $(SRC:%.c=$(CUDA_BUILD)/%.o)
+# + the per-ISA kernel TUs (src/kern.h). They carry no CUDA code, so they are
+# shared with the CPU build rather than rebuilt under build/cuda/.
+CUDA_SRC_OBJ    := $(SRC:%.c=$(CUDA_BUILD)/%.o) $(KERN_OBJ)
 CUDA_TEST_OBJ   := $(CUDA_BUILD)/gpu/cuda/self_test.o $(CUDA_BUILD)/gpu/cuda/test_cuda.o
 CUDA_ARCH_STAMP := $(CUDA_BUILD)/.cuda-arch
 
