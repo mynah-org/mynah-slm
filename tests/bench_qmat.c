@@ -339,6 +339,52 @@ static int suite_k3(int rounds) {
 #endif
 }
 
+static int side_ingot(const bctx *c, const unsigned char *w, size_t n, float *out) {
+    return ingot_matvec(c->type, w, n, c->cols, c->x, out);
+}
+
+/* K4: Q8_0 and Q6_K. A = ingot's f32 kernel (what runs today, with or without
+ * --fast), B = our int8 kernel. Different numerics on purpose: this is the
+ * decision "does turning int8 on for this type pay", so the outputs only have
+ * to agree to the int8 budget. */
+static int suite_k4(int rounds) {
+    if (strcmp(mynah_slm_matvec_int8_isa(), "none") == 0) {
+        printf("\nK4: SKIP — no int8 kernel in this build\n");
+        return 0;
+    }
+    int rc = 0;
+    const int types[] = { INGOT_TYPE_Q8_0, INGOT_TYPE_Q6_K };
+    for (size_t t = 0; t < sizeof types / sizeof *types; t++) {
+        const int type = types[t];
+        size_t elems = 0, bytes = 0;
+        qfx_geometry(type, &elems, &bytes);
+        printf("\nK4 — %s matvec: A = ingot f32 activations, B = ours int8 (%s)\n",
+               ingot_type_name(type), mynah_slm_matvec_int8_isa());
+        header();
+        for (size_t s = 0; s < sizeof k_shapes / sizeof *k_shapes; s++) {
+            const shape *sh = &k_shapes[s];
+            const size_t row_bytes = sh->cols / elems * bytes;
+            unsigned char *w = mynah_slm_aligned_alloc(sh->rows * row_bytes);
+            float *x = mynah_slm_aligned_alloc(sh->cols * sizeof *x);
+            mynah_slm_matvec_in *prep = mynah_slm_aligned_alloc(sizeof *prep);
+            if (!w || !x || !prep) { printf("FAIL alloc\n"); return -1; }
+            qfx_fill(type, w, sh->rows, sh->cols, 31 + s);
+            qfx_activations(x, sh->cols, 17 + s);
+            mynah_slm_matvec_prepare_int8(x, sh->cols, prep);
+            const bctx c = { type, sh->cols, row_bytes, x, prep };
+            rc |= ab(sh->name, "ingot", side_ingot, "int8", side_ours, &c, w, sh->rows,
+                     rounds, 5e-2);
+            if (s == 0)
+                rc |= ab("CONTROL ingot vs ingot", "ingot", side_ingot, "ingot", side_ingot,
+                         &c, w, sh->rows, rounds, 0.0);
+            mynah_slm_aligned_free(w);
+            mynah_slm_aligned_free(x);
+            mynah_slm_aligned_free(prep);
+        }
+    }
+    return rc;
+}
+
 int main(int argc, char **argv) {
     const char *suite = argc > 1 ? argv[1] : "all";
     const int rounds = argc > 2 ? atoi(argv[2]) : 15;
@@ -356,6 +402,7 @@ int main(int argc, char **argv) {
         mynah_slm_threads_init(n);
         printf("\n== %d thread(s) ==\n", mynah_slm_threads_count());
         if (!strcmp(suite, "all") || !strcmp(suite, "k3")) rc |= suite_k3(rounds);
+        if (!strcmp(suite, "all") || !strcmp(suite, "k4")) rc |= suite_k4(rounds);
         const char *comma = strchr(p, ',');
         if (!comma) break;
         p = comma + 1;

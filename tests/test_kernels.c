@@ -383,10 +383,15 @@ static void test_q4_k_matvec(void) {
      * standing example and it was earned: we wrote that kernel, measured it a
      * tie on ARM, upstreamed it to ingot where x86 had no vector path at all,
      * and then deleted ours because ingot's came back FASTER. See docs/perf.md
-     * — the boundary in CLAUDE.md rule 4 moved a kernel, not an opinion. */
-    check("we decline types we have no kernel for",
+     * — the boundary in CLAUDE.md rule 4 moved a kernel, not an opinion.
+     * Since K4 we have an INT8 Q6_K kernel, so the claim is narrower: with f32
+     * activations (have_int8 = 0, the default) Q6_K is ingot's. */
+    check("we decline Q6_K with f32 activations",
           mynah_slm_matvec(INGOT_TYPE_Q6_K, packed, ROWS, COLS, x, &prep, a) != 0,
-          "claimed a Q6_K kernel we did not write");
+          "claimed an f32 Q6_K kernel we did not write");
+    check("we decline Q8_0 with f32 activations",
+          mynah_slm_matvec(INGOT_TYPE_Q8_0, packed, ROWS, COLS, x, &prep, a) != 0,
+          "claimed an f32 Q8_0 kernel we did not write");
 
 done:
     free(w); free(x); free(a); free(b); free(packed);
@@ -471,8 +476,19 @@ static void int8_contract(const char *name, int type, int8_ref_fn ref,
     mynah_slm_matvec_prepare_int8(x, cols, prep);
 
     if (ingot_dequant_matrix(type, w, rows, cols, deq) != 0) {
-        check("ingot dequantizes the fixture", 0, name);
-        goto done;
+        /* ingot's Q8_0 dequant walks 256-value strides (its "stride trap"
+         * note), so an odd block count cannot go through it. Q8_0 is
+         * w = d * q and nothing else; the other Q8_0 shapes check this
+         * same twin against ingot itself. */
+        if (type != INGOT_TYPE_Q8_0) {
+            check("ingot dequantizes the fixture", 0, name);
+            goto done;
+        }
+        for (size_t b = 0; b < rows * cols / 32; b++) {
+            const unsigned char *blk = w + b * 34;
+            const float d = ingot_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+            for (int i = 0; i < 32; i++) deq[b * 32 + i] = d * (float)(int8_t)blk[2 + i];
+        }
     }
     /* Q4_K's min term is NOT int8: the kernel keeps it on the exact f32 sums.
      * ingot gives it to us independently — dequantize a copy with every nibble
@@ -564,6 +580,61 @@ static void test_int8_contracts(void) {
     int8_contract("Q4_K", INGOT_TYPE_Q4_K, mynah_slm_q4k_int8_ref, 103, 1024, 1);
     int8_contract("Q4_K", INGOT_TYPE_Q4_K, mynah_slm_q4k_int8_ref, 37, 256, 2);
     int8_contract("Q4_K", INGOT_TYPE_Q4_K, mynah_slm_q4k_int8_ref, 6, 3072, 3);
+    /* K4. Q8_0 at 96 columns has THREE blocks: an odd count, which the
+     * AVX-512 kernel (two blocks per zmm) handles with a masked tail. */
+    int8_contract("Q8_0", INGOT_TYPE_Q8_0, mynah_slm_q80_int8_ref, 103, 1024, 4);
+    int8_contract("Q8_0", INGOT_TYPE_Q8_0, mynah_slm_q80_int8_ref, 37, 96, 5);
+    int8_contract("Q8_0", INGOT_TYPE_Q8_0, mynah_slm_q80_int8_ref, 6, 3072, 6);
+    int8_contract("Q6_K", INGOT_TYPE_Q6_K, mynah_slm_q6k_int8_ref, 103, 1024, 7);
+    int8_contract("Q6_K", INGOT_TYPE_Q6_K, mynah_slm_q6k_int8_ref, 37, 256, 8);
+    int8_contract("Q6_K", INGOT_TYPE_Q6_K, mynah_slm_q6k_int8_ref, 6, 3072, 9);
+
+    /* Q8_0 activations of -128 never occur (the quantizer clamps |xq| to 127
+     * by construction: scale = amax/127), which is what keeps AVX2's
+     * sign(xq, w) from overflowing. Pin that, since the kernel relies on it. */
+    float spike[64];
+    for (int i = 0; i < 64; i++) spike[i] = (i % 7 == 0) ? -3.0f : 0.01f * (float)i;
+    mynah_slm_matvec_in *pp = malloc(sizeof *pp);
+    if (pp) {
+        mynah_slm_matvec_prepare_int8(spike, 64, pp);
+        int min = 0;
+        for (int i = 0; i < 64; i++) if (pp->xq[i] < min) min = pp->xq[i];
+        char d[64];
+        snprintf(d, sizeof d, "min xq %d", min);
+        check("int8 activations stay in [-127, 127]", min >= -127, d);
+        free(pp);
+    }
+
+    /* MYNAH_SLM_INT8_TYPES narrows per type: with only Q4_K selected, Q6_K
+     * falls back to ingot (declines) and Q4_K still runs int8; with Q4_K
+     * deselected, an int8-prepared Q4_K call takes the f32 path. */
+    if (strcmp(mynah_slm_matvec_int8_isa(), "none") != 0) {
+        enum { R = 8, C = 256 };
+        unsigned char *w6 = malloc(R * 210), *w4 = malloc(R * 144);
+        float *x = malloc(C * sizeof *x), o1[R], o2[R], o3[R];
+        mynah_slm_matvec_in *p = malloc(sizeof *p), *pf = malloc(sizeof *pf);
+        if (w6 && w4 && x && p && pf) {
+            qfx_fill(INGOT_TYPE_Q6_K, w6, R, C, 21);
+            qfx_fill(INGOT_TYPE_Q4_K, w4, R, C, 22);
+            qfx_activations(x, C, 23);
+            mynah_slm_matvec_prepare_int8(x, C, p);
+            mynah_slm_matvec_set_int8(0);
+            mynah_slm_matvec_prepare(x, C, pf);
+            mynah_slm_matvec_set_int8_types(1, 0, 0);
+            const int q6_declined = mynah_slm_matvec(INGOT_TYPE_Q6_K, w6, R, C, x, p, o1) != 0;
+            mynah_slm_matvec(INGOT_TYPE_Q4_K, w4, R, C, x, p, o1);
+            mynah_slm_q4k_int8_ref(w4, R, C, p, o2);
+            check("INT8_TYPES=q4_k: Q6_K goes back to ingot, Q4_K stays int8",
+                  q6_declined && memcmp(o1, o2, sizeof o1) == 0, "narrowing ignored");
+            mynah_slm_matvec_set_int8_types(0, 1, 1);
+            mynah_slm_matvec(INGOT_TYPE_Q4_K, w4, R, C, x, p, o1);
+            mynah_slm_matvec(INGOT_TYPE_Q4_K, w4, R, C, x, pf, o3);
+            check("INT8_TYPES without q4_k: Q4_K takes the f32 path",
+                  memcmp(o1, o3, sizeof o1) == 0, "int8 ran anyway");
+            mynah_slm_matvec_set_int8_types(1, 1, 1);
+        }
+        free(w6); free(w4); free(x); free(p); free(pf);
+    }
 }
 
 /* The KV round trip is what the format costs numerically, and it is worth a

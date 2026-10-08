@@ -71,7 +71,7 @@ int mynah_slm_project(const mynah_slm_model_t *m, const ingot_tensor *w,
      * be the expensive part. */
     mynah_slm_matvec_in prep;
     const mynah_slm_matvec_in *prepared = NULL;
-    if (mynah_slm_matvec_have(w->type) && cols % 256 == 0 &&
+    if (mynah_slm_matvec_have(w->type) && cols % 32 == 0 &&
         cols / 32 <= MYNAH_SLM_XSUM_MAX) {
         mynah_slm_matvec_prepare(in, cols, &prep);
         prepared = &prep;

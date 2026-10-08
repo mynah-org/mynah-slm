@@ -76,7 +76,9 @@ int mynah_slm_qmatmat(int type, const void *weights, size_t rows, size_t cols,
  * output[rows] = weights * input[cols], for a slice of the rows.
  *
  * Returns 0 when this build has a kernel of its own for `type` and used it,
- * and non-zero when the caller should fall back to ingot's. That is the whole
+ * and non-zero when the caller should fall back to ingot's. Q4_K is ours in
+ * both forms; Q8_0 and Q6_K are ours only with int8 activations
+ * (prep->have_int8), and ingot's otherwise. That is the whole
  * contract: we only take over where we have measured a win, everything else
  * keeps the validated generic path.
  *
@@ -105,6 +107,12 @@ void mynah_slm_matvec_prepare_int8(const float *input, size_t cols,
 int mynah_slm_q4k_int8_ref(const void *weights, size_t rows, size_t cols,
                            const mynah_slm_matvec_in *prep, float *output);
 
+/* The scalar twins of the Q8_0 and Q6_K int8 kernels (K4), same contract. */
+int mynah_slm_q80_int8_ref(const void *weights, size_t rows, size_t cols,
+                           const mynah_slm_matvec_in *prep, float *output);
+int mynah_slm_q6k_int8_ref(const void *weights, size_t rows, size_t cols,
+                           const mynah_slm_matvec_in *prep, float *output);
+
 /* Which int8 kernel this build runs ("avx512-vnni", "avx2", "neon-dotprod",
  * or "none"). A benchmark of the int8 path is invalid until this is printed. */
 const char *mynah_slm_matvec_int8_isa(void);
@@ -114,6 +122,10 @@ const char *mynah_slm_matvec_int8_isa(void);
  * it must be gated by `mynah-slm ppl` and never by a benchmark alone. */
 int  mynah_slm_matvec_int8_enabled(void);
 void mynah_slm_matvec_set_int8(int on);
+
+/* Narrow the int8 switch to some types (MYNAH_SLM_INT8_TYPES=q4_k,q8_0,q6_k,
+ * default all). Never enables int8 on its own. */
+void mynah_slm_matvec_set_int8_types(int q4_k, int q8_0, int q6_k);
 
 /* Does this build have a kernel of its own for `type`? */
 int mynah_slm_matvec_have(int type);
