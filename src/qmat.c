@@ -170,7 +170,13 @@ int mynah_slm_matvec_have(int type) {
 
 static void matvec_prepare(const float *input, size_t cols,
                            mynah_slm_matvec_in *prep, int want_int8) {
-    if (!input || !prep) return;
+    if (!prep) return;
+    /* The arrays are fixed-size: a wider vector is refused, not overrun, and
+     * `cols` says what was prepared so a product can check it (review N7). */
+    prep->cols = 0;
+    prep->have_int8 = 0;
+    if (!input || cols / 32 > MYNAH_SLM_XSUM_MAX) return;
+    prep->cols = cols;
     prep->have_int8 = want_int8 && cols <= MYNAH_SLM_XQ_MAX;
     int finite = 1;
 
@@ -241,7 +247,7 @@ const char *mynah_slm_matvec_int8_isa(void) {
 /* The scalar twins, from the scalar table whatever resolved. */
 int mynah_slm_q4k_int8_ref(const void *weights, size_t rows, size_t cols,
                            const mynah_slm_matvec_in *prep, float *output) {
-    if (!weights || !prep || !output || !prep->have_int8 || cols % 256 != 0)
+    if (!weights || !prep || !output || !prep->have_int8 || prep->cols != cols || cols % 256 != 0)
         return -1;
     mynah_slm_qmat_kern_scalar.q4k_i8((const unsigned char *)weights, rows, cols / 256,
                                       prep->xq, prep->xscale, prep->xsum, output);
@@ -250,7 +256,7 @@ int mynah_slm_q4k_int8_ref(const void *weights, size_t rows, size_t cols,
 
 int mynah_slm_q80_int8_ref(const void *weights, size_t rows, size_t cols,
                            const mynah_slm_matvec_in *prep, float *output) {
-    if (!weights || !prep || !output || !prep->have_int8 || cols % 32 != 0)
+    if (!weights || !prep || !output || !prep->have_int8 || prep->cols != cols || cols % 32 != 0)
         return -1;
     mynah_slm_qmat_kern_scalar.q80_i8((const unsigned char *)weights, rows, cols / 32,
                                       prep->xq, prep->xscale, output);
@@ -259,7 +265,7 @@ int mynah_slm_q80_int8_ref(const void *weights, size_t rows, size_t cols,
 
 int mynah_slm_q6k_int8_ref(const void *weights, size_t rows, size_t cols,
                            const mynah_slm_matvec_in *prep, float *output) {
-    if (!weights || !prep || !output || !prep->have_int8 || cols % 256 != 0)
+    if (!weights || !prep || !output || !prep->have_int8 || prep->cols != cols || cols % 256 != 0)
         return -1;
     mynah_slm_qmat_kern_scalar.q6k_i8((const unsigned char *)weights, rows, cols / 256,
                                       prep->xq, prep->xscale, output);
@@ -269,7 +275,7 @@ int mynah_slm_q6k_int8_ref(const void *weights, size_t rows, size_t cols,
 int mynah_slm_matvec(int type, const void *weights, size_t rows, size_t cols,
                      const float *input, const mynah_slm_matvec_in *prep,
                      float *output) {
-    if (!prep || !use_own_kernels()) return -1;
+    if (!prep || prep->cols != cols || !use_own_kernels()) return -1;
     const mynah_slm_qmat_kern *k = mynah_slm_kern_qmat();
     const unsigned char *w = (const unsigned char *)weights;
     const int int8 = prep->have_int8 && k->int8 && int8_type_on(type);

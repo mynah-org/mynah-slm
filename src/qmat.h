@@ -55,6 +55,7 @@ typedef struct {
     float  xscale[MYNAH_SLM_XSUM_MAX];
     int8_t xq[MYNAH_SLM_XQ_MAX];
     int    have_int8;
+    size_t cols;       /* the width prepared; 0 = nothing (too wide, or no input) */
 } mynah_slm_matvec_in;
 
 /* Rows dequantized per pass. Sized so one strip of f32 stays in L2 next to the

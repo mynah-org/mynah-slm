@@ -724,6 +724,28 @@ static void test_int8_types_parse(void) {
     }
 }
 
+/* The prepared activations are fixed-size arrays: a wider vector is refused
+ * rather than written past them, and a product refuses a preparation made
+ * for another width (review N7). */
+static void test_prepare_bounds(void) {
+    const size_t wide = (size_t)(MYNAH_SLM_XSUM_MAX + 1) * 32;
+    float *x = calloc(wide, sizeof *x);
+    mynah_slm_matvec_in *p = malloc(sizeof *p);
+    unsigned char *w = calloc(4 * (512 / 256), 144);
+    float o[4];
+    if (!x || !p || !w) { check("prepare bounds allocations", 0, "oom"); goto done; }
+    mynah_slm_matvec_set_enabled(1);
+    mynah_slm_matvec_prepare_int8(x, wide, p);
+    check("prepare refuses a vector wider than its arrays",
+          p->cols == 0 && p->have_int8 == 0, "it prepared past MYNAH_SLM_XSUM_MAX");
+    mynah_slm_matvec_prepare(x, 512, p);
+    check("a product refuses activations prepared for another width",
+          p->cols == 512 && mynah_slm_matvec(INGOT_TYPE_Q4_K, w, 4, 256, x, p, o) != 0 &&
+          mynah_slm_matvec(INGOT_TYPE_Q4_K, w, 4, 512, x, p, o) == 0, "width not checked");
+done:
+    free(x); free(p); free(w);
+}
+
 /* The contract at EVERY level this CPU can run (src/isa.c), not only the one
  * it picks by default: since K5 a single binary carries every variant, so a
  * kernel nobody's default machine selects still ships. */
@@ -914,6 +936,7 @@ int main(void) {
     printf("\n-- activations --\n");test_activations();
     printf("\n-- attention --\n");  test_attention();
     printf("\n-- quantized matvec --\n"); test_q4_k_matvec(); test_int8_types_parse();
+    test_prepare_bounds();
     mynah_slm_threads_init(4);
     printf("\n-- int8 matvec contract --\n"); test_int8_contracts();
     mynah_slm_threads_shutdown();

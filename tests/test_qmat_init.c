@@ -55,6 +55,7 @@ int main(void) {
         P.xsum[s] = acc;
     }
     P.have_int8 = 0;                      /* the f32 path: no int8 fields needed */
+    P.cols = COLS;
     mynah_slm_parallel_for(ROWS / PER, chunk, NULL);
 
     /* Same answer serially, now that everything is resolved. */
