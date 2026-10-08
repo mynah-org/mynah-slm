@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: MIT */
 #include "arch_qwen3.h"
 #include "generate.h"
+#include "isa.h"
 #include "model.h"
 #include "mynah_slm.h"
 #include "sampler.h"
@@ -56,6 +57,9 @@ static void usage(FILE *f) {
         "\n"
         "  Timings go to stderr, so stdout stays pipeable into mynah-tts.\n"
         "  mynah-slm --version\n"
+        "  mynah-slm --dispatch   which SIMD kernels resolved on this CPU, and why\n"
+        "                         (MYNAH_SLM_ISA=scalar|avx2|avx512|avx512vnni|neon|dotprod\n"
+        "                         narrows it, never widens it)\n"
         "\n"
         "No checkpoint yet? scripts/download_model.sh --list\n",
         mynah_slm_version());
@@ -517,6 +521,10 @@ static int cmd_run(run_opts *o) {
 int main(int argc, char **argv) {
     if (argc < 2) { usage(stderr); return 2; }
 
+    /* Which of our kernels this CPU resolved, and why — the proof a benchmark
+     * needs before it means anything. Exit 1 when something is not what was
+     * asked for (MYNAH_SLM_ISA clamped, a verify fell back, int8 unavailable). */
+    if (!strcmp(argv[1], "--dispatch")) return mynah_slm_isa_report(stdout);
     if (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v")) {
         printf("%s\n", mynah_slm_version());
         return 0;

@@ -1,13 +1,17 @@
 /* kernels.c — f32 reference implementations.
  *
- * Ported in shape from qwen-tts (docs/prior-art.md), stripped of the TTS half
- * and of the SIMD for now. Correctness first: these are what the parity gate
- * judges, and a vectorized kernel that is wrong costs far more to find than a
- * scalar one that is slow. The SIMD paths land behind these same signatures.
+ * Ported in shape from qwen-tts (docs/prior-art.md), stripped of the TTS half.
+ * Correctness first: these are what the parity gate judges, and a vectorized
+ * kernel that is wrong costs far more to find than a scalar one that is slow.
+ * The attention inner loops — the only part that is vectorized, because it is
+ * the only part whose cost grows with the context — live in attn_kern.c,
+ * compiled once per ISA, and are reached through the table src/isa.c
+ * resolved (kern.h).
  *
  * SPDX-License-Identifier: MIT */
 #include "kernels.h"
 
+#include "kern.h"
 #include "kvcache.h"
 
 #include "threads.h"
@@ -20,91 +24,6 @@
  * operands f32, so this goes through mynah_slm_sgemm (ours, or a vendor BLAS
  * when the build linked one) and not a hand-written loop. */
 #include "sgemm.h"
-
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#define MYNAH_SLM_NEON 1
-#elif defined(__AVX2__)
-#include <immintrin.h>
-#define MYNAH_SLM_AVX2 1
-#endif
-
-/* dot and scaled-accumulate over head_dim, the two inner loops of attention.
- *
- * Worth vectorizing and nothing else is, which took a measurement to learn:
- * at n_kv = 32 the whole non-matvec half of a decode step is 1.6 ms against
- * ~120 ms of matvec, i.e. 1.4%, and RMSNorm/RoPE/SwiGLU are a rounding error
- * inside that. Attention is the only one whose cost grows with the context,
- * and it grows fast — per token, across 28 layers:
- *
- *   n_kv    32 ->   1.4 ms      n_kv   512 ->  20 ms
- *   n_kv   128 ->   5.1 ms      n_kv  2048 -> 106 ms
- *
- * A 37 ms decode step is 4% attention at n_kv 32 and 287% at n_kv 2048. Every
- * benchmark in docs/perf.md so far used a 19-token prompt, which is precisely
- * where this does not show. Summarizing a meeting transcript is not. */
-static inline float dot_f32(const float *a, const float *b, uint32_t n) {
-#if defined(MYNAH_SLM_NEON)
-    float32x4_t s0 = vdupq_n_f32(0.0f), s1 = vdupq_n_f32(0.0f);
-    float32x4_t s2 = vdupq_n_f32(0.0f), s3 = vdupq_n_f32(0.0f);
-    uint32_t i = 0;
-    for (; i + 16 <= n; i += 16) {
-        s0 = vfmaq_f32(s0, vld1q_f32(a + i),      vld1q_f32(b + i));
-        s1 = vfmaq_f32(s1, vld1q_f32(a + i + 4),  vld1q_f32(b + i + 4));
-        s2 = vfmaq_f32(s2, vld1q_f32(a + i + 8),  vld1q_f32(b + i + 8));
-        s3 = vfmaq_f32(s3, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
-    }
-    float sum = vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3)));
-    for (; i < n; i++) sum += a[i] * b[i];
-    return sum;
-#elif defined(MYNAH_SLM_AVX2)
-    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
-    uint32_t i = 0;
-    for (; i + 16 <= n; i += 16) {
-        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
-        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), s1);
-    }
-    const __m256 t = _mm256_add_ps(s0, s1);
-    __m128 v = _mm_add_ps(_mm256_castps256_ps128(t), _mm256_extractf128_ps(t, 1));
-    v = _mm_hadd_ps(v, v);
-    v = _mm_hadd_ps(v, v);
-    float sum = _mm_cvtss_f32(v);
-    for (; i < n; i++) sum += a[i] * b[i];
-    return sum;
-#else
-    /* The scalar reference keeps a double accumulator; the vector paths above
-     * use four (NEON) or two (AVX2) f32 lanes, which is pairwise summation and
-     * so no worse in practice — the parity gate agrees, and it is the gate
-     * that decides, not the argument. */
-    double sum = 0.0;
-    for (uint32_t i = 0; i < n; i++) sum += (double)a[i] * (double)b[i];
-    return (float)sum;
-#endif
-}
-
-/* y[i] += w * x[i] */
-static inline void axpy_f32(float *y, const float *x, float w, uint32_t n) {
-#if defined(MYNAH_SLM_NEON)
-    const float32x4_t vw = vdupq_n_f32(w);
-    uint32_t i = 0;
-    for (; i + 16 <= n; i += 16) {
-        vst1q_f32(y + i,      vfmaq_f32(vld1q_f32(y + i),      vld1q_f32(x + i),      vw));
-        vst1q_f32(y + i + 4,  vfmaq_f32(vld1q_f32(y + i + 4),  vld1q_f32(x + i + 4),  vw));
-        vst1q_f32(y + i + 8,  vfmaq_f32(vld1q_f32(y + i + 8),  vld1q_f32(x + i + 8),  vw));
-        vst1q_f32(y + i + 12, vfmaq_f32(vld1q_f32(y + i + 12), vld1q_f32(x + i + 12), vw));
-    }
-    for (; i < n; i++) y[i] += w * x[i];
-#elif defined(MYNAH_SLM_AVX2)
-    const __m256 vw = _mm256_set1_ps(w);
-    uint32_t i = 0;
-    for (; i + 8 <= n; i += 8)
-        _mm256_storeu_ps(y + i, _mm256_fmadd_ps(_mm256_loadu_ps(x + i), vw,
-                                                _mm256_loadu_ps(y + i)));
-    for (; i < n; i++) y[i] += w * x[i];
-#else
-    for (uint32_t i = 0; i < n; i++) y[i] += w * x[i];
-#endif
-}
 
 /* ── allocation ───────────────────────────────────────────────────────────── */
 
@@ -291,47 +210,10 @@ void mynah_slm_add(float *y, const float *x, size_t n) {
 void mynah_slm_attention(float *out, const float *q, const float *k, const float *v,
                          uint32_t n_kv, uint32_t n_heads, uint32_t n_kv_heads,
                          uint32_t head_dim, float scale, float *scratch) {
-    const uint32_t group   = n_heads / n_kv_heads;
-    const uint32_t kv_dim  = n_kv_heads * head_dim;
-
-    for (uint32_t h = 0; h < n_heads; h++) {
-        const float   *qh  = q + (size_t)h * head_dim;
-        const uint32_t kvh = h / group;
-
-        for (uint32_t t = 0; t < n_kv; t++)
-            scratch[t] = dot_f32(qh, k + (size_t)t * kv_dim + (size_t)kvh * head_dim,
-                                 head_dim) * scale;
-        mynah_slm_softmax(scratch, n_kv);
-
-        float *oh = out + (size_t)h * head_dim;
-        memset(oh, 0, head_dim * sizeof *oh);
-        for (uint32_t t = 0; t < n_kv; t++)
-            axpy_f32(oh, v + (size_t)t * kv_dim + (size_t)kvh * head_dim,
-                     scratch[t], head_dim);
-    }
-}
-
-/* One head of the loop above, factored out so it can be a task. */
-static void attention_head(float *out, const float *q, const float *k, const float *v,
-                           uint32_t h, uint32_t n_kv, uint32_t n_heads,
-                           uint32_t n_kv_heads, uint32_t head_dim, float scale,
-                           float *scratch) {
-    const uint32_t group  = n_heads / n_kv_heads;
-    const uint32_t kv_dim = n_kv_heads * head_dim;
-
-    const float   *qh  = q + (size_t)h * head_dim;
-    const uint32_t kvh = h / group;
-
-    for (uint32_t t = 0; t < n_kv; t++)
-        scratch[t] = dot_f32(qh, k + (size_t)t * kv_dim + (size_t)kvh * head_dim,
-                             head_dim) * scale;
-    mynah_slm_softmax(scratch, n_kv);
-
-    float *oh = out + (size_t)h * head_dim;
-    memset(oh, 0, head_dim * sizeof *oh);
-    for (uint32_t t = 0; t < n_kv; t++)
-        axpy_f32(oh, v + (size_t)t * kv_dim + (size_t)kvh * head_dim,
-                 scratch[t], head_dim);
+    const mynah_slm_attn_kern *a = mynah_slm_kern_attn();
+    for (uint32_t h = 0; h < n_heads; h++)
+        a->f32_head(out, q, k, v, h, n_kv, n_heads, n_kv_heads, head_dim, scale,
+                    scratch);
 }
 
 typedef struct {
@@ -343,9 +225,9 @@ typedef struct {
 
 static void attn_task(void *ctx, int i) {
     attn_job *j = ctx;
-    attention_head(j->out, j->q, j->k, j->v, (uint32_t)i, j->n_kv,
-                   j->n_heads, j->n_kv_heads, j->head_dim, j->scale,
-                   j->scratch + (size_t)i * j->n_kv);
+    mynah_slm_kern_attn()->f32_head(j->out, j->q, j->k, j->v, (uint32_t)i, j->n_kv,
+                                    j->n_heads, j->n_kv_heads, j->head_dim, j->scale,
+                                    j->scratch + (size_t)i * j->n_kv);
 }
 
 void mynah_slm_attention_mt(float *out, const float *q, const float *k, const float *v,
@@ -413,20 +295,10 @@ static void attn_kv_task(void *ctx, int i) {
     attn_kv_job *j = ctx;
     const uint32_t h = (uint32_t)i;
     const uint32_t group = j->n_heads / j->n_kv_heads;
-    const uint32_t kvh = h / group;
-    const float scale = j->scale;
-
-    const float *qh = j->q + (size_t)h * j->head_dim;
-    float *scores = j->scratch + (size_t)h * j->n_kv;
-
-    for (uint32_t t = 0; t < j->n_kv; t++)
-        scores[t] = mynah_slm_kv_dot_k(j->cache, j->layer, t, kvh, qh) * scale;
-    mynah_slm_softmax(scores, j->n_kv);
-
-    float *oh = j->out + (size_t)h * j->head_dim;
-    memset(oh, 0, j->head_dim * sizeof *oh);
-    for (uint32_t t = 0; t < j->n_kv; t++)
-        mynah_slm_kv_axpy_v(j->cache, j->layer, t, kvh, scores[t], oh);
+    mynah_slm_kern_attn()->kv_head(j->out + (size_t)h * j->head_dim,
+                                   j->q + (size_t)h * j->head_dim, j->cache,
+                                   j->layer, h / group, j->n_kv, j->scale,
+                                   j->scratch + (size_t)h * j->n_kv);
 }
 
 void mynah_slm_attention_kv_mt(float *out, const float *q,

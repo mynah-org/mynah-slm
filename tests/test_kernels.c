@@ -11,6 +11,7 @@
  * SPDX-License-Identifier: MIT */
 #include "kernels.h"
 
+#include "isa.h"
 #include "kvcache.h"
 #include "qfixture.h"
 #include "qmat.h"
@@ -574,8 +575,8 @@ done:
     free(exact); free(full); free(prep);
 }
 
-static void test_int8_contracts(void) {
-    printf("     int8 kernel in this build: %s\n", mynah_slm_matvec_int8_isa());
+static void test_int8_contracts_here(void) {
+    printf("     int8 kernel resolved: %s\n", mynah_slm_matvec_int8_isa());
     /* rows not a multiple of four; one, four and twelve blocks per row */
     int8_contract("Q4_K", INGOT_TYPE_Q4_K, mynah_slm_q4k_int8_ref, 103, 1024, 1);
     int8_contract("Q4_K", INGOT_TYPE_Q4_K, mynah_slm_q4k_int8_ref, 37, 256, 2);
@@ -635,6 +636,21 @@ static void test_int8_contracts(void) {
         }
         free(w6); free(w4); free(x); free(p); free(pf);
     }
+}
+
+/* The contract at EVERY level this CPU can run (src/isa.c), not only the one
+ * it picks by default: since K5 a single binary carries every variant, so a
+ * kernel nobody's default machine selects still ships. */
+static void test_int8_contracts(void) {
+    static const char *const levels[] = { "avx512vnni", "avx512", "avx2", "dotprod",
+                                          "neon", "scalar" };
+    for (size_t i = 0; i < sizeof levels / sizeof *levels; i++) {
+        const int id = mynah_slm_isa_parse(levels[i]);
+        if (id < 0 || mynah_slm_isa_narrow(levels[i]) != id) continue;
+        printf("  [ISA ceiling %s]\n", levels[i]);
+        test_int8_contracts_here();
+    }
+    mynah_slm_isa_narrow(NULL);
 }
 
 /* The KV round trip is what the format costs numerically, and it is worth a

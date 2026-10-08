@@ -117,11 +117,15 @@ int mynah_slm_q6k_int8_ref(const void *weights, size_t rows, size_t cols,
  * or "none"). A benchmark of the int8 path is invalid until this is printed. */
 const char *mynah_slm_matvec_int8_isa(void);
 
-/* Is the int8-activation path compiled in AND enabled? It is a QUALITY
+/* Is the int8-activation path requested AND available on the resolved ISA
+ * (src/isa.c)? It is a QUALITY
  * trade-off, not a free win: activations quantized to int8 per 32 values, so
  * it must be gated by `mynah-slm ppl` and never by a benchmark alone. */
 int  mynah_slm_matvec_int8_enabled(void);
 void mynah_slm_matvec_set_int8(int on);
+
+/* Was int8 asked for, whether or not the resolved ISA can honour it? */
+int  mynah_slm_matvec_int8_requested(void);
 
 /* Narrow the int8 switch to some types (MYNAH_SLM_INT8_TYPES=q4_k,q8_0,q6_k,
  * default all). Never enables int8 on its own. */

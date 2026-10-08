@@ -1,0 +1,149 @@
+/* isa_verify.c — verify-on-first-use, before a vector table is trusted.
+ *
+ * mynah-tts's rule (src/qmat.c, "THE PROVE-ON-FIRST-USE GATE"): a kernel
+ * nobody here could execute must not resolve on the strength of a CPUID bit
+ * and a careful reading. Each candidate table is run once per process against
+ * the scalar table on small, deliberately awkward fixtures — row counts that
+ * are not a multiple of four, an odd number of Q8_0 blocks, lengths that leave
+ * vector tails — and a disagreement drops that table, visibly
+ * (`mynah-slm --dispatch`), instead of shipping a wrong answer fast.
+ *
+ * The int8 kernels are held to their CONTRACT: bit-identical to the scalar
+ * twin (memcmp). The f32 kernels are held to a tolerance, because their scalar
+ * twins round in a different order by design; the tolerance catches a wrong
+ * shuffle or a wrong nibble order (errors of order 1), not a reordered sum.
+ *
+ * Small on purpose: this runs at model load (or at first use), single
+ * threaded, and must cost well under a millisecond.
+ *
+ * SPDX-License-Identifier: MIT */
+#include "isa.h"
+
+#include "kern.h"
+#include "kvcache.h"
+#include "qmat.h"
+
+#include "ingot/dtype.h"
+
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static uint32_t vrand(uint32_t *s) {
+    *s = *s * 1664525u + 1013904223u;
+    return *s >> 8;
+}
+
+static float vfrand(uint32_t *s) {
+    return (float)((int)(vrand(s) % 20001u) - 10000) / 10000.0f;
+}
+
+static void put_f16(unsigned char *p, float v) {
+    const uint16_t h = ingot_f32_to_f16(v);
+    p[0] = (unsigned char)(h & 0xffu);
+    p[1] = (unsigned char)(h >> 8);
+}
+
+static void fill_bytes(unsigned char *p, size_t n, uint32_t seed) {
+    for (size_t i = 0; i < n; i++) p[i] = (unsigned char)vrand(&seed);
+}
+
+/* max |a - b| / max |b|; a NaN anywhere fails */
+static double rel_diff(const float *a, const float *b, size_t n) {
+    double worst = 0.0, scale = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        if (!isfinite(a[i]) || !isfinite(b[i])) return INFINITY;
+        const double d = fabs((double)a[i] - (double)b[i]);
+        if (d > worst) worst = d;
+        if (fabs((double)b[i]) > scale) scale = fabs((double)b[i]);
+    }
+    return scale > 0.0 ? worst / scale : worst;
+}
+
+/* ── qmat ──────────────────────────────────────────────────────────────────*/
+
+int mynah_slm_isa_verify_qmat(const mynah_slm_qmat_kern *k, char *why, size_t n) {
+    const mynah_slm_qmat_kern *ref = &mynah_slm_qmat_kern_scalar;
+    enum { R = 6, C = 512, C8 = 96 };            /* 4 + 2 rows; 3 Q8_0 blocks */
+    static unsigned char w4[R * (C / 256) * 144], w6[R * (C / 256) * 210],
+                         w8[R * (C8 / 32) * 34];
+    static mynah_slm_matvec_in p, p8;            /* ~22 KB each: not on a stack */
+    float x[C], x8[C8], a[R], b[R];
+
+    fill_bytes(w4, sizeof w4, 11u);
+    fill_bytes(w6, sizeof w6, 12u);
+    fill_bytes(w8, sizeof w8, 13u);
+    uint32_t s = 14u;
+    for (size_t i = 0; i < sizeof w4 / 144; i++) {
+        put_f16(w4 + i * 144,     0.01f + 0.01f * (float)(vrand(&s) % 7u));
+        put_f16(w4 + i * 144 + 2, 0.005f * (float)(vrand(&s) % 5u));
+    }
+    for (size_t i = 0; i < sizeof w6 / 210; i++) put_f16(w6 + i * 210 + 208, 0.001f);
+    for (size_t i = 0; i < sizeof w8 / 34; i++)  put_f16(w8 + i * 34, 0.002f);
+    for (int i = 0; i < C; i++)  x[i]  = vfrand(&s) * ((i % 37 == 0) ? 9.0f : 1.0f);
+    for (int i = 0; i < C8; i++) x8[i] = vfrand(&s);
+    mynah_slm_matvec_prepare_int8(x, C, &p);
+    mynah_slm_matvec_prepare_int8(x8, C8, &p8);
+
+    k->q4k_f32(w4, R, C / 256, x, p.xsum, a);
+    ref->q4k_f32(w4, R, C / 256, x, p.xsum, b);
+    const double rel = rel_diff(a, b, R);
+    if (!(rel < 1e-4)) { snprintf(why, n, "q4_k f32 rel %.1e", rel); return -1; }
+
+    if (!k->int8) return 0;
+    k->q4k_i8(w4, R, C / 256, p.xq, p.xscale, p.xsum, a);
+    ref->q4k_i8(w4, R, C / 256, p.xq, p.xscale, p.xsum, b);
+    if (memcmp(a, b, sizeof a) != 0) { snprintf(why, n, "q4_k int8 != twin"); return -1; }
+    k->q80_i8(w8, R, C8 / 32, p8.xq, p8.xscale, a);
+    ref->q80_i8(w8, R, C8 / 32, p8.xq, p8.xscale, b);
+    if (memcmp(a, b, sizeof a) != 0) { snprintf(why, n, "q8_0 int8 != twin"); return -1; }
+    k->q6k_i8(w6, R, C / 256, p.xq, p.xscale, a);
+    ref->q6k_i8(w6, R, C / 256, p.xq, p.xscale, b);
+    if (memcmp(a, b, sizeof a) != 0) { snprintf(why, n, "q6_k int8 != twin"); return -1; }
+    return 0;
+}
+
+/* ── attn ──────────────────────────────────────────────────────────────────*/
+
+int mynah_slm_isa_verify_attn(const mynah_slm_attn_kern *k, char *why, size_t n) {
+    const mynah_slm_attn_kern *ref = &mynah_slm_attn_kern_scalar;
+    enum { H = 4, KVH = 2, HD = 64, NKV = 7 };
+    static float q[H * HD], kk[NKV * KVH * HD], vv[NKV * KVH * HD];
+    float oa[H * HD], ob[H * HD], sa[NKV], sb[NKV];
+    const float scale = 0.125f;
+    uint32_t s = 21u;
+    for (int i = 0; i < H * HD; i++) q[i] = vfrand(&s);
+    for (int i = 0; i < NKV * KVH * HD; i++) { kk[i] = vfrand(&s); vv[i] = vfrand(&s); }
+
+    for (uint32_t h = 0; h < H; h++) {
+        k->f32_head(oa, q, kk, vv, h, NKV, H, KVH, HD, scale, sa);
+        ref->f32_head(ob, q, kk, vv, h, NKV, H, KVH, HD, scale, sb);
+    }
+    double rel = rel_diff(oa, ob, H * HD);
+    if (!(rel < 1e-4)) { snprintf(why, n, "f32 head rel %.1e", rel); return -1; }
+
+    const mynah_slm_kv_type types[] = { MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_Q8,
+                                        MYNAH_SLM_KV_Q4, MYNAH_SLM_KV_F32 };
+    for (size_t t = 0; t < sizeof types / sizeof *types; t++) {
+        mynah_slm_kv c;
+        if (mynah_slm_kv_init(&c, types[t], types[t], 1, NKV, KVH, HD) != 0) {
+            snprintf(why, n, "kv init failed");
+            return -1;
+        }
+        for (uint32_t pos = 0; pos < NKV; pos++) {
+            mynah_slm_kv_put_k(&c, 0, pos, kk + (size_t)pos * KVH * HD);
+            mynah_slm_kv_put_v(&c, 0, pos, vv + (size_t)pos * KVH * HD);
+        }
+        k->kv_head(oa, q, &c, 0, 1, NKV, scale, sa);
+        ref->kv_head(ob, q, &c, 0, 1, NKV, scale, sb);
+        mynah_slm_kv_free(&c);
+        rel = rel_diff(oa, ob, HD);
+        if (!(rel < 1e-4)) {
+            snprintf(why, n, "kv %s head rel %.1e", mynah_slm_kv_type_name(types[t]), rel);
+            return -1;
+        }
+    }
+    return 0;
+}

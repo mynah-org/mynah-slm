@@ -16,9 +16,10 @@
  * the other rows to mean anything.
  *
  *   make bench-qmat                         (all suites, 1 and 4 threads)
- *   tests/bench_qmat k3|k4|k6 [rounds] [threads]  e.g. tests/bench_qmat k3 21 4
+ *   tests/bench_qmat k3|k4|k5|k6 [rounds] [threads]  e.g. tests/bench_qmat k3 21 4
  *
  * SPDX-License-Identifier: MIT */
+#include "kern.h"
 #include "kernels.h"
 #include "qfixture.h"
 #include "qmat.h"
@@ -441,6 +442,46 @@ static int suite_k6(int rounds) {
     return rc;
 }
 
+/* K5: what runtime dispatch costs. A = the resolved table's row kernel called
+ * directly, B = the same kernel reached through mynah_slm_matvec (table
+ * lookup, pthread_once fast path, type switch). Same kernel, same numbers, so
+ * the ratio is the overhead and nothing else. Smallest real shape, where a
+ * fixed per-call cost shows most. */
+static int side_direct_q4k(const bctx *c, const unsigned char *w, size_t n, float *out) {
+    const mynah_slm_qmat_kern *k = mynah_slm_kern_qmat();
+    if (c->prep->have_int8 && k->int8)
+        k->q4k_i8(w, n, c->cols / 256, c->prep->xq, c->prep->xscale, c->prep->xsum, out);
+    else
+        k->q4k_f32(w, n, c->cols / 256, c->x, c->prep->xsum, out);
+    return 0;
+}
+
+static int suite_k5(int rounds) {
+    printf("\nK5 — dispatch overhead: A = %s table called directly, B = mynah_slm_matvec\n",
+           mynah_slm_kern_qmat()->name);
+    header();
+    int rc = 0;
+    const shape *sh = &k_shapes[0];
+    const size_t row_bytes = sh->cols / 256 * 144;
+    unsigned char *w = mynah_slm_aligned_alloc(sh->rows * row_bytes);
+    float *x = mynah_slm_aligned_alloc(sh->cols * sizeof *x);
+    mynah_slm_matvec_in *prep = mynah_slm_aligned_alloc(sizeof *prep);
+    if (!w || !x || !prep) { printf("FAIL alloc\n"); return -1; }
+    qfx_fill(INGOT_TYPE_Q4_K, w, sh->rows, sh->cols, 51);
+    qfx_activations(x, sh->cols, 52);
+    for (int int8 = 0; int8 < 2; int8++) {
+        if (int8) mynah_slm_matvec_prepare_int8(x, sh->cols, prep);
+        else { mynah_slm_matvec_set_int8(0); mynah_slm_matvec_prepare(x, sh->cols, prep); }
+        const bctx c = { INGOT_TYPE_Q4_K, sh->cols, row_bytes, x, prep };
+        rc |= ab(int8 ? "1024x1024 Q4_K int8" : "1024x1024 Q4_K f32", "direct",
+                 side_direct_q4k, "dispatch", side_ours, &c, w, sh->rows, rounds, 0.0);
+    }
+    mynah_slm_aligned_free(w);
+    mynah_slm_aligned_free(x);
+    mynah_slm_aligned_free(prep);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     const char *suite = argc > 1 ? argv[1] : "all";
     const int rounds = argc > 2 ? atoi(argv[2]) : 15;
@@ -460,6 +501,7 @@ int main(int argc, char **argv) {
         if (!strcmp(suite, "all") || !strcmp(suite, "k3")) rc |= suite_k3(rounds);
         if (!strcmp(suite, "all") || !strcmp(suite, "k4")) rc |= suite_k4(rounds);
         if (!strcmp(suite, "all") || !strcmp(suite, "k6")) rc |= suite_k6(rounds);
+        if (!strcmp(suite, "all") || !strcmp(suite, "k5")) rc |= suite_k5(rounds);
         const char *comma = strchr(p, ',');
         if (!comma) break;
         p = comma + 1;

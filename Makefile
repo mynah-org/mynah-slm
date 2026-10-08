@@ -77,8 +77,61 @@ INGOT_LIB := $(INGOT_DIR)/libingot.a
 CFLAGS  += -I$(INGOT_DIR)/include
 LDFLAGS += $(INGOT_LIB)
 
-SRC := $(wildcard src/*.c)
-OBJ := $(SRC:%.c=build/%.o)
+# ── kernel TUs: runtime ISA dispatch (src/kern.h, .work/isa-runtime-dispatch.md)
+# Every SIMD kernel we own is compiled ONCE PER ISA into its own object, and
+# src/isa.c picks one table per family at run time (CPUID / getauxval /
+# sysctl, narrowed by MYNAH_SLM_ISA, verified against the scalar table). So a
+# portable build (ARCH_FLAGS=-march=x86-64-v2 or armv8-a) still runs the
+# AVX2 / AVX-512 VNNI / dotprod kernels where the CPU has them, and
+# `mynah-slm --dispatch` proves which ones resolved.
+#
+# The architecture comes from the COMPILER, not the host: a cross build with
+# CC=aarch64-linux-gnu-gcc gets the arm64 set.
+KERN_MACHINE := $(shell $(CC) $(ARCH_FLAGS) -dumpmachine 2>/dev/null)
+ifneq ($(filter x86_64% amd64%,$(KERN_MACHINE)),)
+  KERN_ARCH := x86
+else ifneq ($(filter aarch64% arm64%,$(KERN_MACHINE)),)
+  KERN_ARCH := arm64
+else
+  KERN_ARCH := generic
+endif
+
+# which TUs each family has, per architecture (src/isa.c lists the same sets)
+KERN_QMAT_x86      := scalar avx2 avx512vnni
+KERN_ATTN_x86      := scalar avx2
+KERN_QMAT_arm64    := scalar neon neon_dotprod
+KERN_ATTN_arm64    := scalar neon
+KERN_QMAT_generic  := scalar
+KERN_ATTN_generic  := scalar
+
+# per-TU ISA flags, added AFTER ARCH_FLAGS so they win. The x86 "scalar" and
+# "avx2" TUs also switch the wider ISAs OFF, so a -march=native build's
+# MYNAH_SLM_ISA=scalar really is a pre-AVX2 run and not one the compiler
+# quietly auto-vectorized with AVX-512.
+KF_x86_scalar      := -mno-avx2 -mno-fma
+KF_x86_avx2        := -mavx2 -mfma -mf16c -mno-avx512f
+KF_x86_avx512      := -mavx2 -mfma -mf16c -mavx512f -mavx512bw -mavx512vl -mavx512dq
+KF_x86_avx512vnni  := $(KF_x86_avx512) -mavx512vnni
+KF_arm64_scalar    :=
+KF_arm64_neon      :=
+# only when the baseline lacks it: a second -march would override -mcpu
+KF_arm64_neon_dotprod := $(if $(findstring __ARM_FEATURE_DOTPROD,$(shell $(CC) $(ARCH_FLAGS) -dM -E -xc /dev/null 2>/dev/null)),,-march=armv8.2-a+dotprod)
+KF_generic_scalar  :=
+
+KID_scalar       := 0
+KID_neon         := 1
+KID_neon_dotprod := 2
+KID_avx2         := 3
+KID_avx512       := 4
+KID_avx512vnni   := 5
+
+KERN_SRC := src/qmat_kern.c src/attn_kern.c
+KERN_OBJ := $(foreach t,$(KERN_QMAT_$(KERN_ARCH)),build/kern/qmat_$(t).o) \
+            $(foreach t,$(KERN_ATTN_$(KERN_ARCH)),build/kern/attn_$(t).o)
+KERN_TU_FLAGS = $(KF_$(KERN_ARCH)_$*) -DMYNAH_SLM_KERN_TU=$* -DMYNAH_SLM_KERN_ID=$(KID_$*)
+
+SRC := $(filter-out $(KERN_SRC),$(wildcard src/*.c))
+OBJ := $(SRC:%.c=build/%.o) $(KERN_OBJ)
 HDR := $(wildcard src/*.h) $(wildcard include/*.h)
 
 CFLAGS += -Iinclude
@@ -109,6 +162,7 @@ help:
 	@echo "  cuda         opt-in CUDA build in build/cuda/ (CUDA_ARCH=sm_89; needs nvcc)"
 	@echo "  cuda-test    build and run the CUDA self-test (skips without a device)"
 	@echo "  bench-qmat   kernel A/B on synthetic matrices (no model)"
+	@echo "  dispatch     which kernels resolved on this CPU (mynah-slm --dispatch)"
 	@echo "  check-x86    cross-compile the AVX2 paths"
 	@echo "  test-x86-rosetta  build x86_64 and RUN the suite under Rosetta"
 	@echo "  golden-dump  regenerate the oracle's reference activations"
@@ -143,6 +197,18 @@ build/%.o: %.c $(HDR)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# the kernel TUs: one source, one object per ISA (see KERN_* above)
+build/kern/qmat_%.o: src/qmat_kern.c $(HDR)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(KERN_TU_FLAGS) -c $< -o $@
+build/kern/attn_%.o: src/attn_kern.c $(HDR)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(KERN_TU_FLAGS) -c $< -o $@
+
+# What dispatch resolved on this machine, and why. No model needed.
+dispatch: mynah-slm
+	@./mynah-slm --dispatch
+
 $(INGOT_LIB):
 	$(MAKE) -C $(INGOT_DIR) lib CC="$(CC)" CFLAGS="-O2 $(ARCH_FLAGS)"
 
@@ -152,7 +218,7 @@ $(OBJ): | $(INGOT_LIB)
 # test_ingot needs no model: it pins the container-layer contract (block
 # geometry, dequant coverage) so a bad subtree update fails here and not
 # three modules later.
-TESTS := tests/test_backend tests/test_batch tests/test_ingot tests/test_sgemm tests/test_threads tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer tests/test_tools
+TESTS := tests/test_backend tests/test_batch tests/test_ingot tests/test_sgemm tests/test_threads tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer tests/test_tools tests/test_isa
 
 # The parity harness is built like the others but driven separately: it dumps
 # activations, and tools/eval/compare.py is what judges them.
@@ -300,14 +366,20 @@ cuda-test: $(CUDA_BUILD)/test_cuda
 X86_TARGET ?= x86_64-apple-macos13.3
 X86_SRC := $(SRC) $(wildcard tests/*.c)
 
+X86_CHECK = $(CC) -target $(X86_TARGET) -std=c11 -O2 -Wall -Wextra -D_DEFAULT_SOURCE -iquote src -Iinclude \
+	    -I$(INGOT_DIR)/include -DMYNAH_SLM_BUILD='"x86check"' -D$(BLAS_DEF) -DACCELERATE_NEW_LAPACK
 check-x86:
 	@mkdir -p build/x86
-	@for f in $(X86_SRC); do \
-	  $(CC) -target $(X86_TARGET) -std=c11 -O2 -Wall -Wextra -iquote src -Iinclude \
-	    -I$(INGOT_DIR)/include -DMYNAH_SLM_BUILD='"x86check"' -D$(BLAS_DEF) -DACCELERATE_NEW_LAPACK \
-	    -mavx2 -mfma -mf16c -c $$f -o build/x86/$$(basename $$f .c).avx2.o || exit 1; \
+	@for f in $(filter-out $(KERN_SRC),$(X86_SRC)); do \
+	  $(X86_CHECK) -mavx2 -mfma -mf16c -c $$f -o build/x86/$$(basename $$f .c).avx2.o || exit 1; \
 	done
-	@echo "x86-64 cross-compile OK (avx2 + fma + f16c)"
+	@# every x86 kernel TU, each with its own flags: AVX-512 included, which
+	@# Rosetta cannot run but a compiler can still check
+	@$(foreach t,$(KERN_QMAT_x86),$(X86_CHECK) $(KF_x86_$(t)) -DMYNAH_SLM_KERN_TU=$(t) \
+	  -DMYNAH_SLM_KERN_ID=$(KID_$(t)) -c src/qmat_kern.c -o build/x86/qmat_$(t).o &&) true
+	@$(foreach t,$(KERN_ATTN_x86),$(X86_CHECK) $(KF_x86_$(t)) -DMYNAH_SLM_KERN_TU=$(t) \
+	  -DMYNAH_SLM_KERN_ID=$(KID_$(t)) -c src/attn_kern.c -o build/x86/attn_$(t).o &&) true
+	@echo "x86-64 cross-compile OK (baseline avx2 + every x86 kernel TU)"
 
 # INGOT_CAPS_ASSUME is not optional here, it is what makes this target mean
 # something. Rosetta EXECUTES AVX2 but does not advertise it in CPUID, and
@@ -432,4 +504,4 @@ dist: mynah-slm mynah-slm-server libmynah_slm.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot bench-qmat
+.PHONY: all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot bench-qmat dispatch

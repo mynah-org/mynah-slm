@@ -110,6 +110,11 @@ jobs:
           # the version string must carry the tag, not a stale git describe
           "$D/bin/mynah-slm" --version | tee /dev/stderr | grep -q "${{ steps.v.outputs.name }}"
           "$D/bin/mynah-slm-server" --help > /dev/null
+          # which SIMD kernels the PACKAGED binary resolves on this runner, and
+          # that every vector table passed its verify-on-first-use (exit 1 if
+          # one fell back): a portable tarball is only worth shipping if it
+          # still reaches the fast kernels (.work/isa-runtime-dispatch.md)
+          "$D/bin/mynah-slm" --dispatch
           test -f "$D/lib/libmynah_slm.a"
           test -f "$D/include/mynah_slm.h"
 
