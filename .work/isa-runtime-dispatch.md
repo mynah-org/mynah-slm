@@ -131,7 +131,7 @@ AVX512_BF16, no AMX), gcc 13.3 and clang, plus `qemu-aarch64` for arm64.
 | same, `MYNAH_SLM_INT8=1` | cortex-a53 | neon | | | "REQUESTED BUT UNAVAILABLE" | — | 1 |
 | same, `MYNAH_SLM_ISA=dotprod` | cortex-a53 | neon | | | | — | 1, "REQUEST ABOVE THE CPU, clamped down" |
 | same, `MYNAH_SLM_ISA=neon` | `-cpu max` | neon | neon | neon | none | — | 0 |
-| aarch64 `-march=armv8.2-a+dotprod` (the release's arm flags) | `-cpu max` | neon_dotprod | neon | neon | neon-dotprod | dotprod on | 0 |
+| aarch64 `-march=armv8.2-a+dotprod` (the release's arm flags UNTIL review R7) | `-cpu max` | neon_dotprod | neon | neon | neon-dotprod | dotprod on | 0 — but `-cpu cortex-a53`: **SIGILL** before dispatch (gcc inlines LSE atomics into threads.o and sgemm.o at armv8.1+); the release now builds `-march=armv8-a` |
 
 ### Numerics did not move
 
