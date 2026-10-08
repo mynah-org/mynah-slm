@@ -79,13 +79,23 @@ int mynah_slm_backend_open(mynah_slm_device device, mynah_slm_backend **out,
     return 0;
 }
 
-void mynah_slm_backend_close(mynah_slm_backend *b) {
+void mynah_slm_backend_weights_flush(mynah_slm_backend *b) {
     if (!b) return;
+    /* Drain first: a kernel still queued may be reading the weights being
+     * released. The backends do not rely on their free call to wait. */
+    if (b->ops.sync) (void)b->ops.sync(b->state, NULL, 0);
     for (size_t i = 0; i < b->n_weights; i++) {
         if (b->ops.weight_release) b->ops.weight_release(b->state, b->weights[i]);
         free(b->weights[i]);
     }
     free(b->weights);
+    b->weights = NULL;
+    b->n_weights = b->cap_weights = 0;
+}
+
+void mynah_slm_backend_close(mynah_slm_backend *b) {
+    if (!b) return;
+    mynah_slm_backend_weights_flush(b);    /* syncs before releasing anything */
     if (b->ops.close) b->ops.close(b->state);
     free(b);
 }

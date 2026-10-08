@@ -115,9 +115,19 @@ float *cuda_alloc(void *st, size_t n, char *e, size_t c) {
     return static_cast<float *>(p);
 }
 
+/* Every release below drains the stream first. cudaFree happens to
+ * synchronize the device today, but a kernel still queued that reads the
+ * buffer is a use-after-free if it ever stops doing so (stream-ordered
+ * allocators do not), and an explicit drain says what the code relies on.
+ * None of these runs on the token path. */
+void drain(cuda_state *s) {
+    if (s->stream) (void)cudaStreamSynchronize(s->stream);
+}
+
 void cuda_free(void *st, float *p) {
     auto *s = static_cast<cuda_state *>(st);
     (void)on_device(s, nullptr, 0);
+    drain(s);
     cudaFree(p);
 }
 
@@ -184,6 +194,7 @@ int cuda_weight_upload(void *st, mynah_slm_bweight *w, char *e, size_t c) {
 void cuda_weight_release(void *st, mynah_slm_bweight *w) {
     auto *s = static_cast<cuda_state *>(st);
     (void)on_device(s, nullptr, 0);
+    drain(s);
     if (w->data) cudaFree(w->data);
     w->data = nullptr;
 }
@@ -294,6 +305,7 @@ void cuda_rope_free(void *st, mynah_slm_brope *r) {
     (void)on_device(s, nullptr, 0);
     auto *t = static_cast<rope_table *>(r->impl);
     if (!t) return;
+    drain(s);
     cudaFree(t->cos_t);
     cudaFree(t->sin_t);
     delete t;
@@ -337,6 +349,7 @@ void cuda_kv_free(void *st, mynah_slm_bkv *kv) {
     (void)on_device(s, nullptr, 0);
     auto *k = static_cast<kv_planes *>(kv->impl);
     if (!k) return;
+    drain(s);
     cudaFree(k->k);
     cudaFree(k->v);
     delete k;

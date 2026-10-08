@@ -29,6 +29,10 @@
  * opaque handle afterwards. The backend owns every handle and frees it at
  * close. Uploading the same bytes twice returns the same handle — which is
  * what keeps a tied embedding (input lookup AND LM head) to one device copy.
+ * The cache is keyed by the HOST POINTER, so the backend must not outlive the
+ * model whose bytes it was given: unmap one GGUF and map another at the same
+ * address, and the next upload would hand back the old file's tensor. Close
+ * the backend, or call mynah_slm_backend_weights_flush(), before unmapping.
  *
  * Single submitter: a backend is driven by one thread at a time — but not
  * necessarily the thread that opened it. A device backend selects its device
@@ -101,12 +105,17 @@ int    mynah_slm_backend_sync(mynah_slm_backend *b, char *err, size_t errsz);
 /* ── weights ────────────────────────────────────────────────────────────────
  * `data` is the row-major [rows][cols] block matrix exactly as stored in the
  * GGUF (`type` is its ggml type id), and must stay valid for the backend's
- * life: the CPU backend keeps the pointer rather than a copy. A norm weight is
+ * life (or until weights_flush): the CPU backend keeps the pointer rather
+ * than a copy, and every backend uses it as the cache key. A norm weight is
  * an F32 tensor with rows = 1. Returns 1 when this backend has no kernel for
  * `type`. */
 int mynah_slm_backend_weight(mynah_slm_backend *b, int type, const void *data,
                              size_t rows, size_t cols,
                              const mynah_slm_bweight **out, char *err, size_t errsz);
+/* Waits for the queued work, then releases EVERY uploaded weight: each handle
+ * obtained so far is invalid afterwards. For swapping models under one open
+ * backend; close does the same. Never on the token path (it synchronizes). */
+void mynah_slm_backend_weights_flush(mynah_slm_backend *b);
 int    mynah_slm_bweight_type(const mynah_slm_bweight *w);
 size_t mynah_slm_bweight_rows(const mynah_slm_bweight *w);
 size_t mynah_slm_bweight_cols(const mynah_slm_bweight *w);
@@ -269,6 +278,9 @@ uint32_t       mynah_slm_backend_slots_held(const mynah_slm_bslots *p);
  *        launch failure). No read can clear it; every request on this
  *        backend fails and the backend must be closed and reopened.
  * A synchronous backend has nothing pending and always returns 0.
+ * A 0 is not a promise that nothing is coming: a fault in work that was
+ * queued but had not yet executed surfaces at a later op or sync, which then
+ * fails, and recover() at that point returns -1.
  *
  * Call it on the SAME THREAD that saw the failing op: CUDA keeps the
  * non-sticky last-error record per host thread, so recover() on another

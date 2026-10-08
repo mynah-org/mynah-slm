@@ -115,6 +115,19 @@ static void test_weights(mynah_slm_backend *b) {
     const mynah_slm_bweight *w3 = NULL;
     const int r3 = mynah_slm_backend_weight(b, 41, q, 4, 64, &w3, err, sizeof err);
     check("an undecodable type is UNSUPPORTED (1), not a failure", r3 == 1 && w3 == NULL, NULL);
+
+    /* weights_flush empties the host-pointer cache (every handle so far is
+     * invalid) and leaves the backend serving: the same bytes upload again
+     * and multiply to the same bits. */
+    static float x[64], y1[4], y2[4];
+    fill(x, 64, 1.0f);
+    const int m1 = mynah_slm_backend_matvec(b, w1, x, y1, err, sizeof err);
+    mynah_slm_backend_weights_flush(b);
+    const mynah_slm_bweight *w4 = NULL;
+    const int r4 = mynah_slm_backend_weight(b, INGOT_TYPE_Q8_0, q, 4, 64, &w4, err, sizeof err);
+    const int m2 = r4 == 0 ? mynah_slm_backend_matvec(b, w4, x, y2, err, sizeof err) : -1;
+    check("after weights_flush the same bytes re-upload and give the same product",
+          m1 == 0 && r4 == 0 && m2 == 0 && same(y1, y2, 4), err);
     free(dummy);
 }
 
