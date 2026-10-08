@@ -28,11 +28,13 @@
 #include <cpuid.h>
 #define ISA_X86 1
 #endif
+#if defined(__APPLE__) && (defined(ISA_X86) || defined(__aarch64__))
+#include <sys/sysctl.h>
+#define ISA_SYSCTL 1
+#endif
 #if defined(__aarch64__)
 #define ISA_ARM64 1
-#if defined(__APPLE__)
-#include <sys/sysctl.h>
-#elif defined(__linux__)
+#if defined(__linux__)
 #include <sys/auxv.h>
 #endif
 #endif
@@ -49,7 +51,7 @@ static unsigned long long xgetbv0(void) {
 }
 #endif
 
-#if defined(ISA_ARM64) && defined(__APPLE__)
+#if defined(ISA_SYSCTL)
 static int sysctl_flag(const char *name) {
     int value = 0;
     size_t size = sizeof value;
@@ -83,6 +85,19 @@ static void probe(void) {
         g_cpu.avx512vl   = os_zmm && ((b >> 31) & 1u);
         g_cpu.avx512vnni = os_zmm && ((c >> 11) & 1u);
         g_cpu.amx        = os_amx && ((d >> 24) & 1u);           /* AMX-TILE */
+#if defined(ISA_SYSCTL)
+        /* macOS enables the AVX-512 state LAZILY: XCR0's opmask/ZMM bits
+         * stay clear until a thread first executes an AVX-512 instruction
+         * (the kernel takes the #UD and turns the state on), so the XCR0
+         * test above reports "no AVX-512" on every Intel Mac that has it.
+         * Apple's documented probe is sysctl hw.optional.avx512*, which says
+         * whether the CPU has it AND the OS will support it. */
+        g_cpu.avx512f    = os_ymm && sysctl_flag("hw.optional.avx512f");
+        g_cpu.avx512dq   = os_ymm && sysctl_flag("hw.optional.avx512dq");
+        g_cpu.avx512bw   = os_ymm && sysctl_flag("hw.optional.avx512bw");
+        g_cpu.avx512vl   = os_ymm && sysctl_flag("hw.optional.avx512vl");
+        g_cpu.avx512vnni = os_ymm && sysctl_flag("hw.optional.avx512vnni");
+#endif
         /* leaf 7 SUBLEAF 1, EAX: a different subleaf, the usual trap */
         if (__get_cpuid_count(7, 1, &a, &b, &c, &d)) {
             g_cpu.avxvnni    = os_ymm && ((a >> 4) & 1u);
