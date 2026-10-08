@@ -46,7 +46,9 @@
  * row would undo the point:
  *   xsum    exact f32 sums per 32 values — the min term stays exact
  *   xq/xs   the same activations as int8 with a scale per 32, for the SDOT
- *           path. Only filled when that path is on. */
+ *           path. Only filled when that path is on — and have_int8 stays 0
+ *           for a vector holding a NaN or inf, so it takes the f32 path,
+ *           which propagates it (int8 would return a finite number). */
 typedef struct {
     float  xsum[MYNAH_SLM_XSUM_MAX];
     float  xscale[MYNAH_SLM_XSUM_MAX];

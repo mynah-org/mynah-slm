@@ -655,6 +655,45 @@ static void test_int8_contracts_here(void) {
         }
         free(w6); free(w4); free(x); free(p); free(pf);
     }
+
+    /* A NaN or inf activation must never come out of a product FINITE. The
+     * int8 path cannot carry one (its block quantizes to zero, and Q8_0/Q6_K
+     * never read the exact sums), so prepare drops the whole vector to f32:
+     * Q8_0/Q6_K decline to ingot and Q4_K takes our f32 kernel, both of
+     * which propagate it. */
+    if (strcmp(mynah_slm_matvec_int8_isa(), "none") != 0) {
+        enum { R = 8, C = 256 };
+        unsigned char *w8 = malloc(R * (C / 32) * 34), *w6 = malloc(R * 210),
+                      *w4 = malloc(R * 144);
+        float *x = malloc(C * sizeof *x), o[R];
+        mynah_slm_matvec_in *p = malloc(sizeof *p);
+        if (w8 && w6 && w4 && x && p) {
+            qfx_fill(INGOT_TYPE_Q8_0, w8, R, C, 31);
+            qfx_fill(INGOT_TYPE_Q6_K, w6, R, C, 32);
+            qfx_fill(INGOT_TYPE_Q4_K, w4, R, C, 33);
+            const float bad[2] = { NAN, INFINITY };
+            mynah_slm_matvec_set_int8(1);
+            for (int k = 0; k < 2; k++) {
+                qfx_activations(x, C, 34);
+                x[37] = bad[k];
+                mynah_slm_matvec_prepare(x, C, p);
+                const int dropped = !p->have_int8;
+                const int q8_declined = mynah_slm_matvec(INGOT_TYPE_Q8_0, w8, R, C, x, p, o) != 0;
+                int q8_prop = ingot_matvec(INGOT_TYPE_Q8_0, w8, R, C, x, o) == 0;
+                for (int r = 0; r < R; r++) if (isfinite(o[r])) q8_prop = 0;
+                const int q6_declined = mynah_slm_matvec(INGOT_TYPE_Q6_K, w6, R, C, x, p, o) != 0;
+                int q4_prop = mynah_slm_matvec(INGOT_TYPE_Q4_K, w4, R, C, x, p, o) == 0;
+                for (int r = 0; r < R; r++) if (isfinite(o[r])) q4_prop = 0;
+                char what[128];
+                snprintf(what, sizeof what, "%s activation drops the vector to f32 and propagates",
+                         k ? "an inf" : "a NaN");
+                check(what, dropped && q8_declined && q6_declined && q8_prop && q4_prop,
+                      "a non-finite input came out finite");
+            }
+            mynah_slm_matvec_set_int8(0);
+        }
+        free(w8); free(w6); free(w4); free(x); free(p);
+    }
 }
 
 /* The contract at EVERY level this CPU can run (src/isa.c), not only the one

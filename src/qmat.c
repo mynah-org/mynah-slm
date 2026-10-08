@@ -115,6 +115,7 @@ static void matvec_prepare(const float *input, size_t cols,
                            mynah_slm_matvec_in *prep, int want_int8) {
     if (!input || !prep) return;
     prep->have_int8 = want_int8 && cols <= MYNAH_SLM_XQ_MAX;
+    int finite = 1;
 
     for (size_t s = 0; s < cols / 32; s++) {
         const float *x = input + s * 32;
@@ -125,6 +126,7 @@ static void matvec_prepare(const float *input, size_t cols,
             if (a > amax) amax = a;
         }
         prep->xsum[s] = acc;
+        if (!isfinite(acc)) finite = 0;     /* a NaN or inf in the block */
 
         if (prep->have_int8) {
             int8_t *q = prep->xq + s * 32;
@@ -154,6 +156,14 @@ static void matvec_prepare(const float *input, size_t cols,
             }
         }
     }
+
+    /* A non-finite activation must stay visible. int8 cannot carry it: the
+     * block above became zeros, and Q8_0/Q6_K (which never read xsum) would
+     * return a FINITE dot from a NaN input — a broken layer that samples
+     * normally. So the whole vector takes the f32 path, where ingot's and our
+     * f32 kernels propagate it. Costs nothing on finite input: the check is
+     * on the sums already computed. */
+    if (!finite) prep->have_int8 = 0;
 }
 
 void mynah_slm_matvec_prepare(const float *input, size_t cols,

@@ -190,6 +190,13 @@ against the twin covers them at every ISA level) and in
 in a normalized transformer; the fix is about the contract being true, not
 about a measured quality change.
 
+Review R1, same day: a NaN or inf activation used to come out of the int8
+Q8_0 / Q6_K kernels as a FINITE number (its block quantized to garbage or to
+zero, and neither type reads the exact `xsum` that would have carried it).
+`matvec_prepare` now leaves `have_int8 = 0` for any vector with a non-finite
+block sum, so that vector takes the f32 path (ingot for Q8_0/Q6_K, ours for
+Q4_K), which propagates it. Tested for NaN and inf at every ISA level.
+
 ## Conclusion
 
 **KEEP both, opt-in, inside `--fast`** — per type:
