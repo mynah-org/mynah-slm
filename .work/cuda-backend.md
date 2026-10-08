@@ -386,6 +386,58 @@ device gates assume the CPU side is not FMA-contracted (gcc `-std=c11` is
 not; clang's default `-ffp-contract=on` with `-march=native` may be — then
 those checks fail, which is the honest outcome).
 
+## G2 — the backend wired into a forward pass (2026-10-08, cloud VM, NO GPU)
+
+Integration plan steps 1-3 above, plus the CLI and the slot scheduler, in a
+NEW module so `src/arch_qwen3.c` (the reference, and another agent's file)
+is not touched. One commit per step.
+
+### G2-a — `src/forward_backend.{c,h}`: the decode step and the prefill batch
+
+- `mynah_slm_bfwd_create(backend, model, desc)`: every weight uploaded ONCE
+  through `mynah_slm_backend_weight` (the tied head gets the embedding's
+  handle — same pointer, one device copy), the RoPE table built once from
+  the config (head_dim, theta, pairing), the KV precision probed at create
+  so a refusal is a load-time error, scratch sized once (`rows = max(batch,
+  dec)`). Refused BY NAME, never computed wrong: hybrid layers, non-neutral
+  embed/logit scale, non-F32 norms, a type the backend has no kernel for, a
+  KV the backend refuses, any op the backend lacks.
+- `mynah_slm_bseq`: a sequence's KV handle + `n_past`, owned (`bseq_init`)
+  or borrowed from a slot pool (`bseq_bind`).
+- One core (`run_rows`) for the decode step (n = 1: matvec) and the prefill
+  batch (n > 1: matmat + ONE causal attention call), in arch_qwen3.c's op
+  order: embed → per layer rms_norm, q/k/v, QK-norm (one call over n·heads),
+  NeoX RoPE at pos0, kv_append, attention(scale from config), o, residual,
+  rms_norm, gate/up, SwiGLU, down, residual → final norm (all rows) → LM
+  head on the last row (matvec). Host waits: `bfwd_step` with logits = ONE
+  d2h of the row; `bfwd_step_argmax` = the 4-byte argmax; logits NULL (the
+  prompt) = no wait at all. Every call is validated before anything is
+  queued; `n_past` moves only on success.
+
+Evidence, `tests/test_forward_backend.c` (model-free, in `make test`), on
+the tiny fixture (2 layers, d 256, 8/2 heads of 64, q_dim 512 ≠ d_model),
+F32 and Q4_K_M-mix (Q4_K / Q8_0 / Q6_K), tied AND untied head, KV f32 and
+bf16 — 8 configurations:
+
+- one token at a time over the 112-token prompt: logits at **every**
+  position `memcmp`-identical to `mynah_slm_forward`;
+- prefill in slices of 64, 7 and 13, then 16 greedy tokens: last prompt
+  logits and all 16 steps' logits `memcmp`-identical to
+  `mynah_slm_forward_batch` + `mynah_slm_forward`, ids identical;
+- 17 greedy steps through the 4-byte argmax pick the same ids;
+- a full sequence, an out-of-vocabulary id, a 65-wide prefill on a 64-wide
+  forward: refused, `n_past` unmoved.
+- **Mutation checks**: KV appended to the other layer → 37 FAIL; K rotated
+  at pos0 + 1 in prefill only → 27 FAIL (the width-1 runs still pass, as
+  they should). Reverted, re-passed.
+
+Tolerance is 0 because the CPU backend calls the kernels arch_qwen3.c calls,
+in the same order. One known condition: `src/backend_cpu.c` prepares our
+fused-matvec input only when `cols % 256 == 0`, `mynah_slm_project` when
+`cols % 32 == 0`; for a Q8_0/Q6_K tensor with `--fast` and a width that is
+a multiple of 32 but not 256 the two would pick different kernels. Every
+Qwen3 width is a multiple of 256; the fixture's too.
+
 ## Conclusion
 
 G1-a: **KEEP** — the boundary exists, the CPU side of it is the engine's own
