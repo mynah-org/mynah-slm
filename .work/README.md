@@ -48,3 +48,4 @@ same way.
 | [sibling-port-map.md](sibling-port-map.md) | P1 — what mynah-tts / mynah-asr have that transfers to an SLM engine, what does not, and why |
 | [no-blas.md](no-blas.md) | K1 — our own f32 GEMM (`BLAS=none`), its evidence table, and the gate for making it the Linux default |
 | [cuda-backend.md](cuda-backend.md) | G1 — backend vtable (CPU reference implementation) and the Qwen3 CUDA backend behind `make cuda`; integration plan, kernel parity gates, what transfers from mynah-tts |
+| [q4k-int8-4row.md](q4k-int8-4row.md) | K3 — the opt-in int8 Q4_K matvec: four rows per activation load, one float reduction per row, scalar twin in the same order |

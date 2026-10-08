@@ -94,6 +94,21 @@ int mynah_slm_matvec(int type, const void *weights, size_t rows, size_t cols,
 void mynah_slm_matvec_prepare(const float *input, size_t cols,
                               mynah_slm_matvec_in *prep);
 
+/* The same, with the int8 half filled whatever the switch says. For tests and
+ * benches that exercise the int8 kernels and their scalar twins directly. */
+void mynah_slm_matvec_prepare_int8(const float *input, size_t cols,
+                                   mynah_slm_matvec_in *prep);
+
+/* The scalar twin of the int8 Q4_K kernel: the executable definition of its
+ * accumulation order (qmat.c), which every vector kernel must match BIT FOR
+ * BIT. `prep` must hold int8 activations. Returns 0, or -1. */
+int mynah_slm_q4k_int8_ref(const void *weights, size_t rows, size_t cols,
+                           const mynah_slm_matvec_in *prep, float *output);
+
+/* Which int8 kernel this build runs ("avx512-vnni", "avx2", "neon-dotprod",
+ * or "none"). A benchmark of the int8 path is invalid until this is printed. */
+const char *mynah_slm_matvec_int8_isa(void);
+
 /* Is the int8-activation path compiled in AND enabled? It is a QUALITY
  * trade-off, not a free win: activations quantized to int8 per 32 values, so
  * it must be gated by `mynah-slm ppl` and never by a benchmark alone. */

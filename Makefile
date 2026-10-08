@@ -108,6 +108,7 @@ help:
 	@echo "  bench        per-tensor matvec throughput"
 	@echo "  cuda         opt-in CUDA build in build/cuda/ (CUDA_ARCH=sm_89; needs nvcc)"
 	@echo "  cuda-test    build and run the CUDA self-test (skips without a device)"
+	@echo "  bench-qmat   kernel A/B on synthetic matrices (no model)"
 	@echo "  check-x86    cross-compile the AVX2 paths"
 	@echo "  test-x86-rosetta  build x86_64 and RUN the suite under Rosetta"
 	@echo "  golden-dump  regenerate the oracle's reference activations"
@@ -193,6 +194,13 @@ bench: $(BENCH)
 	@$(BENCH) "$(MODEL)"; rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP bench: model missing (scripts/use_model.sh)"; exit 0; \
 	  else exit $$rc; fi
+
+# The same discipline on SYNTHETIC matrices of the real shapes, no checkpoint:
+# kernel before/after (K3, K4), interleaved in one process with a control row.
+# It answers "is the kernel faster here", never "is decode faster".
+BENCH_QMAT := tests/bench_qmat
+bench-qmat: $(BENCH_QMAT)
+	@$(BENCH_QMAT) all
 
 # End-to-end server checks: shape, determinism (sequential and concurrent),
 # SSE framing, and that reasoning never reaches content. Separate from `test`
@@ -378,7 +386,7 @@ leaks: mynah-slm $(TESTS)
 	 else echo "SKIP leaks/inspect: $(MODEL) not found"; fi
 
 clean:
-	rm -rf build mynah-slm mynah-slm-server libmynah_slm.a libmynah_slm$(SOEXT) $(TESTS) $(PARITY) $(BENCH) dist
+	rm -rf build mynah-slm mynah-slm-server libmynah_slm.a libmynah_slm$(SOEXT) $(TESTS) $(PARITY) $(BENCH) $(BENCH_QMAT) dist
 	@# Without this, libingot.a survives a clean: update the subtree and the
 	@# next build silently links the previous library.
 	@test -d $(INGOT_DIR) && $(MAKE) -C $(INGOT_DIR) clean || true
@@ -424,4 +432,4 @@ dist: mynah-slm mynah-slm-server libmynah_slm.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot
+.PHONY: all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot bench-qmat

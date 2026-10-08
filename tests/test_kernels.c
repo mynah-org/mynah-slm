@@ -12,7 +12,9 @@
 #include "kernels.h"
 
 #include "kvcache.h"
+#include "qfixture.h"
 #include "qmat.h"
+#include "threads.h"
 
 #include "ingot/dtype.h"
 #include "ingot/quant.h"
@@ -390,6 +392,180 @@ done:
     free(w); free(x); free(a); free(b); free(packed);
 }
 
+/* ── the int8 matvec contract (.work/q4k-int8-4row.md) ─────────────────────
+ * The int8 kernels promise more than "close": every ISA computes a row with
+ * the same float operations in the same order as the scalar twin, so the
+ * answer is BIT-IDENTICAL whatever ISA ran it, whether the row sat in a group
+ * of four or in the tail, and however many threads split the rows. memcmp,
+ * not a tolerance — a tolerance would also swallow a permuted nibble order.
+ *
+ * Then two references from outside: ingot's dequantizer (cross-checked against
+ * llama.cpp) times the int8 activations it was actually given, in double —
+ * only float rounding separates that from ours — and the same weights times
+ * the f32 activations, which is the int8 approximation itself. */
+
+typedef struct {
+    int type;
+    const unsigned char *w;
+    size_t rows, cols, row_bytes, per;
+    const float *x;
+    const mynah_slm_matvec_in *prep;
+    float *out;
+    int rc;
+} mv_job;
+
+static void mv_chunk(void *ctx, int i) {
+    mv_job *j = ctx;
+    const size_t first = (size_t)i * j->per;
+    if (first >= j->rows) return;
+    size_t n = j->per;
+    if (first + n > j->rows) n = j->rows - first;
+    if (mynah_slm_matvec(j->type, j->w + first * j->row_bytes, n, j->cols, j->x,
+                         j->prep, j->out + first) != 0)
+        j->rc = -1;
+}
+
+/* Rows split `per` at a time over the pool — `per` deliberately not a
+ * multiple of four, so group boundaries land everywhere. */
+static int mv_split(int type, const unsigned char *w, size_t rows, size_t cols,
+                    size_t row_bytes, const float *x, const mynah_slm_matvec_in *prep,
+                    float *out, size_t per) {
+    mv_job j = { type, w, rows, cols, row_bytes, per, x, prep, out, 0 };
+    mynah_slm_parallel_for((int)((rows + per - 1) / per), mv_chunk, &j);
+    return j.rc;
+}
+
+/* max |a-b| / max |b|, in double */
+static double rel_err_d(const float *a, const double *b, size_t n) {
+    double worst = 0.0, scale = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        const double d = fabs((double)a[i] - b[i]);
+        if (d > worst) worst = d;
+        if (fabs(b[i]) > scale) scale = fabs(b[i]);
+    }
+    return scale > 0.0 ? worst / scale : worst;
+}
+
+/* The int8 kernel of `type` against its scalar twin and both references.
+ * `ref` is the type's scalar twin; NULL when the type has no int8 kernel. */
+typedef int (*int8_ref_fn)(const void *, size_t, size_t, const mynah_slm_matvec_in *, float *);
+
+static void int8_contract(const char *name, int type, int8_ref_fn ref,
+                          size_t rows, size_t cols, uint64_t seed) {
+    size_t elems = 0, bytes = 0;
+    qfx_geometry(type, &elems, &bytes);
+    const size_t row_bytes = cols / elems * bytes;
+    unsigned char *w = malloc(rows * row_bytes);
+    float *x = malloc(cols * sizeof *x), *deq = malloc(rows * cols * sizeof *deq);
+    float *got = malloc(rows * sizeof *got), *want = malloc(rows * sizeof *want);
+    float *alt = malloc(rows * sizeof *alt);
+    double *exact = malloc(rows * sizeof *exact), *full = malloc(rows * sizeof *full);
+    mynah_slm_matvec_in *prep = malloc(sizeof *prep);
+    char what[160], detail[200];
+    if (!w || !x || !deq || !got || !want || !alt || !exact || !full || !prep) {
+        check("int8 contract allocations", 0, "out of memory");
+        goto done;
+    }
+    qfx_fill(type, w, rows, cols, seed);
+    qfx_activations(x, cols, seed);
+    mynah_slm_matvec_prepare_int8(x, cols, prep);
+
+    if (ingot_dequant_matrix(type, w, rows, cols, deq) != 0) {
+        check("ingot dequantizes the fixture", 0, name);
+        goto done;
+    }
+    /* Q4_K's min term is NOT int8: the kernel keeps it on the exact f32 sums.
+     * ingot gives it to us independently — dequantize a copy with every nibble
+     * zeroed and what comes back is -dmin*min per sub-block — so the
+     * reference is (deq - deq0) . xq*xs  +  deq0 . x. */
+    float *deq0 = NULL;
+    if (type == INGOT_TYPE_Q4_K) {
+        unsigned char *w0 = malloc(rows * row_bytes);
+        deq0 = malloc(rows * cols * sizeof *deq0);
+        if (!w0 || !deq0) { free(w0); free(deq0); check("allocations", 0, "oom"); goto done; }
+        memcpy(w0, w, rows * row_bytes);
+        for (size_t b = 0; b < rows * row_bytes / 144; b++) memset(w0 + b * 144 + 16, 0, 128);
+        const int rc = ingot_dequant_matrix(type, w0, rows, cols, deq0);
+        free(w0);
+        if (rc != 0) { free(deq0); check("ingot dequantizes the zeroed fixture", 0, name); goto done; }
+    }
+    for (size_t r = 0; r < rows; r++) {
+        double e = 0.0, f = 0.0;
+        for (size_t c = 0; c < cols; c++) {
+            const double xi = (double)prep->xq[c] * (double)prep->xscale[c / 32];
+            const double dw = deq[r * cols + c];
+            const double d0 = deq0 ? deq0[r * cols + c] : 0.0;
+            e += (dw - d0) * xi + d0 * (double)x[c];
+            f += dw * (double)x[c];
+        }
+        exact[r] = e;
+        full[r]  = f;
+    }
+    free(deq0);
+
+    if (ref(w, rows, cols, prep, want) != 0) {
+        snprintf(what, sizeof what, "%s int8 scalar twin runs", name);
+        check(what, 0, "declined");
+        goto done;
+    }
+    double rel = rel_err_d(want, exact, rows);
+    snprintf(what, sizeof what, "%s int8 twin = ingot dequant x int8 activations (%zux%zu)",
+             name, rows, cols);
+    snprintf(detail, sizeof detail, "rel=%.2e vs ingot dequant, double", rel);
+    check(what, rel < 2e-6, detail);
+    printf("     %s\n", detail);
+
+    rel = rel_err_d(want, full, rows);
+    snprintf(what, sizeof what, "%s int8 stays within its quantization budget", name);
+    snprintf(detail, sizeof detail, "rel=%.2e vs f32 activations", rel);
+    check(what, rel > 1e-7 && rel < 3e-2, detail);
+    printf("     %s\n", detail);
+
+    if (strcmp(mynah_slm_matvec_int8_isa(), "none") == 0) {
+        printf("     (no int8 vector kernel in this build: twin checked alone)\n");
+        goto done;
+    }
+
+    mynah_slm_matvec_set_enabled(1);
+    if (mynah_slm_matvec(type, w, rows, cols, x, prep, got) != 0) {
+        snprintf(what, sizeof what, "%s int8 kernel runs", name);
+        check(what, 0, "declined");
+        goto done;
+    }
+    snprintf(what, sizeof what, "%s %s kernel == scalar twin, bit for bit",
+             name, mynah_slm_matvec_int8_isa());
+    check(what, memcmp(got, want, rows * sizeof *got) == 0, "memcmp differs");
+
+    /* one row per call: every row goes through the tail kernel */
+    for (size_t r = 0; r < rows; r++)
+        mynah_slm_matvec(type, w + r * row_bytes, 1, cols, x, prep, alt + r);
+    snprintf(what, sizeof what, "%s row grouping does not change a row", name);
+    check(what, memcmp(alt, want, rows * sizeof *alt) == 0, "group of 4 != tail");
+
+    const size_t pers[] = { 1, 3, 7, 64 };
+    int same = 1;
+    for (size_t k = 0; k < sizeof pers / sizeof *pers; k++) {
+        memset(alt, 0, rows * sizeof *alt);
+        if (mv_split(type, w, rows, cols, row_bytes, x, prep, alt, pers[k]) != 0 ||
+            memcmp(alt, want, rows * sizeof *alt) != 0) same = 0;
+    }
+    snprintf(what, sizeof what, "%s %d threads, ragged chunks == 1 thread, bit for bit",
+             name, mynah_slm_threads_count());
+    check(what, same, "a thread split changed a row");
+
+done:
+    free(w); free(x); free(deq); free(got); free(want); free(alt);
+    free(exact); free(full); free(prep);
+}
+
+static void test_int8_contracts(void) {
+    printf("     int8 kernel in this build: %s\n", mynah_slm_matvec_int8_isa());
+    /* rows not a multiple of four; one, four and twelve blocks per row */
+    int8_contract("Q4_K", INGOT_TYPE_Q4_K, mynah_slm_q4k_int8_ref, 103, 1024, 1);
+    int8_contract("Q4_K", INGOT_TYPE_Q4_K, mynah_slm_q4k_int8_ref, 37, 256, 2);
+    int8_contract("Q4_K", INGOT_TYPE_Q4_K, mynah_slm_q4k_int8_ref, 6, 3072, 3);
+}
+
 /* The KV round trip is what the format costs numerically, and it is worth a
  * gate because the perplexity sweep in docs/perf.md rests on it: q4 keys came
  * out ruinous, and the first question about a result like that is whether the
@@ -565,6 +741,9 @@ int main(void) {
     printf("\n-- activations --\n");test_activations();
     printf("\n-- attention --\n");  test_attention();
     printf("\n-- quantized matvec --\n"); test_q4_k_matvec();
+    mynah_slm_threads_init(4);
+    printf("\n-- int8 matvec contract --\n"); test_int8_contracts();
+    mynah_slm_threads_shutdown();
     printf("\n-- kv cache precision --\n"); test_kv_roundtrip();
     printf("\n-- kv cache, packed --\n"); test_kv_packed();
 
