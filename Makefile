@@ -110,15 +110,21 @@ KERN_SGEMM_generic := scalar
 # per-TU ISA flags, added AFTER ARCH_FLAGS so they win. The x86 "scalar" and
 # "avx2" TUs also switch the wider ISAs OFF, so a -march=native build's
 # MYNAH_SLM_ISA=scalar really is a pre-AVX2 run and not one the compiler
-# quietly auto-vectorized with AVX-512.
-KF_x86_scalar      := -mno-avx2 -mno-fma
+# quietly auto-vectorized with AVX-512. The scalar TU drops AVX itself (and
+# with it F16C): the twins are what a pre-AVX machine runs, so not a single
+# VEX/ymm instruction may appear in them (objdump-checked, review N1).
+KF_x86_scalar      := -mno-avx -mno-avx2 -mno-fma -mno-f16c
 KF_x86_avx2        := -mavx2 -mfma -mf16c -mno-avx512f
 KF_x86_avx512      := -mavx2 -mfma -mf16c -mavx512f -mavx512bw -mavx512vl -mavx512dq
 KF_x86_avx512vnni  := $(KF_x86_avx512) -mavx512vnni
 KF_arm64_scalar    :=
 KF_arm64_neon      :=
-# only when the baseline lacks it: a second -march would override -mcpu
-KF_arm64_neon_dotprod := $(if $(findstring __ARM_FEATURE_DOTPROD,$(shell $(CC) $(ARCH_FLAGS) -dM -E -xc /dev/null 2>/dev/null)),,-march=armv8.2-a+dotprod)
+# only when the baseline lacks it. With an -mcpu in ARCH_FLAGS the feature is
+# added to THAT cpu (-mcpu=cortex-a72+dotprod): a -march next to an -mcpu is a
+# "switch conflicts" warning in gcc, which -Werror turns into a failed build
+# (review N3), and it would also drop the -mcpu's tuning for this TU.
+KF_ARM_MCPU := $(lastword $(filter -mcpu=%,$(ARCH_FLAGS)))
+KF_arm64_neon_dotprod := $(if $(findstring __ARM_FEATURE_DOTPROD,$(shell $(CC) $(ARCH_FLAGS) -dM -E -xc /dev/null 2>/dev/null)),,$(if $(KF_ARM_MCPU),$(KF_ARM_MCPU)+dotprod,-march=armv8.2-a+dotprod))
 KF_generic_scalar  :=
 
 KID_scalar       := 0
