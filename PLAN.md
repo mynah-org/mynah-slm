@@ -92,14 +92,17 @@ per commit, listed in the matrix note.
       prefill shapes here, default flip gated → [`.work/no-blas.md`](.work/no-blas.md)
 - [~] **K2** — pool: atomic claim, bounded spin, affinity width; 4x on a
       synthetic region, decode tok/s unmeasured → [`.work/thread-pool-spin.md`](.work/thread-pool-spin.md)
-- [ ] **K3** — Q4_K int8 kernel restructure (4 rows per activation load,
-      deferred float reduction); note written with the work
-- [ ] **K4** — int8-activation kernels for Q8_0 and Q6_K, opt-in like `--fast`;
-      note written with the work
-- [ ] **K5** — runtime ISA dispatch for our own kernels, for portable
-      `make dist` binaries; note written with the work
-- [ ] **K6** — native BF16 weight matvec, if the formats make it useful; note
-      written with the work
+- [~] **K3** — Q4_K int8 kernel restructure (4 rows per activation load, one
+      reduction per row), opt-in `--fast`; 1.9-2.4x per tensor here, ppl
+      unmeasured → [`.work/q4k-int8-4row.md`](.work/q4k-int8-4row.md)
+- [~] **K4** — int8-activation Q8_0 and Q6_K kernels under `--fast`
+      (`MYNAH_SLM_INT8_TYPES` narrows per type); Q6_K head 1.6x here, ppl
+      unmeasured → [`.work/int8-q8_0-q6_k.md`](.work/int8-q8_0-q6_k.md)
+- [~] **K5** — runtime ISA dispatch for our kernels (qmat, attention, sgemm),
+      `mynah-slm --dispatch`, verify-on-first-use; ingot itself still
+      compile-time → [`.work/isa-runtime-dispatch.md`](.work/isa-runtime-dispatch.md)
+- [-] **K6** — native BF16 weight matvec: REJECTED, ingot already at
+      0.87-0.94x of the read roof → [`.work/bf16-native-matvec.md`](.work/bf16-native-matvec.md)
 - [ ] **S1** — serving foundation: slots, scheduler, continuous batching,
       batched decode, sliced prefill; note written with the work
 - [~] **G1** — CUDA backend foundation for Qwen3 (GQA, head_dim 128, NeoX RoPE,
