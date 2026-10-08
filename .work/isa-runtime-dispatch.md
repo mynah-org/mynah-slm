@@ -1,6 +1,6 @@
 # K5 — runtime ISA dispatch for our kernels, so a portable binary is a fast one
 
-Status: **IN PROGRESS** (2026-10-08: core dispatch for qmat + attn landed; the sgemm.c dual-mode change lands in the next commit, and the sgemm rows below describe the tree after it)
+Status: **DONE 2026-10-08** (landed in two commits: core dispatch, then the sgemm.c change; real-silicon probes UNVALIDATED)
 
 Item: `PLAN.md` §0 K5. Lineage: mynah-tts `src/qmat.c` (`qmat_x86_probe`
 ~:243, `qmat_u8_level_uncached` ~:311 — "clamped down, never up", the

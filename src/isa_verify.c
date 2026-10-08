@@ -147,3 +147,29 @@ int mynah_slm_isa_verify_attn(const mynah_slm_attn_kern *k, char *why, size_t n)
     }
     return 0;
 }
+
+/* ── sgemm ─────────────────────────────────────────────────────────────────
+ * Shapes far below the planner's parallel threshold, so this never touches
+ * the thread pool — it may run inside a pool worker on first use. */
+int mynah_slm_isa_verify_sgemm(const mynah_slm_sgemm_kern *k, char *why, size_t n) {
+    const mynah_slm_sgemm_kern *ref = &mynah_slm_sgemm_kern_scalar;
+    static float a[7 * 37], bt[5 * 37], bn[11 * 19], ca[7 * 19], cb[7 * 19];
+    uint32_t s = 31u;
+    for (size_t i = 0; i < sizeof a / sizeof *a; i++)   a[i]  = vfrand(&s);
+    for (size_t i = 0; i < sizeof bt / sizeof *bt; i++) bt[i] = vfrand(&s);
+    for (size_t i = 0; i < sizeof bn / sizeof *bn; i++) bn[i] = vfrand(&s);
+
+    /* NT 7x5x37: k leaves a tail on every width; rows and columns leave edges */
+    k->run(1, 7, 5, 37, 1.0f, a, 37, bt, 37, 0.0f, ca, 5);
+    ref->run(1, 7, 5, 37, 1.0f, a, 37, bt, 37, 0.0f, cb, 5);
+    double rel = rel_diff(ca, cb, 7 * 5);
+    if (!(rel < 1e-5)) { snprintf(why, n, "NT rel %.1e", rel); return -1; }
+
+    /* NN 6x19x11 with beta != 0: C is read */
+    for (int i = 0; i < 6 * 19; i++) ca[i] = cb[i] = vfrand(&s);
+    k->run(0, 6, 19, 11, 0.75f, a, 37, bn, 19, 0.5f, ca, 19);
+    ref->run(0, 6, 19, 11, 0.75f, a, 37, bn, 19, 0.5f, cb, 19);
+    rel = rel_diff(ca, cb, 6 * 19);
+    if (!(rel < 1e-5)) { snprintf(why, n, "NN rel %.1e", rel); return -1; }
+    return 0;
+}

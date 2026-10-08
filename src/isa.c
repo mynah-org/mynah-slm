@@ -191,9 +191,11 @@ typedef struct {
 
 static fam_state g_fq = { "qmat", 0, "", 0 };
 static fam_state g_fa = { "attn", 0, "", 0 };
+static fam_state g_fs = { "sgemm", 0, "", 0 };
 
 static const mynah_slm_qmat_kern  *g_qmat  = &mynah_slm_qmat_kern_scalar;
 static const mynah_slm_attn_kern  *g_attn  = &mynah_slm_attn_kern_scalar;
+static const mynah_slm_sgemm_kern *g_sgemm = &mynah_slm_sgemm_kern_scalar;
 
 /* The compiled tables, best first. Exactly the set the Makefile builds for
  * this architecture (KERN_*_x86 / _arm64 / _generic). */
@@ -212,6 +214,14 @@ static const mynah_slm_attn_kern *const attn_tables[] = {
     &mynah_slm_attn_kern_neon,
 #endif
     &mynah_slm_attn_kern_scalar,
+};
+static const mynah_slm_sgemm_kern *const sgemm_tables[] = {
+#if defined(ISA_X86)
+    &mynah_slm_sgemm_kern_avx512, &mynah_slm_sgemm_kern_avx2,
+#elif defined(ISA_ARM64)
+    &mynah_slm_sgemm_kern_neon,
+#endif
+    &mynah_slm_sgemm_kern_scalar,
 };
 
 #define N_OF(a) (sizeof (a) / sizeof *(a))
@@ -248,6 +258,7 @@ static char g_env[48] = "";
 static void resolve_families(void) {
     RESOLVE(g_fq, qmat_tables, mynah_slm_isa_verify_qmat, g_qmat);
     RESOLVE(g_fa, attn_tables, mynah_slm_isa_verify_attn, g_attn);
+    RESOLVE(g_fs, sgemm_tables, mynah_slm_isa_verify_sgemm, g_sgemm);
 }
 
 /* MYNAH_SLM_ISA narrows; it is clamped to the CPU and never raises the
@@ -281,6 +292,7 @@ int mynah_slm_isa_ceiling(void)  { mynah_slm_isa_init(); return g_ceiling; }
 
 const mynah_slm_qmat_kern  *mynah_slm_kern_qmat(void)  { mynah_slm_isa_init(); return g_qmat; }
 const mynah_slm_attn_kern  *mynah_slm_kern_attn(void)  { mynah_slm_isa_init(); return g_attn; }
+const mynah_slm_sgemm_kern *mynah_slm_kern_sgemm(void) { mynah_slm_isa_init(); return g_sgemm; }
 
 int mynah_slm_isa_narrow(const char *name) {
     mynah_slm_isa_init();
@@ -347,9 +359,10 @@ int mynah_slm_isa_report(FILE *f) {
     if (g_env_clamped) { fprintf(f, "  <- REQUEST ABOVE THE CPU, clamped down"); bad = 1; }
     fprintf(f, "\n");
 
-    const char *qn[N_OF(qmat_tables)], *an[N_OF(attn_tables)];
+    const char *qn[N_OF(qmat_tables)], *an[N_OF(attn_tables)], *sn[N_OF(sgemm_tables)];
     for (size_t i = 0; i < N_OF(qmat_tables); i++)  qn[i] = qmat_tables[i]->name;
     for (size_t i = 0; i < N_OF(attn_tables); i++)  an[i] = attn_tables[i]->name;
+    for (size_t i = 0; i < N_OF(sgemm_tables); i++) sn[i] = sgemm_tables[i]->name;
 
     char q_extra[128];
     const int want8 = mynah_slm_matvec_int8_requested();
@@ -358,12 +371,13 @@ int mynah_slm_isa_report(FILE *f) {
              want8 ? "ON" : "off",
              want8 && !g_qmat->int8 ? " <- REQUESTED BUT UNAVAILABLE at this level" : "");
     if (want8 && !g_qmat->int8) bad = 1;
+    char s_extra[96];
+    snprintf(s_extra, sizeof s_extra, "backend %s", mynah_slm_sgemm_backend());
+
     fam_line(f, &g_fq, g_qmat->name, qn, N_OF(qmat_tables), q_extra);
     fam_line(f, &g_fa, g_attn->name, an, N_OF(attn_tables), NULL);
-    /* not dispatched yet: compile-time ISA, like every kernel before K5 */
-    fprintf(f, "  sgemm  -> %-11s compile-time ISA (not dispatched)  backend %s\n",
-            mynah_slm_sgemm_isa(), mynah_slm_sgemm_backend());
-    bad |= g_fq.verify_failed | g_fa.verify_failed;
+    fam_line(f, &g_fs, g_sgemm->name, sn, N_OF(sgemm_tables), s_extra);
+    bad |= g_fq.verify_failed | g_fa.verify_failed | g_fs.verify_failed;
 
     /* ingot dispatches its own kernels (the f32-activation Q6_K / Q8_0 / Q5_K
      * paths, every type we have no kernel for) on CPUID AND on what it was

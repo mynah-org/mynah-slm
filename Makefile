@@ -99,10 +99,13 @@ endif
 # which TUs each family has, per architecture (src/isa.c lists the same sets)
 KERN_QMAT_x86      := scalar avx2 avx512vnni
 KERN_ATTN_x86      := scalar avx2
+KERN_SGEMM_x86     := scalar avx2 avx512
 KERN_QMAT_arm64    := scalar neon neon_dotprod
 KERN_ATTN_arm64    := scalar neon
+KERN_SGEMM_arm64   := scalar neon
 KERN_QMAT_generic  := scalar
 KERN_ATTN_generic  := scalar
+KERN_SGEMM_generic := scalar
 
 # per-TU ISA flags, added AFTER ARCH_FLAGS so they win. The x86 "scalar" and
 # "avx2" TUs also switch the wider ISAs OFF, so a -march=native build's
@@ -127,7 +130,8 @@ KID_avx512vnni   := 5
 
 KERN_SRC := src/qmat_kern.c src/attn_kern.c
 KERN_OBJ := $(foreach t,$(KERN_QMAT_$(KERN_ARCH)),build/kern/qmat_$(t).o) \
-            $(foreach t,$(KERN_ATTN_$(KERN_ARCH)),build/kern/attn_$(t).o)
+            $(foreach t,$(KERN_ATTN_$(KERN_ARCH)),build/kern/attn_$(t).o) \
+            $(foreach t,$(KERN_SGEMM_$(KERN_ARCH)),build/kern/sgemm_$(t).o)
 KERN_TU_FLAGS = $(KF_$(KERN_ARCH)_$*) -DMYNAH_SLM_KERN_TU=$* -DMYNAH_SLM_KERN_ID=$(KID_$*)
 
 SRC := $(filter-out $(KERN_SRC),$(wildcard src/*.c))
@@ -202,6 +206,9 @@ build/kern/qmat_%.o: src/qmat_kern.c $(HDR)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(KERN_TU_FLAGS) -c $< -o $@
 build/kern/attn_%.o: src/attn_kern.c $(HDR)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(KERN_TU_FLAGS) -c $< -o $@
+build/kern/sgemm_%.o: src/sgemm.c $(HDR)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(KERN_TU_FLAGS) -c $< -o $@
 
@@ -379,6 +386,8 @@ check-x86:
 	  -DMYNAH_SLM_KERN_ID=$(KID_$(t)) -c src/qmat_kern.c -o build/x86/qmat_$(t).o &&) true
 	@$(foreach t,$(KERN_ATTN_x86),$(X86_CHECK) $(KF_x86_$(t)) -DMYNAH_SLM_KERN_TU=$(t) \
 	  -DMYNAH_SLM_KERN_ID=$(KID_$(t)) -c src/attn_kern.c -o build/x86/attn_$(t).o &&) true
+	@$(foreach t,$(KERN_SGEMM_x86),$(X86_CHECK) $(KF_x86_$(t)) -DMYNAH_SLM_KERN_TU=$(t) \
+	  -DMYNAH_SLM_KERN_ID=$(KID_$(t)) -c src/sgemm.c -o build/x86/sgemm_$(t).o &&) true
 	@echo "x86-64 cross-compile OK (baseline avx2 + every x86 kernel TU)"
 
 # INGOT_CAPS_ASSUME is not optional here, it is what makes this target mean

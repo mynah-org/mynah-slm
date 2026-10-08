@@ -130,23 +130,37 @@ typedef struct {
                      uint32_t head, float w, float *out);
 } mynah_slm_attn_kern;
 
+/* ── sgemm: our own f32 GEMM's planner + micro-kernels (src/sgemm.c) ─────── */
+typedef struct {
+    const char *name;
+    int         id;
+    int (*run)(int trans_b, size_t m, size_t n, size_t k, float alpha,
+               const float *a, size_t lda, const float *b, size_t ldb,
+               float beta, float *c, size_t ldc);
+} mynah_slm_sgemm_kern;
+
 /* The tables each TU exports. Which ones exist depends on the target
  * architecture; src/isa.c references only those the Makefile builds. */
 extern const mynah_slm_qmat_kern  mynah_slm_qmat_kern_scalar;
 extern const mynah_slm_attn_kern  mynah_slm_attn_kern_scalar;
+extern const mynah_slm_sgemm_kern mynah_slm_sgemm_kern_scalar;
 #if defined(__x86_64__) || defined(_M_X64)
 extern const mynah_slm_qmat_kern  mynah_slm_qmat_kern_avx2;
 extern const mynah_slm_qmat_kern  mynah_slm_qmat_kern_avx512vnni;
 extern const mynah_slm_attn_kern  mynah_slm_attn_kern_avx2;
+extern const mynah_slm_sgemm_kern mynah_slm_sgemm_kern_avx2;
+extern const mynah_slm_sgemm_kern mynah_slm_sgemm_kern_avx512;
 #elif defined(__aarch64__)
 extern const mynah_slm_qmat_kern  mynah_slm_qmat_kern_neon;
 extern const mynah_slm_qmat_kern  mynah_slm_qmat_kern_neon_dotprod;
 extern const mynah_slm_attn_kern  mynah_slm_attn_kern_neon;
+extern const mynah_slm_sgemm_kern mynah_slm_sgemm_kern_neon;
 #endif
 
 /* The resolved tables (src/isa.c). Never NULL: the scalar table is always
  * there to fall back to. */
 const mynah_slm_qmat_kern  *mynah_slm_kern_qmat(void);
 const mynah_slm_attn_kern  *mynah_slm_kern_attn(void);
+const mynah_slm_sgemm_kern *mynah_slm_kern_sgemm(void);
 
 #endif /* MYNAH_SLM_KERN_H */

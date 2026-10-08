@@ -25,6 +25,23 @@
 #define SG_VENDOR "openblas"
 #endif
 
+/* ── runtime dispatch (K5, .work/isa-runtime-dispatch.md) ──────────────────
+ * This file is compiled twice over. The plain compile is the API: counters,
+ * the reference, argument checks, the vendor switch. Each KERNEL TU compile
+ * (kern.h: the Makefile defines MYNAH_SLM_KERN_ID) holds only the ISA
+ * abstraction, the micro-kernels and the planner, exported as one table that
+ * src/isa.c picks at run time. In a kernel TU the TU's id picks the ISA below,
+ * not the build's -march, so a baseline build still carries AVX-512. Nothing
+ * in the arithmetic changed. */
+#include "kern.h"
+
+#if defined(MYNAH_SLM_KERN_ID)     /* the ISA abstraction: kernel TUs only */
+#if MYNAH_SLM_KERN_ID == MYNAH_SLM_KERN_ID_SCALAR
+#define SG_TU_SCALAR 1
+#elif MYNAH_SLM_KERN_ID == MYNAH_SLM_KERN_ID_AVX2
+#define SG_TU_AVX2 1
+#endif
+
 /* ── ISA abstraction ───────────────────────────────────────────────────────
  * The scalar build is not a second algorithm: SG_L == 1 makes a "vector" one
  * float and the same loop nest runs. SG_FMA1, not a bare a*b+c, so a scalar
@@ -43,7 +60,7 @@
 #else
 #define SG_FMA1(a, b, c) ((a) * (b) + (c))
 #endif
-#if defined(__ARM_NEON) || defined(__aarch64__)
+#if !defined(SG_TU_SCALAR) && (defined(__ARM_NEON) || defined(__aarch64__))
 #include <arm_neon.h>
 #define SG_ISA "neon"
 #define SG_L 4
@@ -63,7 +80,8 @@ static inline float sg_hsum(sg_v v) {
     return vget_lane_f32(s, 0) + vget_lane_f32(s, 1);
 }
 
-#elif defined(__AVX512F__) && defined(__AVX512DQ__)   /* DQ: _mm512_extractf32x8_ps */
+#elif !defined(SG_TU_SCALAR) && !defined(SG_TU_AVX2) && defined(__AVX512F__) && \
+      defined(__AVX512DQ__)   /* DQ: _mm512_extractf32x8_ps */
 #include <immintrin.h>
 #define SG_ISA "avx512"
 #define SG_L 16
@@ -85,7 +103,7 @@ static inline float sg_hsum(sg_v v) {
     return _mm_cvtss_f32(_mm_add_ss(d, _mm_movehdup_ps(d)));
 }
 
-#elif defined(__AVX2__) && defined(__FMA__)
+#elif !defined(SG_TU_SCALAR) && defined(__AVX2__) && defined(__FMA__)
 #include <immintrin.h>
 #define SG_ISA "avx2"
 #define SG_L 8
@@ -119,6 +137,7 @@ typedef float sg_v;
 #define SG_NN_NV 4
 static inline float sg_hsum(sg_v v) { return v; }
 #endif
+#endif /* MYNAH_SLM_KERN_ID: the ISA abstraction */
 
 #define SG_NN_MR 4
 
@@ -126,6 +145,8 @@ static inline float sg_hsum(sg_v v) { return v; }
  * mynah-tts measured ~20 us of wake-up per region, and 2^17 MACs is a few
  * tens of microseconds on one core. Cost-model estimate, not a sweep. */
 #define SG_PARALLEL_MIN_WORK 131072u
+
+#if !defined(MYNAH_SLM_KERN_ID)    /* ── the API compile ─────────────────── */
 
 /* ── counters ──────────────────────────────────────────────────────────────*/
 static atomic_ullong g_calls, g_nt, g_nn, g_ref, g_vendor, g_refused;
@@ -147,7 +168,8 @@ void mynah_slm_sgemm_stats_reset(void) {
     atomic_store(&g_ref, 0);   atomic_store(&g_vendor, 0); atomic_store(&g_refused, 0);
 }
 
-const char *mynah_slm_sgemm_isa(void) { return SG_ISA; }
+/* The RESOLVED kernel, not the build's: since K5 they can differ. */
+const char *mynah_slm_sgemm_isa(void) { return mynah_slm_kern_sgemm()->name; }
 
 /* ── reference ─────────────────────────────────────────────────────────────*/
 void mynah_slm_sgemm_reference(int trans_b, size_t m, size_t n, size_t k,
@@ -165,6 +187,8 @@ void mynah_slm_sgemm_reference(int trans_b, size_t m, size_t n, size_t k,
                                  : (float)(alpha * s) + beta * *cp;
         }
 }
+
+#else                               /* ── a kernel TU ───────────────────── */
 
 /* ── store, shared by both families ────────────────────────────────────────
  * beta == 0 never reads C. With beta != 0 the rounding is spelled out:
@@ -371,22 +395,10 @@ static void sg_task(void *ctx, int t) {
 
 static size_t round_up(size_t x, size_t q) { return (x + q - 1) / q * q; }
 
-int mynah_slm_sgemm_own(int trans_b, size_t m, size_t n, size_t k, float alpha,
-                        const float *a, size_t lda, const float *b, size_t ldb,
-                        float beta, float *c, size_t ldc) {
-    bump(&g_calls);
-    if (m == 0 || n == 0) return 0;
-    if (!c || ldc < n || (k && (!a || !b || lda < k || ldb < (trans_b ? k : n)))) {
-        bump(&g_refused);
-        return -1;
-    }
-    if (k == 0) {
-        bump(&g_ref);
-        mynah_slm_sgemm_reference(trans_b, m, n, 0, alpha, a, lda, b, ldb, beta, c, ldc);
-        return 0;
-    }
-    bump(trans_b ? &g_nt : &g_nn);
-
+/* Plan and run; arguments already checked by mynah_slm_sgemm_own. */
+static int sg_run(int trans_b, size_t m, size_t n, size_t k, float alpha,
+                  const float *a, size_t lda, const float *b, size_t ldb,
+                  float beta, float *c, size_t ldc) {
     sg_job j = { trans_b, m, n, k, lda, ldb, ldc, alpha, beta, a, b, c, m, n, 1 };
 
     /* The plan. Because every element is computed identically whatever tile
@@ -416,6 +428,32 @@ int mynah_slm_sgemm_own(int trans_b, size_t m, size_t n, size_t k, float alpha,
     if (n_tasks <= 1) sg_task(&j, 0);
     else mynah_slm_parallel_for((int)n_tasks, sg_task, &j);
     return 0;
+}
+
+const mynah_slm_sgemm_kern MYNAH_SLM_KERN_SYM(mynah_slm_sgemm_kern) = {
+    SG_ISA, MYNAH_SLM_KERN_ID, sg_run,
+};
+
+#endif /* MYNAH_SLM_KERN_ID */
+
+#if !defined(MYNAH_SLM_KERN_ID)
+int mynah_slm_sgemm_own(int trans_b, size_t m, size_t n, size_t k, float alpha,
+                        const float *a, size_t lda, const float *b, size_t ldb,
+                        float beta, float *c, size_t ldc) {
+    bump(&g_calls);
+    if (m == 0 || n == 0) return 0;
+    if (!c || ldc < n || (k && (!a || !b || lda < k || ldb < (trans_b ? k : n)))) {
+        bump(&g_refused);
+        return -1;
+    }
+    if (k == 0) {
+        bump(&g_ref);
+        mynah_slm_sgemm_reference(trans_b, m, n, 0, alpha, a, lda, b, ldb, beta, c, ldc);
+        return 0;
+    }
+    bump(trans_b ? &g_nt : &g_nn);
+    return mynah_slm_kern_sgemm()->run(trans_b, m, n, k, alpha, a, lda, b, ldb,
+                                       beta, c, ldc);
 }
 
 /* ── the entry point ───────────────────────────────────────────────────────*/
@@ -460,3 +498,4 @@ int mynah_slm_sgemm(int trans_b, size_t m, size_t n, size_t k, float alpha,
     return -1;
 #endif
 }
+#endif /* !MYNAH_SLM_KERN_ID */

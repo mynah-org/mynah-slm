@@ -86,24 +86,27 @@ static void test_narrowing(void) {
         snprintf(d, sizeof d, "got %s", mynah_slm_isa_level_name(got));
         check(what, got == want, d);
 
-        const int q = mynah_slm_kern_qmat()->id, a = mynah_slm_kern_attn()->id;
-        snprintf(what, sizeof what, "  under %s: qmat %s attn %s, none above the ceiling",
+        const int q = mynah_slm_kern_qmat()->id, a = mynah_slm_kern_attn()->id,
+                  s = mynah_slm_kern_sgemm()->id;
+        snprintf(what, sizeof what, "  under %s: qmat %s attn %s sgemm %s, none above the ceiling",
                  mynah_slm_isa_level_name(got), mynah_slm_kern_qmat()->name,
-                 mynah_slm_kern_attn()->name);
-        check(what, rank_of(q) <= rank_of(got) && rank_of(a) <= rank_of(got),
-              "a family exceeded the ceiling");
+                 mynah_slm_kern_attn()->name, mynah_slm_kern_sgemm()->name);
+        check(what, rank_of(q) <= rank_of(got) && rank_of(a) <= rank_of(got) &&
+              rank_of(s) <= rank_of(got), "a family exceeded the ceiling");
         /* and none BELOW what was compiled and allowed: the best is taken */
 #if defined(__x86_64__)
         const int best_q = got == MYNAH_SLM_KERN_ID_AVX512 ? MYNAH_SLM_KERN_ID_AVX2 : got;
         const int best_a = rank_of(got) >= 1 ? MYNAH_SLM_KERN_ID_AVX2 : 0;
+        const int best_s = got == MYNAH_SLM_KERN_ID_AVX512VNNI ? MYNAH_SLM_KERN_ID_AVX512 : got;
 #elif defined(__aarch64__)
         const int best_q = got;
         const int best_a = rank_of(got) >= 1 ? MYNAH_SLM_KERN_ID_NEON : 0;
+        const int best_s = rank_of(got) >= 1 ? MYNAH_SLM_KERN_ID_NEON : 0;
 #else
-        const int best_q = 0, best_a = 0;
+        const int best_q = 0, best_a = 0, best_s = 0;
 #endif
         check("  ...and each family takes the best table it is allowed",
-              q == best_q && a == best_a, "a better compiled table was skipped");
+              q == best_q && a == best_a && s == best_s, "a better compiled table was skipped");
     }
     check("an unknown name is refused and changes nothing",
           mynah_slm_isa_narrow("avx1024") == -1, NULL);
@@ -143,7 +146,8 @@ static void test_verify_teeth(void) {
         snprintf(what, sizeof what, "verify passes the resolved tables at %s", all_levels[i]);
         why[0] = '\0';
         int ok = mynah_slm_isa_verify_qmat(mynah_slm_kern_qmat(), why, sizeof why) == 0 &&
-                 mynah_slm_isa_verify_attn(mynah_slm_kern_attn(), why, sizeof why) == 0;
+                 mynah_slm_isa_verify_attn(mynah_slm_kern_attn(), why, sizeof why) == 0 &&
+                 mynah_slm_isa_verify_sgemm(mynah_slm_kern_sgemm(), why, sizeof why) == 0;
         check(what, ok, why);
     }
     mynah_slm_isa_narrow(NULL);
@@ -191,6 +195,7 @@ static void test_levels_agree(void) {
     qfx_activations(a, M * K, 1); qfx_activations(b, N * K, 2);
     qfx_activations(q, H * HD, 3); qfx_activations(kk, NKV * KVH * HD, 4);
     qfx_activations(vv, NKV * KVH * HD, 5);
+    mynah_slm_sgemm_reference(1, M, N, K, 1.0f, a, K, b, K, 0.0f, cref, N);
 
     mynah_slm_kv cache;
     if (mynah_slm_kv_init(&cache, MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_BF16, 1, NKV, KVH, HD) != 0) {
@@ -211,11 +216,21 @@ static void test_levels_agree(void) {
         char what[160], d[96];
 
         mynah_slm_threads_init(1);
+        mynah_slm_sgemm_own(1, M, N, K, 1.0f, a, K, b, K, 0.0f, c1, N);
         mynah_slm_attention_kv_mt(o1, q, &cache, 0, NKV, H, KVH, HD, 0.088f, scr);
         mynah_slm_threads_init(4);
+        mynah_slm_sgemm_own(1, M, N, K, 1.0f, a, K, b, K, 0.0f, c4, N);
         mynah_slm_attention_kv_mt(o4, q, &cache, 0, NKV, H, KVH, HD, 0.088f, scr);
 
-        double r = rel_diff(o1, oref, H * HD);
+        double r = rel_diff(c1, cref, M * N);
+        snprintf(what, sizeof what, "%s: sgemm (%s) agrees with the reference",
+                 all_levels[i], mynah_slm_kern_sgemm()->name);
+        snprintf(d, sizeof d, "rel %.1e", r);
+        check(what, r < 1e-5, d);
+        snprintf(what, sizeof what, "%s: sgemm 4 threads == 1 thread, bit for bit", all_levels[i]);
+        check(what, memcmp(c1, c4, M * N * 4) == 0, NULL);
+
+        r = rel_diff(o1, oref, H * HD);
         snprintf(what, sizeof what, "%s: bf16-KV attention (%s) agrees with scalar",
                  all_levels[i], mynah_slm_kern_attn()->name);
         snprintf(d, sizeof d, "rel %.1e", r);
@@ -239,7 +254,8 @@ static void test_report(void) {
     buf[n] = '\0';
     fclose(f);
     check("the report names every family",
-          strstr(buf, "qmat") && strstr(buf, "attn") && strstr(buf, "ingot"), NULL);
+          strstr(buf, "qmat") && strstr(buf, "attn") && strstr(buf, "sgemm") &&
+          strstr(buf, "ingot"), NULL);
     check("the report is OK when nothing was asked for",
           rc == 0 || getenv("MYNAH_SLM_ISA") || getenv("MYNAH_SLM_INT8"), buf);
 }

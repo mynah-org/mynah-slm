@@ -61,5 +61,6 @@ int mynah_slm_isa_report(FILE *f);
  * fixed, awkward fixtures. 0 = agrees; else -1 with the reason in `why`. */
 int mynah_slm_isa_verify_qmat(const mynah_slm_qmat_kern *k, char *why, size_t n);
 int mynah_slm_isa_verify_attn(const mynah_slm_attn_kern *k, char *why, size_t n);
+int mynah_slm_isa_verify_sgemm(const mynah_slm_sgemm_kern *k, char *why, size_t n);
 
 #endif /* MYNAH_SLM_ISA_H */
