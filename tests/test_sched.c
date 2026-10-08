@@ -59,6 +59,11 @@ typedef struct {
     int    n;
     int    max_width;
     int    live, max_live;
+    /* A client arriving mid-prefill: pushed when `inject_after` prompt
+     * tokens of any job have been prefilled. */
+    mynah_slm_jobq *inject_q;
+    void  *inject;
+    int    inject_after;
 } fake;
 
 static void logev(fake *f, char k, int who, int arg) {
@@ -86,6 +91,10 @@ static int f_prefill(void *ud, void *j_, uint32_t slot, uint32_t budget) {
     if (budget && take > (int)budget) take = (int)budget;
     j->prefilled += take;
     if (j->cancel_at && j->prefilled >= j->cancel_at) atomic_store(&j->cancel, 1);
+    if (f->inject && j->prefilled >= f->inject_after) {
+        mynah_slm_jobq_push(f->inject_q, f->inject);
+        f->inject = NULL;
+    }
     f->clock += take * f->cost_token;
     logev(f, 'P', j->id, take);
     return j->prefilled == j->prompt ? 1 : 0;
@@ -387,6 +396,42 @@ static void t_idle_full_batch(void) {
     mynah_slm_jobq_free(q);
 }
 
+/* A request arriving while a long prompt is prefilled with nobody decoding
+ * (one uncapped pass, many batches) is ADMITTED between batches — its
+ * client hears back — instead of after the whole prompt. Review R7. */
+static void t_admit_mid_prefill(void) {
+    printf("\n-- admission between prefill batches --\n");
+    fake f = { .cost_token = 0.001, .cost_step = 0.01 };
+    mynah_slm_jobq *q = mynah_slm_jobq_new(8);
+    mynah_slm_sched_engine e = engine_for(&f);
+    mynah_slm_sched_cfg cfg = { 2, 32, 0.040, 128 };
+    mynah_slm_sched *s = mynah_slm_sched_new(&cfg, &e, q);
+    job big, late;
+    job_init(&big, 0, 1024, 5);
+    job_init(&late, 1, 10, 5);
+    f.inject_q = q;
+    f.inject = &late;
+    f.inject_after = 128;               /* arrives after big's first batch */
+    mynah_slm_jobq_push(q, &big);
+    f.iter++; mynah_slm_sched_iterate(s, 0);
+    int last_big = -1;
+    for (int i = 0; i < f.n; i++) if (f.kind[i] == 'P' && f.who[i] == 0) last_big = i;
+    const int adm = index_of(&f, 'A', 1), first_late = index_of(&f, 'P', 1);
+    char d[200];
+    snprintf(d, sizeof d, "late admitted at event %d, big's last slice at event %d, late's "
+             "first slice at %d", adm, last_big, first_late);
+    check("a request arriving mid-prompt is admitted before that prompt finishes",
+          adm >= 0 && adm < last_big, d);
+    check("... and its own prefill still waits for the older prompt (FIFO)",
+          first_late < 0 || first_late > last_big, d);
+    atomic_store(&big.cancel, 1);
+    atomic_store(&late.cancel, 1);
+    mynah_slm_jobq_close(q);
+    mynah_slm_sched_run(s);
+    mynah_slm_sched_free(s);
+    mynah_slm_jobq_free(q);
+}
+
 static void t_cancel_and_isolation(void) {
     printf("\n-- cancellation and isolation --\n");
     fake f = { .cost_token = 0.001, .cost_step = 0.01 };
@@ -627,6 +672,7 @@ int main(void) {
     t_prefill_policy();
     t_prefill_turns_decoder();
     t_idle_full_batch();
+    t_admit_mid_prefill();
     t_cancel_and_isolation();
     t_queued_ghosts();
     t_queue_bound();

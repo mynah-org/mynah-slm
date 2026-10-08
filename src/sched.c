@@ -204,8 +204,14 @@ static void prefill_pass(mynah_slm_sched *s) {
         const int rc = s->eng.prefill(s->eng.ud, s->slots[pick].job, pick, slice);
         served++;
         if (rc < 0) retire(s, pick, MYNAH_SLM_JOB_FAILED);
-        else if (rc == 1) {
-            s->slots[pick].state = SLOT_DECODING;
+        else if (rc == 1) s->slots[pick].state = SLOT_DECODING;
+        /* Head-of-line admission: a request that arrived during this pass
+         * is admitted between slices (its SSE header goes out, its client
+         * is probed) rather than after the whole pass — which, with nobody
+         * decoding, is a whole long prompt. Its own prefill still waits
+         * its FIFO turn. */
+        admit_pass(s, 0);
+        if (rc == 1) {
             /* Someone decodes now. An uncapped pass was uncapped only
              * because nobody did: carrying on would make this new stream
              * wait for every other queued prompt before its first step.
