@@ -35,6 +35,9 @@ typedef struct {
     /* SO_RCVTIMEO while the request is read: a client that opens a socket
      * and sends nothing must not keep a thread. 0 = 30000 ms. */
     int recv_timeout_ms;
+    /* Liveness probe period once the client's read side has reached EOF
+     * (see http_keepalive). 0 = 250 ms. */
+    int probe_interval_ms;
 } http_limits;
 
 /* Accept loop. Returns when *stop becomes non-zero (a signal handler sets it)
@@ -49,7 +52,10 @@ int http_serve(const char *host, int port, http_handler fn, void *user,
 int           http_live_connections(void);
 unsigned long http_rejected_connections(void);
 
-/* Complete response with a Content-Length. */
+/* Complete response with a Content-Length. If the response has already
+ * been started (http_begin_sse, or http_keepalive committed it), only the
+ * body is written: the status line is gone, so an error after that point
+ * travels in-band, as the body. */
 void http_respond(http_conn *c, int status, const char *content_type,
                   const char *body, size_t len);
 
@@ -67,14 +73,38 @@ int http_write(http_conn *c, const char *data, size_t len);
 
 /* Has the peer gone? Non-blocking and cheap — one poll(2) with a zero
  * timeout, plus a one-byte MSG_PEEK when the socket reads as readable — so it
- * can be asked before every decode step. Gone = a write already failed, the
- * socket reports hang-up / error / read-side shutdown, or a peek reads EOF.
- * A pipelined byte from a live client is NOT gone. Sticky once true.
- * Safe to call from a thread other than the one writing. */
+ * can be asked before every decode step. Sticky once true. Safe to call from
+ * a thread other than the one writing.
+ *
+ * Gone = a write failed (EPIPE, ECONNRESET, a send timeout), or the socket
+ * reports a reset or hang-up (POLLERR / POLLHUP). An EOF on the read side is
+ * NOT gone: a client that half-closes after its request (shutdown(SHUT_WR):
+ * nc -N, socat, some proxies) still reads the answer, and from here it looks
+ * exactly like one that closed the socket. The EOF is recorded
+ * (http_peer_eof) and http_keepalive resolves it with a write: a closed
+ * socket answers it with a reset, which the next probe sees.
+ * A pipelined byte from a live client is neither. */
 int http_peer_gone(http_conn *c);
 
-/* The same probe on a bare descriptor (what http_peer_gone runs), exposed
- * for tests/test_http.c. 1 = gone, 0 = alive. */
-int http_fd_peer_gone(int fd);
+/* The read side reached EOF (half-close or close — not distinguishable
+ * without writing). Set by http_peer_gone. */
+int http_peer_eof(http_conn *c);
+
+/* Resolve an EOF: once the read side has reached EOF, make sure the client
+ * was written to within the last probe interval, so a client that really
+ * closed answers with a reset. Nothing happens before EOF. The first write
+ * starts the response if it has not started — the SSE header (`sse`), or a
+ * 200 with a close-delimited JSON body — and the later ones are an SSE
+ * comment line (":\n\n") or one byte of JSON whitespace, both ignored by a
+ * client. Call it from the thread that writes the response. */
+void http_keepalive(http_conn *c, int sse);
+
+/* Has the response been started (status line written)? */
+int http_head_sent(const http_conn *c);
+
+/* The probe on a bare descriptor, exposed for tests/test_http.c:
+ * 0 alive, 1 EOF on the read side (half-closed or closed), 2 gone (reset,
+ * hang-up, a closed descriptor). */
+int http_fd_probe(int fd);
 
 #endif /* MYNAH_SLM_HTTP_H */

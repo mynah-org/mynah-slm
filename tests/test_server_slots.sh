@@ -396,6 +396,48 @@ PY
 done
 fi
 
+if want 11; then
+# ── 11. a client that half-closes after its request still gets its answer ─────
+# Review R2: POLLRDHUP / a read EOF counted as "gone", so a client that sends
+# its request and then shutdown(SHUT_WR)s (nc -N, socat, some proxies) got
+# NOTHING, in both modes. EOF alone is not gone now; a write resolves it.
+for MODE in 1 2; do
+    start "$TMP/half$MODE.log" --slots $MODE
+    python3 - "$PORT" > "$TMP/half$MODE.out" 2>&1 <<'PY'
+import json, socket, sys
+port = int(sys.argv[1])
+for stream in (False, True):
+    b = json.dumps({'messages': [{'role': 'user', 'content': 'Hello there'}], 'max_tokens': 24,
+                    'stream': stream, 'temperature': 0}).encode()
+    s = socket.create_connection(('127.0.0.1', port)); s.settimeout(60)
+    s.sendall(b'POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n' % len(b) + b)
+    s.shutdown(socket.SHUT_WR)
+    r = b''
+    while True:
+        c = s.recv(65536)
+        if not c: break
+        r += c
+    st = r.split(b'\r\n')[0].decode('latin-1') or 'EMPTY'
+    body = r.split(b'\r\n\r\n', 1)[1] if b'\r\n\r\n' in r else b''
+    if stream:
+        good = body.endswith(b'data: [DONE]\n\n') and b'"finish_reason":"length"' in body
+    else:
+        try:
+            d = json.loads(body.decode('utf-8', 'replace'))
+            good = d['usage']['completion_tokens'] == 24
+        except Exception:
+            good = False
+    print('stream' if stream else 'json', st, 'complete' if good else 'INCOMPLETE', len(r))
+PY
+    stop
+    for K in json stream; do
+        L=$(grep "^$K " "$TMP/half$MODE.out")
+        echo "$L" | grep -q "200 OK complete" && ok "--slots $MODE: a half-closed $K client gets the whole answer" \
+            || bad "--slots $MODE: a half-closed $K client gets the whole answer" "$L"
+    done
+done
+fi
+
 if grep -l "Sanitizer" "$TMP"/*.log >/dev/null 2>&1; then
     bad "no sanitizer report in any server log" "$(grep -h -A3 Sanitizer "$TMP"/*.log | head -12)"
 fi

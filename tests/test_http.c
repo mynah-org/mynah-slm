@@ -7,7 +7,9 @@
  *
  *   open, idle               alive
  *   open, a pipelined byte   alive (readable is not the same as gone)
- *   peer closed              gone, within one probe
+ *   peer half-closed         EOF, NOT gone — it still reads our answer
+ *   peer closed (FIN)        EOF, not gone until written to; gone after
+ *                            one write (the closed socket resets it)
  *   peer reset (SO_LINGER 0) gone
  *
  * SPDX-License-Identifier: MIT */
@@ -47,36 +49,58 @@ static int tcp_pair(int *srv, int *cli) {
     return *srv < 0 ? -1 : 0;
 }
 
-/* The FIN takes a moment to cross loopback; poll up to 1 s for it. Returns
- * the number of probes it took, or -1 if it never reported gone. */
-static int probes_until_gone(int fd) {
+/* A FIN or RST takes a moment to cross loopback; poll up to 1 s for state
+ * `want`. Returns the number of probes it took, or -1 if never. */
+static int probes_until(int fd, int want) {
     for (int i = 1; i <= 1000; i++) {
-        if (http_fd_peer_gone(fd)) return i;
+        if (http_fd_probe(fd) == want) return i;
         struct timespec ts = { 0, 1000000 };
         nanosleep(&ts, NULL);
     }
     return -1;
 }
+#define probes_until_gone(fd) probes_until((fd), 2)
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     int s, c;
 
     if (tcp_pair(&s, &c) != 0) { printf("FAIL no loopback TCP\n"); return 1; }
-    check("an open, idle client is alive", http_fd_peer_gone(s) == 0);
-    check("asking again does not change the answer", http_fd_peer_gone(s) == 0);
+    check("an open, idle client is alive", http_fd_probe(s) == 0);
+    check("asking again does not change the answer", http_fd_probe(s) == 0);
     send(c, "x", 1, 0);
     {
         struct timespec ts = { 0, 20000000 };
         nanosleep(&ts, NULL);
     }
-    check("a pipelined byte is not a disconnect", http_fd_peer_gone(s) == 0);
+    check("a pipelined byte is not a disconnect", http_fd_probe(s) == 0);
     char b;
     check("... and the probe did not consume it", recv(s, &b, 1, 0) == 1 && b == 'x');
     close(c);
+    const int e = probes_until(s, 1);
+    check("a closed client shows EOF first (indistinguishable from a half-close)", e > 0);
+    check("... and is not called gone before anything is written", http_fd_probe(s) == 1);
+    send(s, "x", 1, MSG_NOSIGNAL);              /* what http_keepalive does */
     const int n = probes_until_gone(s);
-    printf("     gone after %d probe(s)\n", n);
-    check("a closed client is gone", n > 0);
+    printf("     gone %d probe(s) after one write\n", n);
+    check("a closed client is gone once written to (it answers with a reset)", n > 0);
+    close(s);
+
+    /* Half-close (shutdown(SHUT_WR) after the request): EOF, never gone,
+     * and it still receives what is written — the review's R2 case, where
+     * such a client used to get no answer at all. */
+    if (tcp_pair(&s, &c) != 0) return 1;
+    shutdown(c, SHUT_WR);
+    check("a half-closed client shows EOF", probes_until(s, 1) > 0);
+    for (int i = 0; i < 3; i++) send(s, "y", 1, MSG_NOSIGNAL);
+    {
+        struct timespec ts = { 0, 50000000 };
+        nanosleep(&ts, NULL);
+    }
+    check("... is not gone after writes", http_fd_probe(s) == 1);
+    char got[8];
+    check("... and reads them", recv(c, got, sizeof got, 0) == 3);
+    close(c);
     close(s);
 
     if (tcp_pair(&s, &c) != 0) return 1;
@@ -86,7 +110,7 @@ int main(void) {
     check("a reset client is gone", probes_until_gone(s) > 0);
     close(s);
 
-    check("a closed descriptor is gone", http_fd_peer_gone(-1) == 1);
+    check("a closed descriptor is gone", http_fd_probe(-1) == 2);
 
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASS",
            failures, failures == 1 ? "" : "s");

@@ -494,6 +494,17 @@ static int run_entered(http_conn *conn, const slots_params *p, slots_result *out
             continue;
         }
         if (r->done) break;
+        /* A client whose read side reached EOF may have half-closed or
+         * closed: write to it (header, then a probe every interval) so a
+         * closed one answers with a reset the scheduler's probe sees. */
+        if (!atomic_load(&r->gone)) {
+            pthread_mutex_unlock(&r->mu);
+            http_keepalive(conn, p->stream);
+            pthread_mutex_lock(&r->mu);
+            if (http_head_sent(conn) && p->stream) out->header_sent = 1;
+            /* Frames may have arrived while unlocked: their signal is gone. */
+            if ((r->out_used && out->header_sent) || r->done) continue;
+        }
         /* Still queued: nobody else looks at this client until it is
          * admitted, so probe it here. A client that left while queued is
          * marked gone, and the scheduler takes it out of the queue at its

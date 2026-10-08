@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_BODY (4u * 1024u * 1024u)
@@ -25,7 +26,21 @@ struct http_conn {
     /* Set by a failed or timed-out send, or by the probe. Atomic because the
      * probe may run on a thread that is not the writer's. */
     atomic_int dead;
+    /* The read side reached EOF (set by the probe, any thread). */
+    atomic_int eof;
+    /* The writer thread's alone: the response has started, and when it
+     * last wrote (monotonic seconds). */
+    int        head_sent;
+    double     last_write;
 };
+
+static int g_probe_ms = 250;
+
+static double mono_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
 
 static atomic_int   g_live;
 static atomic_ulong g_rejected;
@@ -35,6 +50,7 @@ unsigned long http_rejected_connections(void) { return atomic_load(&g_rejected);
 
 int http_write(http_conn *c, const char *data, size_t len) {
     if (atomic_load(&c->dead)) return -1;
+    c->last_write = mono_s();
     while (len > 0) {
         /* MSG_NOSIGNAL where it exists; SIGPIPE is ignored process-wide too. */
 #ifdef MSG_NOSIGNAL
@@ -56,8 +72,8 @@ int http_write(http_conn *c, const char *data, size_t len) {
     return 0;
 }
 
-int http_fd_peer_gone(int fd) {
-    if (fd < 0) return 1;
+int http_fd_probe(int fd) {
+    if (fd < 0) return 2;
     struct pollfd p;
     p.fd = fd;
     p.events = POLLIN;
@@ -66,11 +82,13 @@ int http_fd_peer_gone(int fd) {
 #endif
     p.revents = 0;
     const int ready = poll(&p, 1, 0);       /* zero timeout: never blocks */
-    if (ready < 0) return errno != EINTR && errno != EAGAIN;
+    if (ready < 0) return (errno != EINTR && errno != EAGAIN) ? 2 : 0;
     if (ready == 0) return 0;
-    if (p.revents & (POLLHUP | POLLERR | POLLNVAL)) return 1;
+    /* A reset (or our own write after the peer closed, answered with one)
+     * sets POLLERR and POLLHUP; a FIN alone sets neither. */
+    if (p.revents & (POLLHUP | POLLERR | POLLNVAL)) return 2;
 #ifdef POLLRDHUP
-    if (p.revents & POLLRDHUP) return 1;
+    if (p.revents & POLLRDHUP) return 1;     /* FIN: half-close or close */
 #endif
     if (p.revents & POLLIN) {
         /* Readable is either a pipelined byte or EOF; only a zero-length
@@ -78,16 +96,49 @@ int http_fd_peer_gone(int fd) {
         char b;
         const ssize_t n = recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
         if (n == 0) return 1;
-        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return 1;
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return 2;
     }
     return 0;
 }
 
 int http_peer_gone(http_conn *c) {
     if (atomic_load(&c->dead)) return 1;
-    if (!http_fd_peer_gone(c->fd)) return 0;
+    const int st = http_fd_probe(c->fd);
+    if (st == 1) atomic_store(&c->eof, 1);
+    if (st != 2) return 0;
     atomic_store(&c->dead, 1);
     return 1;
+}
+
+int http_peer_eof(http_conn *c) { return atomic_load(&c->eof); }
+
+int http_head_sent(const http_conn *c) { return c->head_sent; }
+
+static void begin_body(http_conn *c) {
+    static const char head[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n\r\n";
+    c->head_sent = 1;
+    http_write(c, head, sizeof head - 1);
+}
+
+void http_keepalive(http_conn *c, int sse) {
+    if (atomic_load(&c->dead)) return;
+    if (!atomic_load(&c->eof) && (http_peer_gone(c) || !atomic_load(&c->eof))) return;
+    if (!c->head_sent) {
+        /* The only way to tell a half-close from a close is to write, and
+         * the first thing written must be the response's start. A client
+         * that only half-closed gets its answer with a 200 committed now;
+         * an error after this point is carried in the body. */
+        if (sse) http_begin_sse(c);
+        else begin_body(c);
+        return;
+    }
+    if (mono_s() - c->last_write < g_probe_ms / 1000.0) return;
+    if (sse) http_write(c, ":\n\n", 3);      /* an SSE comment: ignored */
+    else     http_write(c, " ", 1);           /* JSON allows leading whitespace */
 }
 
 static const char *status_text(int s) {
@@ -104,6 +155,11 @@ static const char *status_text(int s) {
 
 void http_respond(http_conn *c, int status, const char *content_type,
                   const char *body, size_t len) {
+    if (c->head_sent) {                       /* committed: the body is all that is left */
+        if (len) http_write(c, body, len);
+        return;
+    }
+    c->head_sent = 1;
     char head[512];
     const int n = snprintf(head, sizeof head,
         "HTTP/1.1 %d %s\r\n"
@@ -147,7 +203,8 @@ void http_busy(http_conn *c, const char *message, int retry_after_s) {
     char body[256], head[384];
     const int nb = busy_body(body, sizeof body, message);
     const int nh = busy_head(head, sizeof head, nb, retry_after_s);
-    http_write(c, head, (size_t)nh);
+    if (!c->head_sent) http_write(c, head, (size_t)nh);
+    c->head_sent = 1;
     http_write(c, body, (size_t)nb);
 }
 
@@ -161,6 +218,8 @@ void http_begin_sse(http_conn *c) {
         "X-Accel-Buffering: no\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         "Connection: close\r\n\r\n";
+    if (c->head_sent) return;
+    c->head_sent = 1;
     http_write(c, head, sizeof head - 1);
 }
 
@@ -233,8 +292,10 @@ static void *serve_conn(void *arg) {
     char *raw = read_request(ca.fd, &len, &head_end);
 
     http_conn conn;
+    memset(&conn, 0, sizeof conn);
     conn.fd = ca.fd;
     atomic_init(&conn.dead, 0);
+    atomic_init(&conn.eof, 0);
     if (!raw) {
         http_error(&conn, 400, "malformed request");
         close(ca.fd);
@@ -297,6 +358,7 @@ int http_serve(const char *host, int port, http_handler fn, void *user,
     const int max_conns = (limits && limits->max_conns > 0) ? limits->max_conns : 64;
     const int send_ms = (limits && limits->send_timeout_ms > 0) ? limits->send_timeout_ms : 5000;
     const int recv_ms = (limits && limits->recv_timeout_ms > 0) ? limits->recv_timeout_ms : 30000;
+    if (limits && limits->probe_interval_ms > 0) g_probe_ms = limits->probe_interval_ms;
 
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { snprintf(err, errsz, "socket: %s", strerror(errno)); return 1; }

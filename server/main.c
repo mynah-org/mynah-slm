@@ -124,7 +124,7 @@ static void send_shutdown(http_conn *conn, int header_sent) {
 /* Enter the model, or give up because the client is gone (-1) or the
  * server is shutting down (-2). Polls the client every 20 ms while queued: a
  * disconnect while waiting costs no inference. */
-static int gate_enter(server_ctx *c, http_conn *conn) {
+static int gate_enter(server_ctx *c, http_conn *conn, int stream) {
     pthread_mutex_lock(&c->gate_mu);
     c->gate_waiting++;
     for (;;) {
@@ -134,6 +134,7 @@ static int gate_enter(server_ctx *c, http_conn *conn) {
             return -2;
         }
         if (!c->gate_busy) break;
+        http_keepalive(conn, stream);     /* resolves a read-side EOF */
         if (http_peer_gone(conn)) {
             c->gate_waiting--;
             c->cancelled_queued++;
@@ -193,6 +194,11 @@ typedef struct {
 
 static int chat_cancel(void *ctx) {
     cancel_ctx *cc = ctx;
+    /* An EOF on the read side is not "gone" (a half-closed client still
+     * reads): a write resolves it, and a client that really closed answers
+     * that write with a reset the probe below sees, at the latest at the
+     * next step. */
+    http_keepalive(cc->conn, cc->answer->stream);
     if (cc->answer->failed || http_peer_gone(cc->conn)) return 1;
     if (shutdown_due()) { cc->shutdown = 1; return 1; }
     return 0;
@@ -684,7 +690,7 @@ static void handle_chat(server_ctx *c, http_conn *conn,
     /* ── the serialization point ──
      * Asked before queueing and again once inside: a client that left while
      * the request was parsed or queued costs no inference at all. */
-    const int gate = gate_enter(c, conn);
+    const int gate = gate_enter(c, conn, stream);
     const int entered = gate == 0;
     if (gate == -2) {
         fprintf(stderr, "[%s refused while queued: the server is shutting down]\n", req_id);
@@ -848,6 +854,8 @@ static void usage_text(FILE *f) {
         "                       one scheduler thread (default 1 = serialized)\n"
         "  --queue N            requests waiting for a slot before a 503 (default 2N)\n"
         "  --send-timeout-ms N  a client that stops reading is dropped (default 5000)\n"
+        "  --probe-interval-ms N  liveness write period once a client's read side\n"
+        "                       reached EOF (default 250)\n"
         "  --shutdown-grace-ms N  on SIGTERM/SIGINT, running requests get N ms more\n"
         "                       before they are stopped with an error event / 503;\n"
         "                       queued ones get 503 at once (default 0)\n"
@@ -861,7 +869,7 @@ static void usage_text(FILE *f) {
 int main(int argc, char **argv) {
     const char *model_path = NULL, *host = "127.0.0.1";
     int port = 8080, n_ctx = 0, threads = 0;
-    http_limits limits = { 0, 0, 0 };
+    http_limits limits = { 0, 0, 0, 0 };
     int slots = 1, queue = 0, grace_ms = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -877,6 +885,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--queue") && v)           { queue = atoi(v); i++; }
         else if (!strcmp(a, "--send-timeout-ms") && v) { limits.send_timeout_ms = atoi(v); i++; }
         else if (!strcmp(a, "--shutdown-grace-ms") && v) { grace_ms = atoi(v); i++; }
+        else if (!strcmp(a, "--probe-interval-ms") && v) { limits.probe_interval_ms = atoi(v); i++; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage_text(stdout); return 0; }
         else { fprintf(stderr, "mynah-slm-server: unknown option '%s'\n", a); return 2; }
     }
