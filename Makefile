@@ -175,6 +175,7 @@ help:
 	@echo "  debug        -O0 -g rebuild"
 	@echo "  ubsan        UBSan rebuild + test, then clean"
 	@echo "  asan         ASan+UBSan rebuild + test (LINUX CI ONLY, see below)"
+	@echo "  tsan         ThreadSanitizer: scheduler, queue, pool, batched decode"
 	@echo "  leaks        macOS native leak check (no rebuild)"
 	@echo "  warnings     the CI -Werror gate, same flags (your CC: see caveat)"
 	@echo "  update-ingot refresh the vendored ingot subtree"
@@ -233,7 +234,7 @@ $(OBJ): | $(INGOT_LIB)
 # test_ingot needs no model: it pins the container-layer contract (block
 # geometry, dequant coverage) so a bad subtree update fails here and not
 # three modules later.
-TESTS := tests/test_backend tests/test_batch tests/test_ingot tests/test_sgemm tests/test_threads tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer tests/test_tools tests/test_isa tests/test_synth tests/test_http
+TESTS := tests/test_backend tests/test_batch tests/test_ingot tests/test_sgemm tests/test_threads tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer tests/test_tools tests/test_isa tests/test_synth tests/test_http tests/test_sched
 
 # The parity harness is built like the others but driven separately: it dumps
 # activations, and tools/eval/compare.py is what judges them.
@@ -488,6 +489,15 @@ asan:
 	$(MAKE) clean && $(MAKE) EXTRA_CFLAGS="$(SAN_ADD) -O1 -fsanitize=address,undefined" \
 	  EXTRA_LDFLAGS="-fsanitize=address,undefined" all test && $(MAKE) clean
 
+# The concurrency the server runs on — the pending queue, the scheduler loop
+# with producer threads, and the pool — under ThreadSanitizer. BLAS=none so no
+# uninstrumented vendor threads are in the process. Linux/clang or gcc.
+tsan:
+	$(MAKE) clean && $(MAKE) BLAS=none EXTRA_CFLAGS="$(SAN_ADD) -O1 -fsanitize=thread" \
+	  EXTRA_LDFLAGS="-fsanitize=thread" tests/test_sched tests/test_threads tests/test_synth
+	TSAN_OPTIONS=halt_on_error=1 tests/test_sched && TSAN_OPTIONS=halt_on_error=1 tests/test_threads \
+	  && TSAN_OPTIONS=halt_on_error=1 tests/test_synth; rc=$$?; $(MAKE) clean; exit $$rc
+
 leaks: mynah-slm $(TESTS)
 	@# test_inspect is the one that allocates (the census grows by realloc and
 	@# the fixture writer holds buffers): it is the real subject here.
@@ -547,4 +557,4 @@ dist: mynah-slm mynah-slm-server libmynah_slm.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot bench-qmat dispatch bench-decode test-server-cancel
+.PHONY: all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot bench-qmat dispatch bench-decode test-server-cancel tsan

@@ -397,6 +397,49 @@ HTTP/1.1 clients do not do that, and tts made the same call); prefill
 cancellation granularity is one batch, so a 256-token batch on a large model
 can still run ~1 s after the client left.
 
+### S1-d — the scheduler, model-free
+
+`src/sched.{c,h}` (policy over opaque jobs, engine behind callbacks) and
+`src/jobq.{c,h}` (the bounded pending queue). One thread runs
+`mynah_slm_sched_run` and is the only thread that enters the model. One
+iteration: **admit → reap → prefill → step**, with retirement inline.
+
+| rule | ported from | why it fits an LLM | here |
+|---|---|---|---|
+| one scheduler thread owns the model and the pool | tts `scheduler_main`, asr `sched.c` | a second submitter on the pool serialized behind the regions and lost its cohort (tts TTFA 167 → 1200 ms); a decode step is ~225 pool regions on 0.6B, all ours | `sched_run` on one thread; HTTP threads only push to the queue |
+| admit at the top of every iteration; block only when nothing is live | tts `admit_pass` | a live stream's next token must not wait for an empty queue | `admit_pass(block = live == 0)` |
+| reap cancelled jobs every iteration, and before admission, and between prefill slices | tts `sink_cancelled`, polled per step | S1-z: no zombie work; the slot and its KV are free for the next admission | `reap_pass`, the pre-admit check, the between-slices check |
+| prefill in slices, FIFO to completion, a wall-time budget per iteration, ≥ 1 slice always, uncapped when nobody decodes | tts `prefill_slice_budget`, `prefill_fifo`, `prefill_step_budget_s` | a 2275-token prompt is ~10 s here; inline it would freeze every live stream for that long. FIFO beat round-robin by 29% TTFA p95 in tts with every request class improving | `prefill_slice` 32 tokens, `prefill_budget_s` 40 ms (tts's qualified values, **not measured here**; `MYNAH_SLM_PREFILL_SLICE`, `MYNAH_SLM_PREFILL_STEP_MS`) |
+| a prefill that completes steps in the same iteration | tts `slots_prefill_slice` | TTFT pays the slicing, not a loop round trip | prefill pass runs before the step pass |
+| one step call for all decoding jobs; on failure re-step each alone, retire only who fails alone | tts `step_live` / `step_isolate` | one request's failure retires one request; `forward_multi`'s all-or-nothing contract makes the re-step exact | `step_pass` |
+| bounded queue, fail-fast refusal | tts `job_enqueue` (503) | a wait no metric sees is worse than a refusal | `jobq_push` returns -1, never waits |
+
+**Not ported, on purpose** (tts measured each and it lost, or the reason does
+not exist here): a low-priority prefill helper thread (TTFA p95 435 → 2379 ms);
+global cross-worker batching (arrivals coincide 1.6% of the time); a second
+submitter on the pool; utilization-aware admission (stall@250 → 50%); emit
+quanta and the quantum ramp (audio has a playback clock to stay ahead of; a
+text stream emits one token per step); prefork + fd passing (a scaling step
+after S1 is measured, `sibling-port-map.md`); async admission helpers
+(admission here is a KV reserve that `seq_reserve` makes allocation-free in
+steady state).
+
+**Gate**: `tests/test_sched` (fake engine logging every call, fake clock with
+a fixed cost per prefill token and per step, so budgets are exact) — admission
+FIFO and never more live than slots; a freed slot reused; a live slot plus an
+empty queue does not block; closing the queue drains; no slice longer than
+`prefill_slice`; exactly 2 slices of 320 ms inside a 500 ms budget; the
+decoding stream steps every iteration through two long prefills; FIFO to
+completion; same-iteration first step; uncapped when alone; a cancelled
+decoding job retires at the next iteration, is never stepped again, and its
+slot goes to the waiting job; cancelled while queued → never admitted;
+cancelled mid-prompt → not prefilled further; a poisoned job retires FAILED
+and its batch-mate steps exactly once; a refused admission is never
+prefilled; the queue refuses when full or closed; and a threaded run (4
+producers x 60 jobs, one scheduler thread, some clients leaving) where every
+queued job retires exactly once and every refusal is counted — also under
+ThreadSanitizer.
+
 ## Conclusion
 
 (open)
