@@ -214,10 +214,120 @@ reuses / regrows / retypes as specified.
 the CLI and the server still call the unchanged single-sequence API, so they
 exercise `own` only.
 
+### S1-c — one decode step for B sequences
+
+**What.** `mynah_slm_forward_multi(ws, seqs[B], tokens[B], logits[B])`
+advances B independent sequences by one token each. Per layer: the B rows'
+norms, then ONE product per weight over the [B x d] activations
+(`mynah_slm_qmatmat`, the batched-prefill product — or B matvecs, see the
+switch below), then per row QK-norm,
+RoPE at that sequence's own position and the K/V write into that sequence's
+own cache, then attention for all B sequences in ONE pool region over
+(sequence, head) pairs, each over its own history. The LM head is one
+[B x d] product too. B = 1 calls the single-token path verbatim.
+
+**Cost model, written before the code** (`engineering-method.md` §3):
+
+| field | |
+|---|---|
+| current cost | B streams = B full decode steps. 0.6B Q4_K_M on M1, 8 threads: ~27 ms/step (36.5 tok/s, `docs/perf.md`), of which the weight walk is the bulk; attention is 4% at n_kv 32 |
+| suspected cause | each step walks every weight for ONE token: ~400 MB of quantized bytes per token per stream |
+| transformation | one product per weight over B rows: the bytes are read once for B tokens |
+| max plausible saving | weight traffic /B. At B = 4: up to ~3x aggregate tok/s IF the step stays memory-bound and the product's per-weight work does not grow with B |
+| new work | (a) `qmatmat` DEQUANTIZES each 128-row strip to f32 before the sgemm: per-weight decode work is paid once per step (same as a matvec) but in a separate pass that writes and re-reads 4 B/weight through L2; (b) sgemm at M = B = 2..8 is a skinny GEMM, where vendor BLAS is weakest; (c) 2 pool regions per strip (dequant + sgemm) instead of 1 per matvec — the LM head alone is 1187 strips |
+| risk | (a)-(c) can make one [B x d] qmatmat SLOWER than B fused matvecs at small B: the prefill product was tuned for T = 128-256, never for T = 2..8. Then batching would cost throughput, not buy it |
+| smallest experiment that kills it | per decode step on the real 0.6B geometry (the fixture's `fixture_spec_06b_shape`: real shapes, noise weights — speed does not depend on values): B x single-token step vs one `forward_multi` step, interleaved in one process, B = 1, 2, 4, 8 |
+
+Because of that risk the product is a **seam with a switch**, not a
+hard-wired call: `MYNAH_SLM_DECODE_PRODUCT=matmat` (one `qmatmat` per
+weight, weights read once) or `=matvec` (B threaded matvecs per weight —
+weights read B times). The design intent was matmat by default; the
+measurement below reversed that before commit, so the shipped default is
+matvec. The resolved choice is
+readable (`mynah_slm_decode_product_name`) so a benchmark can prove which ran.
+The follow-up that would remove the risk is sibling-port-map row 6 — a
+weight-stationary batched quantized matvec (B rows against one Q4_K row,
+no f32 strip) — and it is NOT in this step: a kernel change is separate work
+and `src/qmat.c` belongs to another agent.
+
+**Why attention is one region.** Each (sequence, head) task runs the exact
+per-head code the single-token path runs (`attention_head` /
+the packed-KV head), so a sequence's attention output is bit-identical to its
+solo decode; one region per layer instead of B keeps the dispatch count of a
+step at the single-token step's (~225 regions on 0.6B), not B times it. Load
+balance across sequences of different lengths comes from the pool's atomic
+claiming.
+
+**Step isolation.** `forward_multi` validates every sequence (fits the
+workspace, has room, token in range, no sequence twice) BEFORE touching any
+of them, and advances no `n_past` unless the whole step succeeded. A failure
+mid-step can leave K/V written at each sequence's position `n_past` — exactly
+the slot the next attempt overwrites — so re-stepping a sequence alone is the
+step it would have taken alone. That is the property tts's `step_isolate`
+relies on, and the scheduler (S1-d) uses it the same way.
+
+**Gate** (`tests/test_synth`, both fixtures): B = 1..8 sequences at
+DIFFERENT positions (different prompt lengths, f32 and bf16 KV): each
+sequence's logits in the batch vs its logits decoded alone, `rel < 1e-4` with
+the same argmax, and continued greedily for several steps in the batch vs
+alone; B = 1 is memcmp-identical to `seq_forward`; a batch containing an
+invalid sequence fails WITHOUT advancing any `n_past`.
+
+**Gate result (2026-10-08, x86, both fixtures, KV f32 and bf16 mixed in one
+batch, 6 greedy steps per B)**: PASS for B = 1..8 in both product modes.
+`matvec`: memcmp-identical to solo at every B (the same kernels in the same
+order — which also proves the attention region, the per-row RoPE positions and
+the per-sequence KV writes are exact). `matmat`: worst rel 2.3e-06 (F32
+fixture) / 2.3e-07 (Q4_K_M mix), same argmax every step; B = 1 memcmp. A batch
+holding a full sequence, or one sequence twice, returns -1 and moves nobody.
+Mutation: K written one slot late for batch row 1 → 29 checks fail (after
+the cache poisoning of S1-a was applied to this test too).
+
+**The smallest experiment — it killed the default.** `tests/bench_decode`
+(`make bench-decode`), 0.6B geometry with noise weights (Q4_K/Q8_0/Q6_K mix,
+151936-row tied Q6_K head), position 128, bf16 KV, 4 threads, cloud 4-vCPU
+x86, weights on local tmp, arms interleaved in one process. **CONTENDED**:
+other agents were running (load average 3-6), so magnitudes are soft; the
+direction held at every B in both runs.
+
+| B | solo ms | matmat ms | matvec ms | matmat vs solo | matvec vs solo |
+|---|---|---|---|---|---|
+| OpenBLAS, 7 rounds: 1 | 65.5 | 69.2 | 63.8 | 0.95x | 1.03x |
+| 2 | 166.4 | 779.2 | 152.1 | **0.21x** | 1.09x |
+| 4 | 240.7 | 920.4 | 211.4 | **0.26x** | 1.14x |
+| 8 | 505.8 | 1478.7 | 485.1 | **0.34x** | 1.04x |
+| own sgemm (`MYNAH_SLM_SGEMM=own`), 5 rounds: 2 | 178.9 | 581.3 | 149.4 | 0.31x | 1.20x |
+| 4 | 340.3 | 772.1 | 331.0 | 0.44x | 1.03x |
+| 8 | 524.0 | 663.8 | 483.7 | 0.79x | 1.08x |
+
+Reading it, with the control that would embarrass the explanation:
+
+- **One `qmatmat` per weight is 3-5x SLOWER than B separate steps** at
+  B = 2..8. The cost model's risk row, measured. The own-sgemm control keeps
+  the loss (0.31x at B = 2), so it is not OpenBLAS's second thread pool
+  fighting ours: it is the product's shape — every weight is dequantized to
+  f32 into a strip (4 bytes written and re-read per weight) before a skinny
+  sgemm, a cost amortized at prefill's T = 128-256 and not at T = 2..8.
+- **`matvec` multi-step is 1.03-1.20x faster than solo**, from what it does
+  share: one attention region per layer for all B and one step call; the
+  weights are still read B times. Not the continuous-batching win — that
+  needs the weights read once.
+- **Decision: the default product is `matvec`** (bit-identical to solo, never
+  slower here); `matmat` stays behind `MYNAH_SLM_DECODE_PRODUCT=matmat` as
+  the A/B arm. The weight-read-once win needs sibling-port-map row 6 — a
+  weight-stationary kernel that multiplies B rows against each Q4_K block
+  while it is in registers, no f32 strip — which is kernel work in
+  `src/qmat.c` (another agent's file) and a separate, measured item. The seam
+  it plugs into is `project_rows` in `arch_qwen3.c`.
+- Unexplained, left as a question rather than a story: solo B = 2 costs 2.6x
+  a solo B = 1 in the first run (166 vs 65 ms) instead of 2x. Contention is
+  the cheap hypothesis; the per-arm minimum-of-3 should have absorbed most of
+  it. Re-measure on an idle host before reading anything into it.
+
 ## Conclusion
 
 (open)
 
 ## Next action
 
-S1-b, then S1-c (batched decode across sequences).
+S1-c, then S1-d (the scheduler, model-free).

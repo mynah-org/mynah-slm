@@ -167,6 +167,7 @@ help:
 	@echo "  cuda-test    build and run the CUDA self-test (skips without a device)"
 	@echo "  bench-qmat   kernel A/B on synthetic matrices (no model)"
 	@echo "  dispatch     which kernels resolved on this CPU (mynah-slm --dispatch)"
+	@echo "  bench-decode one decode step for B streams: solo vs batched (S1-c)"
 	@echo "  check-x86    cross-compile the AVX2 paths"
 	@echo "  test-x86-rosetta  build x86_64 and RUN the suite under Rosetta"
 	@echo "  golden-dump  regenerate the oracle's reference activations"
@@ -283,6 +284,14 @@ bench: $(BENCH)
 BENCH_QMAT := tests/bench_qmat
 bench-qmat: $(BENCH_QMAT)
 	@$(BENCH_QMAT) all
+# One decode step for B streams, three ways (B solo steps / one forward_multi
+# step with one qmatmat per weight / one with B matvecs per weight), interleaved
+# in one process. With no MODEL it writes a 0.6B-GEOMETRY fixture with noise
+# weights (~400 MB in TMPDIR) — real shapes, so real costs, no quality claim.
+# Not part of `test`: it measures. .work/serving-continuous-batching.md S1-c.
+BENCH_DECODE := tests/bench_decode
+bench-decode: $(BENCH_DECODE)
+	@if [ -e "$(MODEL)" ]; then $(BENCH_DECODE) "$(MODEL)"; else $(BENCH_DECODE); fi
 
 # End-to-end server checks: shape, determinism (sequential and concurrent),
 # SSE framing, and that reasoning never reaches content. Separate from `test`
@@ -478,7 +487,7 @@ leaks: mynah-slm $(TESTS)
 	 else echo "SKIP leaks/inspect: $(MODEL) not found"; fi
 
 clean:
-	rm -rf build mynah-slm mynah-slm-server libmynah_slm.a libmynah_slm$(SOEXT) $(TESTS) $(PARITY) $(BENCH) $(BENCH_QMAT) dist
+	rm -rf build mynah-slm mynah-slm-server libmynah_slm.a libmynah_slm$(SOEXT) $(TESTS) $(PARITY) $(BENCH) $(BENCH_QMAT) $(BENCH_DECODE) tests/write_fixture dist
 	@# Without this, libingot.a survives a clean: update the subtree and the
 	@# next build silently links the previous library.
 	@test -d $(INGOT_DIR) && $(MAKE) -C $(INGOT_DIR) clean || true
@@ -524,4 +533,4 @@ dist: mynah-slm mynah-slm-server libmynah_slm.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot bench-qmat dispatch
+.PHONY: all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot bench-qmat dispatch bench-decode

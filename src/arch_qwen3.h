@@ -132,6 +132,15 @@ typedef struct {
     float *bk, *bv;                   /* [batch_max * kv_dim] */
     float *kgather, *vgather;         /* [ctx_cap * head_dim], batched attention */
 
+    /* ── multi-sequence decode (mynah_slm_forward_multi) ────────────────────
+     * Rows of the batch scratch above are reused, one per sequence; these are
+     * what a decode step over B DIFFERENT histories needs on top. NULL and
+     * dec_max 0 until mynah_slm_state_init_decode(). */
+    uint32_t dec_max;                 /* sequences one step may carry */
+    float *mscores;                   /* [dec_max][n_heads][ctx_cap] */
+    float *mlogits;                   /* [dec_max][vocab] */
+    mynah_slm_attn_seq *mattn;        /* [dec_max] */
+
     mynah_slm_final_cb on_embed;   /* the residual stream before layer 0 */
     mynah_slm_layer_cb on_layer;
     mynah_slm_final_cb on_final;
@@ -197,6 +206,47 @@ int  mynah_slm_seq_forward(mynah_slm_state *ws, mynah_slm_seq *q, uint32_t token
                            float *logits_out);
 int  mynah_slm_seq_forward_batch(mynah_slm_state *ws, mynah_slm_seq *q,
                                  const uint32_t *tokens, uint32_t n, float *logits_out);
+
+/* ── one decode step for several sequences ─────────────────────────────────
+ * Allocates what mynah_slm_forward_multi needs for up to dec_max sequences.
+ * Refused (-1, reason in err) on a hybrid family — its short-conv layers have
+ * no batched form yet — and when dec_max exceeds the batch scratch rows
+ * (MYNAH_SLM_BATCH). Call once, at setup. */
+int  mynah_slm_state_init_decode(mynah_slm_state *s, uint32_t dec_max,
+                                 char *err, size_t errsz);
+
+/* Advance n DIFFERENT sequences by one token each: tokens[b] is fed to
+ * seqs[b] at its own position. Every projection is ONE product over the
+ * [n x d] rows (weights read once for all n — the reason continuous batching
+ * pays on a memory-bound decode); attention runs per sequence over its own
+ * history, in one pool region. logits[b] is set to row b of the workspace's
+ * logits, valid until the next call on `s`.
+ *
+ * n == 1 is the single-token path verbatim (bit-identical to
+ * mynah_slm_seq_forward). For n > 1 each sequence's logits equal its solo
+ * decode to a summation reorder (tests/test_synth), not bit for bit.
+ *
+ * Step isolation: every sequence is validated before any is touched, and no
+ * n_past moves unless the whole step succeeded. A failure can leave K/V
+ * written at a sequence's current position — the slot its next attempt
+ * overwrites — so re-stepping one sequence alone is exactly its solo step.
+ * Returns 0, or -1. */
+int  mynah_slm_forward_multi(mynah_slm_state *s, mynah_slm_seq *const *seqs,
+                             const uint32_t *tokens, uint32_t n, float **logits);
+
+/* Which product forward_multi uses per weight, from MYNAH_SLM_DECODE_PRODUCT:
+ *   "matvec" (default)  n threaded matvecs, our fused kernels — weights read
+ *                       n times, but bit-identical to each sequence's solo
+ *                       step, and one attention region per layer for all n.
+ *   "matmat"            one mynah_slm_qmatmat over the n rows — weights read
+ *                       once, but each strip is dequantized to f32 first.
+ *                       MEASURED 3-5x SLOWER than n solo steps at n = 2..8 on
+ *                       the 0.6B geometry (bench_decode, S1-c), so opt-in until
+ *                       a weight-stationary batched kernel exists.
+ * The setter exists for an interleaved in-process A/B (1 matmat, 0 matvec,
+ * -1 back to the environment's choice); call it between steps. */
+const char *mynah_slm_decode_product_name(void);
+void        mynah_slm_decode_product_set(int matmat);
 
 /* Rows the batch scratch was sized for. `MYNAH_SLM_BATCH` in the environment
  * overrides the default — it is how the width gets measured rather than

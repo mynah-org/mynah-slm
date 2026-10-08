@@ -310,6 +310,142 @@ out:
     free(alone_a); free(alone_b); free(mix_a); free(mix_b);
 }
 
+/* ── one decode step for several sequences ───────────────────────────────── */
+
+#define MULTI_MAX   8
+#define MULTI_STEPS 6
+
+/* Prefill sequence b with its own prompt: a different slice of the text and a
+ * different length, so the B sequences sit at B different positions. */
+static int prefill_seq(mynah_slm_state *ws, mynah_slm_seq *q, const uint32_t *ids,
+                       long n_tok, uint32_t b, uint32_t *last) {
+    const long off = (long)(b * 3) % (n_tok / 2);
+    long len = 4 + 13 * (long)b;
+    if (off + len > n_tok) len = n_tok - off;
+    /* Reset AND poison: the previous round wrote the same values at the same
+     * positions, which would mask a misplaced write (see reset_poisoned). */
+    mynah_slm_seq_reset(q);
+    const size_t positions = (size_t)q->kv.n_layers * q->kv.n_ctx;
+    memset(q->kv.k, 0xff, positions * q->kv.pos_bytes_k);
+    memset(q->kv.v, 0xff, positions * q->kv.pos_bytes_v);
+    for (long i = 0; i + 1 < len; i += 11) {
+        long take = (len - 1) - i;
+        if (take > 11) take = 11;
+        if (mynah_slm_seq_forward_batch(ws, q, ids + off + i, (uint32_t)take, NULL) != 0)
+            return -1;
+    }
+    *last = ids[off + len - 1];
+    return 0;
+}
+
+static void check_multi(mynah_slm_model_t *m, const uint32_t *ids, long n_tok, int matmat) {
+    char err[256] = "", what[128], detail[256];
+    const uint32_t vocab = mynah_slm_vocab_size(m);
+    mynah_slm_state ws;
+    mynah_slm_seq solo[MULTI_MAX], batch[MULTI_MAX];
+    memset(solo, 0, sizeof solo);
+    memset(batch, 0, sizeof batch);
+    float *ref = malloc(vocab * sizeof *ref);
+    float *gotbuf = malloc((size_t)MULTI_MAX * vocab * sizeof *gotbuf);
+    mynah_slm_decode_product_set(matmat);
+
+    int ok = mynah_slm_state_init_workspace(&ws, m, 256, err, sizeof err) == 0 &&
+             mynah_slm_state_init_decode(&ws, MULTI_MAX, err, sizeof err) == 0;
+    /* Mixed precisions in one batch: even sequences keep an f32 cache, odd
+     * ones bf16, so each (sequence, head) task must find its own format. */
+    for (uint32_t b = 0; ok && b < MULTI_MAX; b++) {
+        const mynah_slm_kv_type t = (b % 2) ? MYNAH_SLM_KV_BF16 : MYNAH_SLM_KV_F32;
+        ok = mynah_slm_seq_reserve(&solo[b], m, 160, t, t, err, sizeof err) == 0 &&
+             mynah_slm_seq_reserve(&batch[b], m, 160, t, t, err, sizeof err) == 0;
+    }
+    snprintf(what, sizeof what, "[%s] a decode workspace for %d sequences",
+             mynah_slm_decode_product_name(), MULTI_MAX);
+    check(what, ok, err);
+    if (!ok) goto out;
+
+    double worst_all = 0.0;
+    for (uint32_t B = 1; B <= MULTI_MAX; B++) {
+        uint32_t next[MULTI_MAX];
+        mynah_slm_seq *bp[MULTI_MAX];
+        for (uint32_t b = 0; b < B; b++) {
+            uint32_t last_s = 0, last_b = 0;
+            prefill_seq(&ws, &solo[b], ids, n_tok, b, &last_s);
+            prefill_seq(&ws, &batch[b], ids, n_tok, b, &last_b);
+            next[b] = last_s;
+            bp[b] = &batch[b];
+        }
+        double worst = 0.0;
+        int argmax_ok = 1, bit_ok = 1, past_ok = 1, rc_ok = 1;
+        for (int step = 0; step < MULTI_STEPS; step++) {
+            float *lg[MULTI_MAX];
+            if (mynah_slm_forward_multi(&ws, bp, next, B, lg) != 0) { rc_ok = 0; break; }
+            /* Copy the batch rows out: the solo calls below reuse the
+             * workspace, and B == 1 hands back ws.logits itself. */
+            float *got[MULTI_MAX];
+            for (uint32_t b = 0; b < B; b++) {
+                got[b] = gotbuf + (size_t)b * vocab;
+                memcpy(got[b], lg[b], vocab * sizeof(float));
+            }
+            for (uint32_t b = 0; b < B; b++) {
+                if (mynah_slm_seq_forward(&ws, &solo[b], next[b], ref) != 0) { rc_ok = 0; break; }
+                const double rel = rel_diff(ref, got[b], vocab);
+                if (rel > worst) worst = rel;
+                if (argmax(ref, vocab) != argmax(got[b], vocab)) argmax_ok = 0;
+                if (memcmp(ref, got[b], vocab * sizeof(float)) != 0) bit_ok = 0;
+                if (solo[b].n_past != batch[b].n_past) past_ok = 0;
+                /* Both copies are fed the SOLO choice, so the histories stay
+                 * the same tokens and only the arithmetic is compared. */
+                next[b] = (uint32_t)argmax(ref, vocab);
+            }
+        }
+        if (worst > worst_all) worst_all = worst;
+        snprintf(what, sizeof what, "[%s] B=%u: each sequence in the batch == its solo decode",
+                 mynah_slm_decode_product_name(), B);
+        snprintf(detail, sizeof detail, "%d steps, worst rel %.2e, argmax %s, bit-identical %s",
+                 MULTI_STEPS, worst, argmax_ok ? "same" : "DIFFERS", bit_ok ? "yes" : "no");
+        /* B == 1 is the single-token path verbatim, and the matvec product is
+         * the same kernels in the same order as the solo path: both must be
+         * memcmp-identical. matmat is a reorder: the 1e-4 gate test_batch
+         * holds a real checkpoint to, and the same argmax. */
+        const int exact_required = (B == 1 || !matmat);
+        check(what, rc_ok && past_ok && argmax_ok && worst < 1e-4 &&
+              (!exact_required || bit_ok), detail);
+        printf("     %s\n", detail);
+    }
+    printf("     worst rel over B=1..%d: %.2e\n", MULTI_MAX, worst_all);
+
+    /* Isolation: a batch with one sequence that cannot step (its cache is
+     * full) fails as a whole and moves NOBODY. */
+    {
+        uint32_t next[3];
+        mynah_slm_seq *bp[3] = { &batch[0], &batch[1], &batch[2] };
+        for (uint32_t b = 0; b < 3; b++) prefill_seq(&ws, &batch[b], ids, n_tok, b, &next[b]);
+        const uint32_t p0 = batch[0].n_past, p2 = batch[2].n_past;
+        const uint32_t saved = batch[1].n_past;
+        batch[1].n_past = batch[1].n_ctx;
+        float *lg[3];
+        const int rc = mynah_slm_forward_multi(&ws, bp, next, 3, lg);
+        snprintf(what, sizeof what, "[%s] a batch with a full sequence fails and moves nobody",
+                 mynah_slm_decode_product_name());
+        check(what, rc == -1 && batch[0].n_past == p0 && batch[2].n_past == p2, "it ran or moved");
+        batch[1].n_past = saved;
+        bp[1] = &batch[0];                       /* the same sequence twice */
+        check("     ... and so does a batch naming one sequence twice",
+              mynah_slm_forward_multi(&ws, bp, next, 3, lg) == -1 && batch[0].n_past == p0,
+              "it ran");
+    }
+
+out:
+    for (uint32_t b = 0; b < MULTI_MAX; b++) {
+        mynah_slm_seq_free(&solo[b]);
+        mynah_slm_seq_free(&batch[b]);
+    }
+    mynah_slm_state_free(&ws);
+    free(ref);
+    free(gotbuf);
+    mynah_slm_decode_product_set(-1);
+}
+
 static void run(const char *label, int quant) {
     printf("\n-- %s fixture --\n", label);
     fixture_spec spec;
@@ -421,6 +557,8 @@ static void run(const char *label, int quant) {
     mynah_slm_state_free(&st);
     check_generate(m, tok);
     check_two_sequences(m, ids, n_tok);
+    check_multi(m, ids, n_tok, 1);
+    check_multi(m, ids, n_tok, 0);
 out:
     free(ref); free(got); free(ids);
     mynah_slm_tokenizer_free(tok);

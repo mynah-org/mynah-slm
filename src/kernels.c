@@ -291,14 +291,25 @@ typedef struct {
     float scale;
 } attn_kv_job;
 
+/* One head over a packed cache, factored out so the single-sequence and the
+ * multi-sequence forms run the same code. */
+static void attention_kv_head(float *out, const float *q, const mynah_slm_kv *cache,
+                              uint32_t layer, uint32_t h, uint32_t n_kv,
+                              uint32_t n_heads, uint32_t n_kv_heads,
+                              uint32_t head_dim, float scale, float *scores) {
+    /* The per-head body is the ISA-dispatched kernel (src/attn_kern.c), the
+     * same one the single-sequence path ran before this was factored out. */
+    const uint32_t group = n_heads / n_kv_heads;
+    mynah_slm_kern_attn()->kv_head(out + (size_t)h * head_dim,
+                                   q + (size_t)h * head_dim, cache,
+                                   layer, h / group, n_kv, scale, scores);
+}
+
 static void attn_kv_task(void *ctx, int i) {
     attn_kv_job *j = ctx;
-    const uint32_t h = (uint32_t)i;
-    const uint32_t group = j->n_heads / j->n_kv_heads;
-    mynah_slm_kern_attn()->kv_head(j->out + (size_t)h * j->head_dim,
-                                   j->q + (size_t)h * j->head_dim, j->cache,
-                                   j->layer, h / group, j->n_kv, j->scale,
-                                   j->scratch + (size_t)h * j->n_kv);
+    attention_kv_head(j->out, j->q, j->cache, j->layer, (uint32_t)i, j->n_kv,
+                      j->n_heads, j->n_kv_heads, j->head_dim, j->scale,
+                      j->scratch + (size_t)i * j->n_kv);
 }
 
 void mynah_slm_attention_kv_mt(float *out, const float *q,
@@ -348,4 +359,36 @@ void mynah_slm_attention_kv_batch(float *out, const float *q,
                         scores, n_kv, vscratch, head_dim,
                         0.0f, out + (size_t)h * head_dim, q_stride);
     }
+}
+
+/* ── attention for several sequences, one query each ─────────────────────── */
+
+typedef struct {
+    const mynah_slm_attn_seq *seqs;
+    uint32_t n_heads, n_kv_heads, head_dim;
+    float scale;
+} attn_multi_job;
+
+/* Task i is head (i % n_heads) of sequence (i / n_heads): the same per-head
+ * code, the same per-head scratch slice, the same arguments as that
+ * sequence's own _mt call would pass. */
+static void attn_multi_task(void *ctx, int i) {
+    const attn_multi_job *j = ctx;
+    const mynah_slm_attn_seq *s = &j->seqs[(uint32_t)i / j->n_heads];
+    const uint32_t h = (uint32_t)i % j->n_heads;
+    float *scratch = s->scratch + (size_t)h * s->n_kv;
+    if (s->k)
+        mynah_slm_kern_attn()->f32_head(s->out, s->q, s->k, s->v, h, s->n_kv, j->n_heads,
+                                        j->n_kv_heads, j->head_dim, j->scale, scratch);
+    else
+        attention_kv_head(s->out, s->q, (const mynah_slm_kv *)s->cache, s->layer, h,
+                          s->n_kv, j->n_heads, j->n_kv_heads, j->head_dim,
+                          j->scale, scratch);
+}
+
+void mynah_slm_attention_multi(const mynah_slm_attn_seq *seqs, uint32_t n_seq,
+                               uint32_t n_heads, uint32_t n_kv_heads,
+                               uint32_t head_dim, float scale) {
+    attn_multi_job j = { seqs, n_heads, n_kv_heads, head_dim, scale };
+    mynah_slm_parallel_for((int)(n_seq * n_heads), attn_multi_task, &j);
 }

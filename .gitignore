@@ -29,6 +29,8 @@ tests/test_*
 # be a SHELL SCRIPT is source, and this ignore quietly kept tests/test_server.sh
 # out of the repo for a whole release's worth of commits.
 !tests/test_*.sh
+# the fixture writer binary (tests/write_fixture.c is source)
+tests/write_fixture
 bench_*
 !bench_*.c
 

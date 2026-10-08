@@ -373,6 +373,9 @@ void mynah_slm_state_free(mynah_slm_state *s) {
     mynah_slm_aligned_free(s->conv_bcx);
     mynah_slm_aligned_free(s->conv_bx);
     mynah_slm_aligned_free(s->conv_y);
+    mynah_slm_aligned_free(s->mscores);
+    mynah_slm_aligned_free(s->mlogits);
+    free(s->mattn);
     memset(s, 0, sizeof *s);
 }
 
@@ -724,5 +727,216 @@ residual:
 
     q->n_past++;
     if (logits_out) memcpy(logits_out, s->logits, c->vocab_size * sizeof(float));
+    return 0;
+}
+
+/* ── one decode step for several sequences ────────────────────────────────── */
+
+int mynah_slm_state_init_decode(mynah_slm_state *s, uint32_t dec_max,
+                                char *err, size_t errsz) {
+    const mynah_slm_config *c = &s->model->cfg;
+    if (dec_max == 0) dec_max = 1;
+    if (dec_max > 1 && c->n_attn_layers < c->n_layers) {
+        snprintf(err, errsz, "batched decode needs every layer to be attention; "
+                             "%s has %u short-conv layers", c->arch,
+                 c->n_layers - c->n_attn_layers);
+        return -1;
+    }
+    if (dec_max > s->batch_max) {
+        snprintf(err, errsz, "a decode width of %u exceeds the %u-row batch scratch "
+                             "(MYNAH_SLM_BATCH)", dec_max, s->batch_max);
+        return -1;
+    }
+    mynah_slm_aligned_free(s->mscores);
+    mynah_slm_aligned_free(s->mlogits);
+    free(s->mattn);
+    s->mscores = alloc_f32((size_t)dec_max * c->n_heads * s->ctx_cap);
+    s->mlogits = alloc_f32((size_t)dec_max * c->vocab_size);
+    s->mattn   = calloc(dec_max, sizeof *s->mattn);
+    if (!s->mscores || !s->mlogits || !s->mattn) {
+        snprintf(err, errsz, "out of memory for a %u-sequence decode step", dec_max);
+        mynah_slm_aligned_free(s->mscores);
+        mynah_slm_aligned_free(s->mlogits);
+        free(s->mattn);
+        s->mscores = s->mlogits = NULL;
+        s->mattn = NULL;
+        s->dec_max = 0;
+        return -1;
+    }
+    s->dec_max = dec_max;
+    return 0;
+}
+
+/* -1 unresolved, 0 matvec, 1 matmat. Read and written on the one thread that
+ * runs the model. */
+static int g_decode_matmat = -1;
+
+static int decode_matmat(void) {
+    if (g_decode_matmat < 0) {
+        const char *e = getenv("MYNAH_SLM_DECODE_PRODUCT");
+        /* matvec by default: measured, one qmatmat per weight lost 3-5x to
+         * B solo steps at B = 2..8 on the 0.6B geometry
+         * (.work/serving-continuous-batching.md S1-c). */
+        g_decode_matmat = (e && strcmp(e, "matmat") == 0) ? 1 : 0;
+    }
+    return g_decode_matmat;
+}
+
+const char *mynah_slm_decode_product_name(void) {
+    return decode_matmat() ? "matmat" : "matvec";
+}
+
+void mynah_slm_decode_product_set(int matmat) {
+    g_decode_matmat = matmat < 0 ? -1 : (matmat ? 1 : 0);
+}
+
+/* out[n][rows] = in[n][cols] * W^T, by whichever product is selected. */
+static int project_rows(mynah_slm_state *s, const ingot_tensor *w, const float *in,
+                        float *out, uint32_t n) {
+    const mynah_slm_model_t *m = s->model;
+    if (decode_matmat()) return project_batch(m, w, s, in, out, n);
+    const size_t cols = (size_t)w->ne[0];
+    const size_t rows = (w->rank >= 2) ? (size_t)w->ne[1] : 1;
+    for (uint32_t b = 0; b < n; b++)
+        if (mynah_slm_project(m, w, in + (size_t)b * cols, out + (size_t)b * rows) != 0)
+            return -1;
+    return 0;
+}
+
+int mynah_slm_forward_multi(mynah_slm_state *s, mynah_slm_seq *const *seqs,
+                            const uint32_t *tokens, uint32_t n, float **logits) {
+    if (!s || !seqs || !tokens || !logits || n == 0) return -1;
+    if (n == 1) {
+        /* The single-token path, verbatim: decode never changes shape when
+         * only one stream is live. */
+        if (mynah_slm_seq_forward(s, seqs[0], tokens[0], NULL) != 0) return -1;
+        logits[0] = s->logits;
+        return 0;
+    }
+    if (n > s->dec_max) return -1;
+
+    const mynah_slm_model_t *m = s->model;
+    const mynah_slm_config  *c = &m->cfg;
+
+    /* Validate EVERYTHING before touching anything: a step that fails here
+     * leaves every sequence exactly as it was. */
+    for (uint32_t b = 0; b < n; b++) {
+        const mynah_slm_seq *q = seqs[b];
+        if (!seq_fits(s, q) || q->n_past >= q->n_ctx || tokens[b] >= c->vocab_size)
+            return -1;
+        for (uint32_t j = 0; j < b; j++) if (seqs[j] == q) return -1;
+    }
+
+    for (uint32_t b = 0; b < n; b++) {
+        float *row = s->bx + (size_t)b * c->d_model;
+        if (embed_row(m, tokens[b], row) != 0) return -1;
+        if (c->embed_scale != 1.0f)
+            for (uint32_t i = 0; i < c->d_model; i++) row[i] *= c->embed_scale;
+    }
+
+    for (uint32_t l = 0; l < c->n_layers; l++) {
+        const mynah_slm_layer *w = &m->layers[l];
+        /* Every layer is attention here (init_decode refuses hybrids). */
+        const uint32_t kvl = c->op_slot[l];
+
+        for (uint32_t b = 0; b < n; b++)
+            mynah_slm_rms_norm(s->bh + (size_t)b * c->d_model,
+                               s->bx + (size_t)b * c->d_model,
+                               (const float *)ingot_gguf_data(m->gguf, w->attn_norm),
+                               c->d_model, c->rms_eps);
+
+        if (project_rows(s, w->wq, s->bh, s->bq, n) != 0) return -1;
+        if (project_rows(s, w->wk, s->bh, s->bk, n) != 0) return -1;
+        if (project_rows(s, w->wv, s->bh, s->bv, n) != 0) return -1;
+
+        for (uint32_t b = 0; b < n; b++) {
+            mynah_slm_seq *q = seqs[b];
+            const uint32_t pos = q->n_past;
+            float *q_row = s->bq + (size_t)b * c->q_dim;
+            float *k_row = s->bk + (size_t)b * c->kv_dim;
+
+            if (w->q_norm)
+                mynah_slm_rms_norm_per_head(q_row,
+                    (const float *)ingot_gguf_data(m->gguf, w->q_norm),
+                    c->n_heads, c->head_dim, c->rms_eps);
+            if (w->k_norm)
+                mynah_slm_rms_norm_per_head(k_row,
+                    (const float *)ingot_gguf_data(m->gguf, w->k_norm),
+                    c->n_kv_heads, c->head_dim, c->rms_eps);
+
+            /* Each row at its OWN position: the sequences are at different
+             * points in their histories. */
+            mynah_slm_rope_apply(&s->rope, q_row, c->n_heads,    pos);
+            mynah_slm_rope_apply(&s->rope, k_row, c->n_kv_heads, pos);
+
+            mynah_slm_kv_put_k(&q->kv, kvl, pos, k_row);
+            mynah_slm_kv_put_v(&q->kv, kvl, pos, s->bv + (size_t)b * c->kv_dim);
+
+            mynah_slm_attn_seq *a = &s->mattn[b];
+            const int f32 = (q->kv.type_k == MYNAH_SLM_KV_F32 &&
+                             q->kv.type_v == MYNAH_SLM_KV_F32);
+            const size_t per_layer = (size_t)q->n_ctx * c->kv_dim;
+            a->out     = s->battn + (size_t)b * c->q_dim;
+            a->q       = q_row;
+            a->k       = f32 ? (const float *)q->kv.k + (size_t)kvl * per_layer : NULL;
+            a->v       = f32 ? (const float *)q->kv.v + (size_t)kvl * per_layer : NULL;
+            a->cache   = &q->kv;
+            a->layer   = kvl;
+            a->n_kv    = pos + 1;
+            a->scratch = s->mscores + (size_t)b * c->n_heads * s->ctx_cap;
+        }
+
+        mynah_slm_attention_multi(s->mattn, n, c->n_heads, c->n_kv_heads,
+                                  c->head_dim, c->attn_scale);
+
+        if (project_rows(s, w->wo, s->battn, s->bproj, n) != 0) return -1;
+        for (uint32_t b = 0; b < n; b++) {
+            float *xr = s->bx + (size_t)b * c->d_model;
+            const float *pr = s->bproj + (size_t)b * c->d_model;
+            if (c->residual_scale == 1.0f) mynah_slm_add(xr, pr, c->d_model);
+            else mynah_slm_add_scaled(xr, pr, c->residual_scale, c->d_model);
+        }
+
+        for (uint32_t b = 0; b < n; b++)
+            mynah_slm_rms_norm(s->bh + (size_t)b * c->d_model,
+                               s->bx + (size_t)b * c->d_model,
+                               (const float *)ingot_gguf_data(m->gguf, w->ffn_norm),
+                               c->d_model, c->rms_eps);
+
+        if (project_rows(s, w->gate, s->bh, s->bgate, n) != 0) return -1;
+        if (project_rows(s, w->up,   s->bh, s->bup,   n) != 0) return -1;
+        for (uint32_t b = 0; b < n; b++)
+            mynah_slm_swiglu(s->bgate + (size_t)b * c->d_ff,
+                             s->bup   + (size_t)b * c->d_ff, c->d_ff);
+
+        if (project_rows(s, w->down, s->bgate, s->bproj, n) != 0) return -1;
+        for (uint32_t b = 0; b < n; b++) {
+            float *xr = s->bx + (size_t)b * c->d_model;
+            const float *pr = s->bproj + (size_t)b * c->d_model;
+            if (c->residual_scale == 1.0f) mynah_slm_add(xr, pr, c->d_model);
+            else mynah_slm_add_scaled(xr, pr, c->residual_scale, c->d_model);
+        }
+    }
+
+    for (uint32_t b = 0; b < n; b++)
+        mynah_slm_rms_norm(s->bh + (size_t)b * c->d_model,
+                           s->bx + (size_t)b * c->d_model,
+                           (const float *)ingot_gguf_data(m->gguf, m->out_norm),
+                           c->d_model, c->rms_eps);
+
+    /* Every row needs its logits here — unlike prefill, each one samples. So
+     * the head is one [n x d] product too, and on a tied 151936-row head that
+     * is the single largest weight read the batching saves. */
+    const ingot_tensor *head = m->lm_head ? m->lm_head : m->embed;
+    if (project_rows(s, head, s->bh, s->mlogits, n) != 0) return -1;
+
+    for (uint32_t b = 0; b < n; b++) {
+        float *lg = s->mlogits + (size_t)b * c->vocab_size;
+        if (c->logit_scale != 1.0f)
+            for (uint32_t i = 0; i < c->vocab_size; i++) lg[i] /= c->logit_scale;
+        logits[b] = lg;
+    }
+    /* Only now, with the whole step done, does any sequence move. */
+    for (uint32_t b = 0; b < n; b++) seqs[b]->n_past++;
     return 0;
 }
