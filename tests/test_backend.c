@@ -355,14 +355,21 @@ static void test_slots(mynah_slm_backend *b) {
           mynah_slm_backend_slot_acquire(b, p, &s[3], &g[3], err, sizeof err) == 1, NULL);
     check("held count is 3", mynah_slm_backend_slots_held(p) == 3, NULL);
 
-    /* Slot 1's request writes some history, then is cancelled mid-sequence. */
+    /* Slot 1's request writes OLD_N positions of history, then is cancelled
+     * mid-sequence. */
+    enum { OLD_N = 8, NEW_N = 3 };
     mynah_slm_bkv *kv_before = mynah_slm_backend_slot_kv(p, 1);
     float *scr_before = mynah_slm_backend_slot_scratch(p, 1);
-    static float k[5 * NKV * HD], v[5 * NKV * HD], q[NH * HD], out[NH * HD], ref[NH * HD];
-    fill(k, sizeof k / sizeof k[0], 2.0f);
-    fill(v, sizeof v / sizeof v[0], 2.0f);
+    static float k_old[OLD_N * NKV * HD], v_old[OLD_N * NKV * HD];
+    static float k_new[OLD_N * NKV * HD], v_new[OLD_N * NKV * HD];
+    static float q[NH * HD], out[NH * HD], ref[NH * HD];
+    fill(k_old, sizeof k_old / sizeof k_old[0], 2.0f);
+    fill(v_old, sizeof v_old / sizeof v_old[0], 2.0f);
+    fill(k_new, sizeof k_new / sizeof k_new[0], 2.0f);
+    fill(v_new, sizeof v_new / sizeof v_new[0], 2.0f);
     fill(q, sizeof q / sizeof q[0], 2.0f);
-    mynah_slm_backend_kv_append(b, kv_before, 0, 0, 5, k, v, err, sizeof err);
+    rc = mynah_slm_backend_kv_append(b, kv_before, 0, 0, OLD_N, k_old, v_old, err, sizeof err);
+    check("the first request writes 8 positions of history", rc == 0, err);
 
     rc = mynah_slm_backend_slot_release(b, p, 1, err, sizeof err);
     check("cancelling a row releases its slot at the step boundary", rc == 0, err);
@@ -380,20 +387,44 @@ static void test_slots(mynah_slm_backend *b) {
           mynah_slm_backend_slot_kv(p, 1) == kv_before &&
           mynah_slm_backend_slot_scratch(p, 1) == scr_before, NULL);
 
-    /* The new request writes position 0 and attends to it. The previous
-     * occupant's positions 1..4 are still in the cache and must be invisible:
-     * the answer equals a fresh cache that only ever saw the new row. */
-    const float *k_new = k + 2 * kv_dim, *v_new = v + 2 * kv_dim;
-    mynah_slm_backend_kv_append(b, kv_before, 0, 0, 1, k_new, v_new, err, sizeof err);
-    rc = mynah_slm_backend_attention(b, kv_before, 0, q, out, 0, 1, scale, err, sizeof err);
+    /* The new request writes FEWER positions than the old one left behind
+     * (0..2 of its own data over the old 0..7), attends at its last
+     * position, then appends one more (3) and attends there. The cache is
+     * not cleared on reuse, so the old values are still sitting at 3..7
+     * (and were at 0..2 until overwritten): each answer must equal a fresh
+     * cache that only ever saw the new request's rows. The reference is
+     * filled one row at a time, as the engine would. */
     mynah_slm_kv fresh;
     mynah_slm_kv_init(&fresh, MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_BF16, 1, CTX, NKV, HD);
-    mynah_slm_kv_put_k(&fresh, 0, 0, k_new);
-    mynah_slm_kv_put_v(&fresh, 0, 0, v_new);
     float *scores = mynah_slm_aligned_alloc((size_t)NH * CTX * sizeof(float));
-    mynah_slm_attention_kv_mt(ref, q, &fresh, 0, 1, NH, NKV, HD, scale, scores);
-    check("a reused slot sees none of the cancelled request's history, bitwise",
-          rc == 0 && same(out, ref, q_dim), rc ? err : "bits differ");
+    rc = mynah_slm_backend_kv_append(b, kv_before, 0, 0, NEW_N, k_new, v_new, err, sizeof err);
+    for (uint32_t i = 0; i < NEW_N + 1; i++) {
+        mynah_slm_kv_put_k(&fresh, 0, i, k_new + (size_t)i * kv_dim);
+        mynah_slm_kv_put_v(&fresh, 0, i, v_new + (size_t)i * kv_dim);
+    }
+    int seen_ok = rc == 0;
+    for (uint32_t pos = NEW_N - 1; seen_ok && pos <= NEW_N; pos++) {
+        if (pos == NEW_N)
+            seen_ok = mynah_slm_backend_kv_append(b, kv_before, 0, pos, 1, k_new + (size_t)pos * kv_dim,
+                                                  v_new + (size_t)pos * kv_dim, err, sizeof err) == 0;
+        seen_ok = seen_ok &&
+                  mynah_slm_backend_attention(b, kv_before, 0, q, out, pos, 1, scale, err, sizeof err) == 0;
+        mynah_slm_attention_kv_mt(ref, q, &fresh, 0, pos + 1, NH, NKV, HD, scale, scores);
+        seen_ok = seen_ok && same(out, ref, q_dim);
+    }
+    check("a reused slot sees only the new request's rows at pos 2 and 3, bitwise",
+          seen_ok, rc ? err : "bits differ");
+
+    /* The check above would be vacuous if the old rows had already gone.
+     * They have not: reading one position PAST what the new request wrote
+     * (a scheduler bug, never done by the engine) reaches the OLD request's
+     * row 4 — bit for bit the answer of new rows 0..3 plus old row 4. */
+    rc = mynah_slm_backend_attention(b, kv_before, 0, q, out, NEW_N + 1, 1, scale, err, sizeof err);
+    mynah_slm_kv_put_k(&fresh, 0, NEW_N + 1, k_old + (size_t)(NEW_N + 1) * kv_dim);
+    mynah_slm_kv_put_v(&fresh, 0, NEW_N + 1, v_old + (size_t)(NEW_N + 1) * kv_dim);
+    mynah_slm_attention_kv_mt(ref, q, &fresh, 0, NEW_N + 2, NH, NKV, HD, scale, scores);
+    check("control: old row 4 is still in the cache, so the check above can fail",
+          rc == 0 && same(out, ref, q_dim), rc ? err : "old history not where expected");
     mynah_slm_aligned_free(scores);
     mynah_slm_kv_free(&fresh);
 
@@ -404,11 +435,14 @@ static void test_slots(mynah_slm_backend *b) {
     check("all slots released", mynah_slm_backend_slots_held(p) == 0, NULL);
     mynah_slm_backend_slots_destroy(b, p);
 
-    /* A KV precision the backend refuses makes the pool refuse too. */
+    /* An INVALID KV description (15 query heads cannot be grouped over 8
+     * KV heads) fails the pool with -1 and no pool. A VALID description the
+     * backend declines (1, passed through) cannot be reached on the CPU,
+     * which takes every KV type; gpu/cuda/self_test.c checks that one. */
     d.kv.n_heads = 15;
     p = NULL;
-    check("a pool over an invalid KV description is refused",
-          mynah_slm_backend_slots_create(b, &d, &p, err, sizeof err) != 0 && p == NULL, NULL);
+    check("a pool over an invalid KV description fails (-1), no pool",
+          mynah_slm_backend_slots_create(b, &d, &p, err, sizeof err) == -1 && p == NULL, NULL);
 }
 
 int main(void) {

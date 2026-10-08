@@ -428,6 +428,12 @@ static void check_refusals(ctx *c) {
     const mynah_slm_bweight *w = NULL;
     const int r3 = mynah_slm_backend_weight(c->gpu, INGOT_TYPE_Q5_K, q5k, 1, 256, &w, c->err, sizeof c->err);
     report(c, "cuda refuses a Q5_K weight (returns 1)", r3 == 1 && !w, r3, 1);
+    /* A refusal is passed through by the slot pool: 1, not -1, and no pool. */
+    mynah_slm_bslots_desc sd = { { MYNAH_SLM_KV_F32, MYNAH_SLM_KV_F32, 1, 16, 16, 8, 128, 1 }, 0, 2 };
+    mynah_slm_bslots *sp = NULL;
+    const int r4 = mynah_slm_backend_slots_create(c->gpu, &sd, &sp, c->err, sizeof c->err);
+    report(c, "cuda slot pool over an f32 KV is refused (returns 1)", r4 == 1 && !sp, r4, 1);
+    mynah_slm_backend_slots_destroy(c->gpu, sp);
 }
 
 /* Cancellation on the device: a slot released while its step may still be
