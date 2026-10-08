@@ -207,8 +207,11 @@ static int chat_cancel(void *ctx) {
     return 0;
 }
 
+/* Sized before the token loop (see handle_chat); growth here is a
+ * regression of the no-allocation rule, counted for /health. */
 static int emit_append(emit_ctx *e, const char *text, size_t len) {
     if (e->used + len + 1 > e->cap) {
+        slots_note_loop_alloc();
         size_t cap = (e->used + len + 1) * 2;
         char *g = realloc(e->buf, cap);
         if (!g) { e->failed = 1; return 1; }
@@ -239,11 +242,12 @@ static int answer_cb(void *ctx, uint32_t id, const char *text, size_t len) {
 
     char esc[2048], frame[3072];
     json_escape(text, len, esc, sizeof esc);
-    const int n = snprintf(frame, sizeof frame,
+    int n = snprintf(frame, sizeof frame,
         "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
         "\"model\":%s,\"choices\":[{\"index\":0,\"delta\":{\"content\":%s},"
         "\"finish_reason\":null}]}\n\n",
         e->id, e->model_name, esc);
+    if (n >= (int)sizeof frame) n = (int)sizeof frame - 1;      /* never read past it */
     if (http_write(e->conn, frame, (size_t)n) != 0) { e->failed = 1; return 1; }
     return 0;
 }
@@ -364,10 +368,11 @@ static void handle_health(server_ctx *c, http_conn *conn) {
         "{\"status\":\"ok\",\"model\":\"%s\",\"n_ctx\":%u,\"threads\":%d,"
         "\"recent_requests\":%u,\"recent_decode_tok_s\":%.2f,"
         "\"running\":%d,\"waiting\":%u,\"connections\":%d,\"rejected\":%lu,"
-        "\"cancelled\":%lu,\"cancelled_queued\":%lu,\"cancelled_running\":%lu}\n",
+        "\"cancelled\":%lu,\"cancelled_queued\":%lu,\"cancelled_running\":%lu,"
+        "\"token_loop_allocs\":%lu}\n",
         c->model_name, c->n_ctx, mynah_slm_threads_count(), n, avg,
         busy, waiting, http_live_connections(), http_rejected_connections(),
-        cq + cr, cq, cr);
+        cq + cr, cq, cr, slots_loop_allocs());
     if (c->slots > 1 && len > 2 && (size_t)len < sizeof body) {
         /* Replace the closing "}\n" with the scheduler's members. */
         len -= 2;
@@ -766,6 +771,16 @@ static void handle_chat(server_ctx *c, http_conn *conn,
 
     mynah_slm_sampler *sam = mynah_slm_sampler_new(&sp, mynah_slm_vocab_size(c->model));
     const uint32_t eos[] = { mynah_slm_tokenizer_eos(c->tok), 151643u };
+
+    /* The accumulation buffers, at the most max_tokens steps can produce
+     * (511 bytes a piece + the end-of-generation flushes): the token loop
+     * never allocates. Virtual until written. */
+    {
+        const uint32_t steps = (uint32_t)max_new < st.own.n_ctx ? (uint32_t)max_new : st.own.n_ctx;
+        const size_t cap = ((size_t)steps + 3) * 511 + 1;
+        if (!stream) { e.buf = malloc(cap); e.cap = e.buf ? cap : 0; }
+        if (tools)   { e_tool.buf = malloc(cap); e_tool.cap = e_tool.buf ? cap : 0; }
+    }
 
     mynah_slm_gen_params gp;
     mynah_slm_gen_params_init(&gp);

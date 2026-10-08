@@ -115,4 +115,10 @@ int  slots_run(http_conn *conn, const slots_params *p, slots_result *out);
  * is shutting down. */
 int  slots_health(char *buf, size_t n);
 
+/* Times a per-request output buffer grew from inside the token loop, in
+ * either serving mode (expected: 0). The serialized path records its own
+ * through slots_note_loop_alloc. */
+void          slots_note_loop_alloc(void);
+unsigned long slots_loop_allocs(void);
+
 #endif /* MYNAH_SLM_SERVER_SLOTS_H */

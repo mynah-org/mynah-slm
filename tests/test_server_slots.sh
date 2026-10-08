@@ -666,6 +666,52 @@ echo "$R" | grep -q ' 503$' && ! echo "$R" | grep -q invalid_request_error \
     || bad "5xx error types" "$R"
 fi
 
+if want 16; then
+# ── 16. /health numbers that mean what they say; no allocation per token ─────
+# Review NITs: aggregate_decode_tok_s divided the tokens of the last 10 s by
+# "now - the oldest step", so an idle server reported a fraction of what it
+# had just done; and the per-request output buffers grew by realloc inside
+# the token loop (AGENTS.md: zero allocation there).
+for MODE in 1 2; do
+    start "$TMP/agg$MODE.log" --slots $MODE
+    python3 - "$PORT" > "$TMP/agg$MODE.out" 2>&1 <<'PY'
+import json, socket, sys, time
+port = int(sys.argv[1])
+def get(data):
+    s = socket.create_connection(('127.0.0.1', port)); s.settimeout(120); s.sendall(data)
+    r = b''
+    while True:
+        c = s.recv(65536)
+        if not c: break
+        r += c
+    return r
+def health():
+    return json.loads(get(b'GET /health HTTP/1.1\r\n\r\n').split(b'\r\n\r\n', 1)[1])
+def chat(n, stream):
+    b = json.dumps({'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': n,
+                    'stream': stream, 'temperature': 0}).encode()
+    return get(b'POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n' % len(b) + b)
+r = chat(120, False)
+u = json.loads(r.split(b'\r\n\r\n', 1)[1].decode('utf-8', 'replace'))['usage']
+chat(120, True)
+time.sleep(2.0)                     # idle: the rate of what was done must not decay
+h = health()
+print('rate', u['decode_tok_s'], h.get('aggregate_decode_tok_s', -1))
+print('allocs', h.get('token_loop_allocs'))
+PY
+    stop
+    if [ "$MODE" = 2 ]; then
+        R=$(grep '^rate' "$TMP/agg$MODE.out")
+        python3 -c "import sys; d, a = map(float, '$R'.split()[1:]); sys.exit(0 if a >= 0.5 * d else 1)" \
+            && ok "--slots 2: aggregate decode t/s after 2 s idle still reflects the steps ($R)" \
+            || bad "--slots 2: aggregate_decode_tok_s is tokens over step time" "$R (stream decode_tok_s, aggregate)"
+    fi
+    A=$(awk '/^allocs/ {print $2}' "$TMP/agg$MODE.out")
+    [ "$A" = 0 ] && ok "--slots $MODE: no output buffer grew inside the token loop (240 tokens, stream and not)" \
+        || bad "--slots $MODE: no allocation in the token loop" "token_loop_allocs=$A"
+done
+fi
+
 if grep -l "Sanitizer" "$TMP"/*.log >/dev/null 2>&1; then
     bad "no sanitizer report in any server log" "$(grep -h -A3 Sanitizer "$TMP"/*.log | head -12)"
 fi

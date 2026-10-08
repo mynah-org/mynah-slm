@@ -63,6 +63,10 @@ mynah_slm_sched *mynah_slm_sched_new(const mynah_slm_sched_cfg *cfg,
         return NULL;
     mynah_slm_sched *s = calloc(1, sizeof *s);
     if (!s) return NULL;
+    /* First, so every path through sched_free destroys an initialized
+     * mutex (it used to be initialized after the allocations that could
+     * fail, and destroyed whenever `slots` had been allocated). */
+    pthread_mutex_init(&s->stat_mu, NULL);
     s->cfg = *cfg;
     s->eng = *engine;
     s->q = queue;
@@ -76,13 +80,12 @@ mynah_slm_sched *mynah_slm_sched_new(const mynah_slm_sched_cfg *cfg,
         mynah_slm_sched_free(s);
         return NULL;
     }
-    pthread_mutex_init(&s->stat_mu, NULL);
     return s;
 }
 
 void mynah_slm_sched_free(mynah_slm_sched *s) {
     if (!s) return;
-    if (s->slots) pthread_mutex_destroy(&s->stat_mu);
+    pthread_mutex_destroy(&s->stat_mu);
     free(s->slots);
     free(s->jobs);
     free(s->idx);

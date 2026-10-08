@@ -113,6 +113,7 @@ static struct {
     double   stream_tok_s[16];
     unsigned n_stream, stream_head;
     double   agg_t[AGG_RING];
+    double   agg_dur[AGG_RING];     /* how long that step took */
     unsigned agg_n[AGG_RING];
     unsigned agg_head, agg_count;
 } S;
@@ -132,9 +133,10 @@ static void life_leave(void) {
     pthread_mutex_unlock(&S.life_mu);
 }
 
-static void stat_step(unsigned tokens) {
+static void stat_step(unsigned tokens, double dur) {
     pthread_mutex_lock(&S.stat_mu);
     S.agg_t[S.agg_head] = mynah_slm_now();
+    S.agg_dur[S.agg_head] = dur;
     S.agg_n[S.agg_head] = tokens;
     S.agg_head = (S.agg_head + 1) % AGG_RING;
     if (S.agg_count < AGG_RING) S.agg_count++;
@@ -149,11 +151,29 @@ static void stat_stream(double tok_s) {
     pthread_mutex_unlock(&S.stat_mu);
 }
 
-/* Append under the request's lock. Growth reallocs: the buffers are per
- * request and amortized, and the alternative — a fixed ring — would turn a
- * long non-stream answer into a truncation. */
+/* Times a per-request buffer had to grow from inside the token loop. The
+ * buffers are sized at arrival for the most the request can produce, so
+ * this stays 0; /health reports it so a regression of the "no allocation
+ * in the token loop" rule shows up. */
+static atomic_ulong g_loop_allocs;
+
+void          slots_note_loop_alloc(void) { atomic_fetch_add(&g_loop_allocs, 1); }
+unsigned long slots_loop_allocs(void)     { return atomic_load(&g_loop_allocs); }
+
+/* The most bytes a generation of `steps` steps can put on one channel: a
+ * detokenizer piece is at most MAX_PIECE bytes, plus the three flushes at
+ * the end. Pages are only touched as they are written. */
+#define MAX_PIECE 511
+static size_t channel_cap(uint32_t steps) { return ((size_t)steps + 3) * MAX_PIECE + 1; }
+
+/* An SSE frame is built in a 3072-byte buffer. */
+#define MAX_FRAME 3072
+
+/* Append under the request's lock. Never expected to grow (see above); if a
+ * bound is ever wrong it still grows rather than truncate, and counts it. */
 static int append(char **buf, size_t *used, size_t *cap, const char *s, size_t n) {
     if (*used + n + 1 > *cap) {
+        slots_note_loop_alloc();
         size_t nc = (*used + n + 1) * 2;
         if (nc < 256) nc = 256;
         char *g = realloc(*buf, nc);
@@ -178,13 +198,23 @@ static int answer_cb(void *ctx, uint32_t id, const char *text, size_t len) {
     if (r->p.stream) {
         char esc[2048], frame[3072];
         json_escape(text, len, esc, sizeof esc);
-        const int n = snprintf(frame, sizeof frame,
+        int n = snprintf(frame, sizeof frame,
             "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
             "\"model\":%s,\"choices\":[{\"index\":0,\"delta\":{\"content\":%s},"
             "\"finish_reason\":null}]}\n\n",
             r->p.req_id, r->p.model_json, esc);
-        if (append(&r->out, &r->out_used, &r->out_cap, frame, (size_t)n) != 0) r->oom = rc = 1;
-        else if (r->out_used > S.max_pending) atomic_store(&r->gone, 1);   /* too slow */
+        if (n >= (int)sizeof frame) n = (int)sizeof frame - 1;   /* never read past it */
+        if (r->out_used + (size_t)n + 1 > r->out_cap) {
+            /* Unsent bytes past the cap: the client is too slow. Dropping
+             * the frame is fine, the request is cancelled at the next
+             * iteration; growing the buffer here would be an allocation in
+             * the token loop. */
+            atomic_store(&r->gone, 1);
+        } else if (append(&r->out, &r->out_used, &r->out_cap, frame, (size_t)n) != 0) {
+            r->oom = rc = 1;
+        } else if (r->out_used > S.max_pending) {
+            atomic_store(&r->gone, 1);                                     /* too slow */
+        }
     } else if (append(&r->text, &r->text_used, &r->text_cap, text, len) != 0) {
         r->oom = rc = 1;
     }
@@ -335,6 +365,7 @@ static int e_step(void *ud, void *const *jobs, const uint32_t *slots, uint32_t n
         m++;
     }
     if (m == 0) return 0;
+    const double t0 = mynah_slm_now();
     /* All or nothing: on failure no sequence moved, and the scheduler
      * re-steps each alone (isolation). */
     if (mynah_slm_forward_multi(&S.ws, S.step_seqs, S.step_tok, m, S.step_logits) != 0)
@@ -345,7 +376,7 @@ static int e_step(void *ud, void *const *jobs, const uint32_t *slots, uint32_t n
         status[S.step_pick[k]] = r->gen.stop == MYNAH_SLM_STOP_ERROR ? -1
                                : mynah_slm_gen_wants_step(&r->gen) ? 1 : 0;
     }
-    stat_step(m);
+    stat_step(m, mynah_slm_now() - t0);
     return 0;
 }
 
@@ -542,9 +573,38 @@ static int run_entered(http_conn *conn, const slots_params *p, slots_result *out
     atomic_init(&r->gone, 0);
     atomic_init(&r->shutdown, 0);
 
+    /* Every buffer the token loop writes into is allocated HERE, on the
+     * connection thread, at its final size (AGENTS.md: zero allocation in
+     * the token loop). Stream: the pending-bytes cap plus the frames that
+     * can follow it before the reap (one per channel flush). Non-stream:
+     * the most text max_tokens steps can produce. Virtual until written. */
+    {
+        uint32_t steps = p->max_new < S.ctx_cap ? p->max_new : S.ctx_cap;
+        if (p->stream) {
+            r->out_cap = S.max_pending + 4 * MAX_FRAME + 1;
+            r->out = malloc(r->out_cap);
+        } else {
+            r->text_cap = channel_cap(steps);
+            r->text = malloc(r->text_cap);
+        }
+        if (p->tool_open >= 0 && p->tool_close >= 0) {
+            r->tool_cap = channel_cap(steps);
+            r->tool = malloc(r->tool_cap);
+        }
+        if ((p->stream && !r->out) || (!p->stream && !r->text) ||
+            (r->tool_cap && !r->tool)) {
+            free(r->out); free(r->text); free(r->tool);
+            pthread_cond_destroy(&r->cv);
+            pthread_mutex_destroy(&r->mu);
+            free(r);
+            return SLOTS_BUSY;
+        }
+    }
+
     if (atomic_fetch_add(&S.in_flight, 1) >= S.capacity ||
         mynah_slm_jobq_push(S.q, r) != 0) {
         atomic_fetch_sub(&S.in_flight, 1);
+        free(r->out); free(r->text); free(r->tool);
         pthread_cond_destroy(&r->cv);
         pthread_mutex_destroy(&r->mu);
         free(r);
@@ -555,8 +615,10 @@ static int run_entered(http_conn *conn, const slots_params *p, slots_result *out
         return stopping ? SLOTS_STOPPING : SLOTS_BUSY;
     }
 
-    char  *wbuf = NULL;
-    size_t wcap = 0;
+    /* The writer's copy buffer, at the size the pending bytes can reach. */
+    size_t wcap = p->stream ? r->out_cap : 0;
+    char  *wbuf = wcap ? malloc(wcap) : NULL;
+    if (wcap && !wbuf) { atomic_store(&r->gone, 1); wcap = 0; }
     pthread_mutex_lock(&r->mu);
     for (;;) {
         if (r->admitted && p->stream && !out->header_sent && !atomic_load(&r->gone)) {
@@ -570,6 +632,7 @@ static int run_entered(http_conn *conn, const slots_params *p, slots_result *out
             /* Take the bytes, write them unlocked: the scheduler keeps
              * appending while this thread sits in send(). */
             if (r->out_used > wcap) {
+                slots_note_loop_alloc();
                 char *g = realloc(wbuf, r->out_used);
                 if (!g) { atomic_store(&r->gone, 1); r->out_used = 0; continue; }
                 wbuf = g;
@@ -651,18 +714,22 @@ static int health_entered(char *buf, size_t n) {
     double per = 0.0;
     for (unsigned i = 0; i < S.n_stream; i++) per += S.stream_tok_s[i];
     if (S.n_stream) per /= S.n_stream;
-    /* Aggregate: tokens over the steps of the last 10 s. */
+    /* Aggregate: tokens per second of STEP time over the steps of the
+     * last 10 s — what the batched step delivers. It used to divide by
+     * "now - the oldest step", which left out that step's own duration
+     * and counted every idle second since the last one: an idle server
+     * reported a fraction of what it had just done. */
     const double now = mynah_slm_now();
-    double t_old = now;
+    double busy = 0.0;
     unsigned tokens = 0;
     for (unsigned k = 0; k < S.agg_count; k++) {
         const unsigned i = (S.agg_head + AGG_RING - 1 - k) % AGG_RING;
         if (now - S.agg_t[i] > 10.0) break;
         tokens += S.agg_n[i];
-        t_old = S.agg_t[i];
+        busy += S.agg_dur[i];
     }
     pthread_mutex_unlock(&S.stat_mu);
-    const double agg = (now - t_old) > 0.0 ? tokens / (now - t_old) : 0.0;
+    const double agg = busy > 0.0 ? tokens / busy : 0.0;
     return snprintf(buf, n,
         "\"slots\":%u,\"live\":%u,\"preparing\":%u,\"decoding\":%u,\"queued\":%zu,"
         "\"capacity\":%u,\"steps\":%llu,\"mean_batch\":%.2f,"
