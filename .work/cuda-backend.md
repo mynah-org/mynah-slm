@@ -210,7 +210,36 @@ Written as the plan, because `arch_qwen3.c` is owned by another agent right now.
 
 ## Evidence
 
-(Filled per step below.)
+### G1-a — the vtable and the CPU backend (2026-10-08, cloud VM, x86, no model)
+
+Files: `src/backend.h` (public, C only, no CUDA type), `src/backend_ops.h`
+(the table a backend fills; C and C++ both include it), `src/backend.c`
+(open/close, the upload-once weight cache, every argument check, NULL → 1),
+`src/backend_cpu.c` (the reference backend), `tests/test_backend.c`.
+
+What ran, `make test` with 4 pool threads, OpenBLAS and `BLAS=none`:
+
+- matvec F32 / Q8_0 / Q4_K / Q6_K, 300 x 1024 (threaded row split) ==
+  one serial `mynah_slm_matvec`-or-`ingot_matvec` call: **bitwise**.
+- matmat, 5 tokens, == `mynah_slm_qmatmat`: **bitwise**. embed rows ==
+  `ingot_dequant_matrix` row decode: **bitwise**.
+- rms_norm, QK-norm (3 tokens x 16 heads x 128), NeoX and interleaved RoPE,
+  swiglu, add, add_scaled == the kernels.c calls: **bitwise**.
+- attention at f32 / bf16 / q8 KV, Qwen3's 16/8 GQA at head_dim 128, layer 1
+  (so a missing per-layer offset cannot pass by reading layer 0), decode and a
+  causal batch of 4 == `attention_mt` / `_kv_mt` / `_batch` / `_kv_batch` on a
+  reference `mynah_slm_kv` filled with the same rows: **bitwise**.
+- Contract: same bytes uploaded twice → one handle; Q1_0 → 1 (unsupported);
+  out-of-range token, layer, position, batch, a 16/5 head grouping, a gain of
+  the wrong width → -1; a CPU-only build refuses `MYNAH_SLM_DEVICE_CUDA` with
+  "build with `make cuda`".
+- **Mutation check:** dropping the layer offset in `cpu_attention` makes both
+  f32 attention checks fail (observed on a rebuilt object, then reverted).
+- ASan+UBSan build of the test: clean. `-Wall -Wextra -Wpedantic -Werror`
+  on the three new files with gcc 13 and clang: clean.
+
+No existing code path changed: nothing outside the new files calls the
+backend yet.
 
 ## Conclusion
 
@@ -218,4 +247,4 @@ Written as the plan, because `arch_qwen3.c` is owned by another agent right now.
 
 ## Next action
 
-G1-a: write `src/backend.{c,h}` and `tests/test_backend.c`.
+G1-b: `gpu/cuda/` behind `make cuda`, and `make cuda-test`.
