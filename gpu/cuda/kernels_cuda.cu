@@ -40,7 +40,10 @@ extern "C" {
 namespace mynah_cuda {
 
 /* Round-to-nearest products and sums that nvcc may not contract into an FMA.
- * On the host the C++ compiler runs in ISO mode, where contraction is off. */
+ * On the host these are plain operators, and g++ WOULD contract them (GCC
+ * turns contraction off only for ISO C, not for C++ at any -std): the
+ * Makefile compiles every .cu's host half with -ffp-contract=off, which is
+ * what keeps the host check bitwise on an FMA-capable host. */
 MYNAH_HD float mul_rn(float a, float b) {
 #ifdef __CUDA_ARCH__
     return __fmul_rn(a, b);

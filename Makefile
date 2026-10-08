@@ -244,11 +244,16 @@ $(CUDA_BUILD)/%.o: %.c $(CUDA_HDR)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -DMYNAH_SLM_ENABLE_CUDA -iquote gpu/cuda -c $< -o $@
 
+# -ffp-contract=off for the HOST half of each .cu: g++ contracts a*b - c into
+# an FMA even in -std=c++17 (GCC only turns contraction off for ISO *C*), so
+# on any target with FMA (aarch64, x86 with -mfma) the host check would run a
+# different rounding than the device's __fmul_rn/__fsub_rn and the CPU's
+# gcc -std=c11 code, and stop being bitwise.
 $(CUDA_BUILD)/gpu/cuda/%.o: gpu/cuda/%.cu $(CUDA_HDR) $(CUDA_ARCH_STAMP)
 	@mkdir -p $(@D)
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc is required for make cuda; install the NVIDIA CUDA toolkit" >&2; exit 2; }
 	$(NVCC) $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) -Isrc -Igpu/cuda -I$(INGOT_DIR)/include -Iinclude \
-	  -Xcompiler -Wall,-Wextra,-fPIC -c $< -o $@
+	  -Xcompiler -Wall,-Wextra,-fPIC,-ffp-contract=off -c $< -o $@
 
 .PHONY: cuda-arch-stamp-force
 cuda-arch-stamp-force:
