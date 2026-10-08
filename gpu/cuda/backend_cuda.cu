@@ -78,11 +78,25 @@ struct kv_planes {
     uint16_t *k, *v;            /* [n_layers][n_ctx][kv_dim] bf16 */
 };
 
+/* The current device is per HOST THREAD, and cudaSetDevice ran only on the
+ * thread that opened the backend. A server hands a request to whichever
+ * worker is free, so every op selects the device first; otherwise an op from
+ * another thread allocates, copies and launches on that thread's current
+ * device (0 by default) — the wrong GPU, or a stream from another device.
+ * cudaGetDevice is a thread-local read, so the common case costs no driver
+ * call; cudaSetDevice only runs when the thread is pointed elsewhere. */
+int on_device(const cuda_state *s, char *e, size_t c) {
+    int cur = -1;
+    if (cudaGetDevice(&cur) == cudaSuccess && cur == s->device) return 0;
+    return ce(cudaSetDevice(s->device), e, c, "set device");
+}
+
 /* ── lifecycle ──────────────────────────────────────────────────────────── */
 
 void cuda_close(void *st) {
     auto *s = static_cast<cuda_state *>(st);
     if (!s) return;
+    (void)on_device(s, nullptr, 0);
     if (s->stream) cudaStreamSynchronize(s->stream);
     if (s->d_tokens) cudaFree(s->d_tokens);
     if (s->d_argmax) cudaFree(s->d_argmax);
@@ -94,14 +108,16 @@ void cuda_close(void *st) {
 /* ── memory ─────────────────────────────────────────────────────────────── */
 
 float *cuda_alloc(void *st, size_t n, char *e, size_t c) {
-    (void)st;
+    auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return nullptr;
     void *p = nullptr;
     if (ce(cudaMalloc(&p, n * sizeof(float)), e, c, "alloc")) return nullptr;
     return static_cast<float *>(p);
 }
 
 void cuda_free(void *st, float *p) {
-    (void)st;
+    auto *s = static_cast<cuda_state *>(st);
+    (void)on_device(s, nullptr, 0);
     cudaFree(p);
 }
 
@@ -111,12 +127,14 @@ void cuda_free(void *st, float *p) {
  * returns before the DMA, and the source must stay untouched until a sync. */
 int cuda_h2d(void *st, float *dst, const float *src, size_t n, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     return ce(cudaMemcpyAsync(dst, src, n * sizeof(float), cudaMemcpyHostToDevice, s->stream),
               e, c, "h2d");
 }
 
 int cuda_d2h(void *st, float *dst, const float *src, size_t n, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     if (ce(cudaMemcpyAsync(dst, src, n * sizeof(float), cudaMemcpyDeviceToHost, s->stream),
            e, c, "d2h"))
         return -1;
@@ -126,6 +144,7 @@ int cuda_d2h(void *st, float *dst, const float *src, size_t n, char *e, size_t c
 
 int cuda_sync(void *st, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     return ce(cudaStreamSynchronize(s->stream), e, c, "sync");
 }
 
@@ -148,6 +167,7 @@ int upload(cuda_state *s, void *dst, const void *src, size_t bytes, char *e, siz
 
 int cuda_weight_upload(void *st, mynah_slm_bweight *w, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     if (!mynah_cuda::type_supported(w->type)) return 1;
     const size_t bytes = w->rows * w->row_bytes;
     void *d = nullptr;
@@ -162,7 +182,8 @@ int cuda_weight_upload(void *st, mynah_slm_bweight *w, char *e, size_t c) {
 }
 
 void cuda_weight_release(void *st, mynah_slm_bweight *w) {
-    (void)st;
+    auto *s = static_cast<cuda_state *>(st);
+    (void)on_device(s, nullptr, 0);
     if (w->data) cudaFree(w->data);
     w->data = nullptr;
 }
@@ -172,6 +193,7 @@ void cuda_weight_release(void *st, mynah_slm_bweight *w) {
 int cuda_matvec(void *st, const mynah_slm_bweight *w, const float *x, float *y,
                 char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     return ce(mynah_cuda::launch_matvec(w->type, w->data, w->row_bytes, w->rows, w->cols,
                                         x, y, 1, s->stream), e, c, "matvec");
 }
@@ -182,6 +204,7 @@ int cuda_matvec(void *st, const mynah_slm_bweight *w, const float *x, float *y,
 int cuda_matmat(void *st, const mynah_slm_bweight *w, const float *x, float *y,
                 size_t tokens, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     if (tokens > 65535u) return 1;
     return ce(mynah_cuda::launch_matvec(w->type, w->data, w->row_bytes, w->rows, w->cols,
                                         x, y, tokens, s->stream), e, c, "matmat");
@@ -190,6 +213,7 @@ int cuda_matmat(void *st, const mynah_slm_bweight *w, const float *x, float *y,
 int cuda_embed(void *st, const mynah_slm_bweight *w, const uint32_t *tokens, size_t n,
                float *out, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     /* The id buffer is sized at open for a full prefill batch; a wider call
      * would need an allocation on the token path, so it is refused instead. */
     if (n > s->tokens_cap) return 1;
@@ -205,6 +229,7 @@ int cuda_embed(void *st, const mynah_slm_bweight *w, const uint32_t *tokens, siz
 int cuda_rms_norm(void *st, float *out, const float *x, const mynah_slm_bweight *w,
                   size_t rows, uint32_t dim, float eps, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     return ce(mynah_cuda::launch_rms_norm(out, x, static_cast<const float *>(w->data),
                                           rows, dim, eps, s->stream), e, c, "rms_norm");
 }
@@ -212,6 +237,7 @@ int cuda_rms_norm(void *st, float *out, const float *x, const mynah_slm_bweight 
 int cuda_rms_norm_heads(void *st, float *x, const mynah_slm_bweight *w, size_t n_heads,
                         uint32_t head_dim, float eps, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     return ce(mynah_cuda::launch_rms_norm_heads(x, static_cast<const float *>(w->data),
                                                 n_heads, head_dim, eps, s->stream),
               e, c, "rms_norm_heads");
@@ -219,16 +245,19 @@ int cuda_rms_norm_heads(void *st, float *x, const mynah_slm_bweight *w, size_t n
 
 int cuda_swiglu(void *st, float *g, const float *u, size_t n, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     return ce(mynah_cuda::launch_swiglu(g, u, n, s->stream), e, c, "swiglu");
 }
 
 int cuda_add(void *st, float *y, const float *x, size_t n, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     return ce(mynah_cuda::launch_add(y, x, n, s->stream), e, c, "add");
 }
 
 int cuda_add_scaled(void *st, float *y, const float *x, float w, size_t n, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     return ce(mynah_cuda::launch_add_scaled(y, x, w, n, s->stream), e, c, "add_scaled");
 }
 
@@ -236,6 +265,7 @@ int cuda_add_scaled(void *st, float *y, const float *x, float w, size_t n, char 
 
 int cuda_rope_create(void *st, mynah_slm_brope *r, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     mynah_slm_rope host;
     if (mynah_slm_rope_init(&host, r->head_dim, r->max_pos, r->theta, r->interleaved) != 0) {
         set_err(e, c, "cannot build the rope table");
@@ -260,7 +290,8 @@ int cuda_rope_create(void *st, mynah_slm_brope *r, char *e, size_t c) {
 }
 
 void cuda_rope_free(void *st, mynah_slm_brope *r) {
-    (void)st;
+    auto *s = static_cast<cuda_state *>(st);
+    (void)on_device(s, nullptr, 0);
     auto *t = static_cast<rope_table *>(r->impl);
     if (!t) return;
     cudaFree(t->cos_t);
@@ -272,6 +303,7 @@ void cuda_rope_free(void *st, mynah_slm_brope *r) {
 int cuda_rope(void *st, const mynah_slm_brope *r, float *x, size_t n_tokens,
               uint32_t n_heads, uint32_t pos0, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     auto *t = static_cast<const rope_table *>(r->impl);
     return ce(mynah_cuda::launch_rope(x, t->cos_t, t->sin_t, n_tokens, n_heads, r->head_dim,
                                       pos0, r->interleaved, s->stream), e, c, "rope");
@@ -280,7 +312,8 @@ int cuda_rope(void *st, const mynah_slm_brope *r, float *x, size_t n_tokens,
 /* ── KV: bf16 only, for now ─────────────────────────────────────────────── */
 
 int cuda_kv_create(void *st, mynah_slm_bkv *kv, char *e, size_t c) {
-    (void)st;
+    auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     const mynah_slm_bkv_desc &d = kv->desc;
     /* bf16 is what AGENTS.md asks of a KV cache; q8/fp8 on the device are a
      * quality question with their own gate, not a default to slip in here. */
@@ -300,7 +333,8 @@ int cuda_kv_create(void *st, mynah_slm_bkv *kv, char *e, size_t c) {
 }
 
 void cuda_kv_free(void *st, mynah_slm_bkv *kv) {
-    (void)st;
+    auto *s = static_cast<cuda_state *>(st);
+    (void)on_device(s, nullptr, 0);
     auto *k = static_cast<kv_planes *>(kv->impl);
     if (!k) return;
     cudaFree(k->k);
@@ -316,6 +350,7 @@ size_t kv_offset(const mynah_slm_bkv *kv, uint32_t layer, uint32_t pos) {
 int cuda_kv_append(void *st, mynah_slm_bkv *kv, uint32_t layer, uint32_t pos0, size_t n,
                    const float *k, const float *v, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     auto *ck = static_cast<kv_planes *>(kv->impl);
     const size_t off = kv_offset(kv, layer, pos0);
     return ce(mynah_cuda::launch_kv_append_bf16(ck->k + off, ck->v + off, k, v, n, kv->kv_dim,
@@ -325,6 +360,7 @@ int cuda_kv_append(void *st, mynah_slm_bkv *kv, uint32_t layer, uint32_t pos0, s
 int cuda_attention(void *st, const mynah_slm_bkv *kv, uint32_t layer, const float *q,
                    float *out, uint32_t pos0, size_t n_q, float scale, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     auto *ck = static_cast<const kv_planes *>(kv->impl);
     const size_t off = kv_offset(kv, layer, 0);
     return ce(mynah_cuda::launch_attention_bf16(out, q, ck->k + off, ck->v + off, pos0, n_q,
@@ -337,6 +373,7 @@ int cuda_attention(void *st, const mynah_slm_bkv *kv, uint32_t layer, const floa
  * sync per token, and that sync is the only one the step should have. */
 int cuda_argmax(void *st, const float *x, size_t n, uint32_t *idx, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     if (ce(mynah_cuda::launch_argmax(x, n, s->d_argmax, s->stream), e, c, "argmax") ||
         ce(cudaMemcpyAsync(s->h_argmax, s->d_argmax, sizeof(uint32_t), cudaMemcpyDeviceToHost,
                            s->stream), e, c, "argmax copy") ||
@@ -349,7 +386,8 @@ int cuda_argmax(void *st, const float *x, size_t n, uint32_t *idx, char *e, size
 /* ── slot-pool fences and per-request error recovery ───────────────────── */
 
 int cuda_fence_create(void *st, void **fence, char *e, size_t c) {
-    (void)st;
+    auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     cudaEvent_t ev = nullptr;
     /* Created once per slot at pool creation; timing off, it is only a marker. */
     if (ce(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), e, c, "fence create")) return -1;
@@ -358,19 +396,22 @@ int cuda_fence_create(void *st, void **fence, char *e, size_t c) {
 }
 
 void cuda_fence_destroy(void *st, void *fence) {
-    (void)st;
+    auto *s = static_cast<cuda_state *>(st);
+    (void)on_device(s, nullptr, 0);
     if (fence) cudaEventDestroy(static_cast<cudaEvent_t>(fence));
 }
 
 /* Behind everything queued so far: the step that was in flight for the row. */
 int cuda_fence_record(void *st, void *fence, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     return ce(cudaEventRecord(static_cast<cudaEvent_t>(fence), s->stream), e, c, "fence record");
 }
 
 /* Polled, never waited on. */
 int cuda_fence_query(void *st, void *fence, char *e, size_t c) {
-    (void)st;
+    auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     const cudaError_t r = cudaEventQuery(static_cast<cudaEvent_t>(fence));
     if (r == cudaSuccess) return 1;
     if (r == cudaErrorNotReady) {
@@ -388,6 +429,7 @@ int cuda_fence_query(void *st, void *fence, char *e, size_t c) {
  * surfaces from the stream query — then the context is gone for everyone. */
 int cuda_recover(void *st, char *e, size_t c) {
     auto *s = static_cast<cuda_state *>(st);
+    if (on_device(s, e, c)) return -1;
     (void)cudaGetLastError();
     cudaError_t r = cudaPeekAtLastError();
     if (r == cudaSuccess) {

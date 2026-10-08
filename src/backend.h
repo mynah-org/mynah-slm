@@ -30,7 +30,11 @@
  * close. Uploading the same bytes twice returns the same handle — which is
  * what keeps a tied embedding (input lookup AND LM head) to one device copy.
  *
- * Single submitter: a backend is driven by one thread at a time.
+ * Single submitter: a backend is driven by one thread at a time — but not
+ * necessarily the thread that opened it. A device backend selects its device
+ * at the start of every op (the current device is per host thread), so a
+ * server may hand a request to any worker. What is NOT shared between threads
+ * is the runtime's last-error record: see mynah_slm_backend_recover().
  *
  * SPDX-License-Identifier: MIT */
 #ifndef MYNAH_SLM_BACKEND_H
@@ -264,7 +268,13 @@ uint32_t       mynah_slm_backend_slots_held(const mynah_slm_bslots *p);
  *   -1   the device context is poisoned (a sticky error: illegal address,
  *        launch failure). No read can clear it; every request on this
  *        backend fails and the backend must be closed and reopened.
- * A synchronous backend has nothing pending and always returns 0. */
+ * A synchronous backend has nothing pending and always returns 0.
+ *
+ * Call it on the SAME THREAD that saw the failing op: CUDA keeps the
+ * non-sticky last-error record per host thread, so recover() on another
+ * thread neither sees nor clears it, and the record then fails that thread's
+ * next unrelated launch. (Sticky errors belong to the context and are seen
+ * from any thread.) recover() selects the backend's device itself. */
 int mynah_slm_backend_recover(mynah_slm_backend *b, char *err, size_t errsz);
 
 #endif /* MYNAH_SLM_BACKEND_H */
