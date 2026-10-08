@@ -92,6 +92,18 @@ static _Atomic uint64_t  g_claim;      /* gen | n | next index */
 static atomic_int        g_done;       /* tasks of the current region finished */
 static atomic_int        g_stop;
 
+/* Re-entry guard. The pool runs ONE region at a time, so a parallel_for from
+ * inside a task (nested) or from a second thread while a region is live
+ * (concurrent) cannot be published: the old pool silently ran 15 of 16
+ * tasks in that case, and the claim protocol here would hang. Both now run
+ * INLINE on the calling thread — correct, just serial. Pool workers carry the
+ * thread-local flag permanently; the caller carries it for the length of its
+ * region. g_busy covers a second, unrelated thread. Found by an adversarial
+ * review, not by a failure: no call site does either today, but the S-items
+ * (a scheduler thread beside HTTP threads) are exactly where one would. */
+static _Thread_local int tl_in_region;
+static atomic_flag       g_busy = ATOMIC_FLAG_INIT;
+
 static pthread_mutex_t   g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t    g_work = PTHREAD_COND_INITIALIZER;   /* workers park here */
 static pthread_cond_t    g_fin  = PTHREAD_COND_INITIALIZER;   /* the caller parks here */
@@ -115,6 +127,16 @@ static uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* One second is far past any useful budget; the clamp only keeps us * 1000
+ * from overflowing. */
+#define MAX_SPIN_US 1000000L
+
+static long clamp_spin_us(long us) {
+    return us < 0 ? 0 : (us > MAX_SPIN_US ? MAX_SPIN_US : us);
+}
+
+static int g_spin_overridden;   /* set_spin_us() wins over the environment */
+
 static long resolve_spin_ns(void) {
     const char *e = getenv("MYNAH_SLM_POOL_SPIN_US");
     long us = DEFAULT_SPIN_US;
@@ -123,7 +145,7 @@ static long resolve_spin_ns(void) {
         const long v = strtol(e, &end, 10);
         if (end != e && v >= 0) us = v;
     }
-    return us * 1000;
+    return clamp_spin_us(us) * 1000;
 }
 
 int mynah_slm_num_cpus(void) {
@@ -216,6 +238,7 @@ static uint32_t wait_for_work(uint32_t seen) {
 
 static void *worker(void *arg) {
     (void)arg;
+    tl_in_region = 1;       /* a task that calls parallel_for runs it inline */
     uint32_t seen = claim_gen(atomic_load_explicit(&g_claim, memory_order_acquire));
     for (;;) {
         const uint32_t g = wait_for_work(seen);
@@ -225,12 +248,18 @@ static void *worker(void *arg) {
     }
 }
 
+static int g_requested = 1;   /* the width asked for, which g_count may fall short of */
+
 int mynah_slm_threads_init(int n) {
     if (n <= 0) n = mynah_slm_num_cpus();
-    if (n == g_count && atomic_load(&g_spin_ns) >= 0) return g_count;
+    /* Compared against what was ASKED, not what was spawned: after a partial
+     * pthread_create failure g_count < n, and comparing with it would tear
+     * the pool down and respawn it on every later call. */
+    if (n == g_requested && atomic_load(&g_spin_ns) >= 0) return g_count;
 
     mynah_slm_threads_shutdown();
-    atomic_store(&g_spin_ns, resolve_spin_ns());
+    g_requested = n;
+    if (!g_spin_overridden) atomic_store(&g_spin_ns, resolve_spin_ns());
     if (n <= 1) { g_count = 1; return 1; }
 
     g_workers = calloc((size_t)(n - 1), sizeof *g_workers);
@@ -257,6 +286,7 @@ void mynah_slm_threads_shutdown(void) {
     free(g_workers);
     g_workers = NULL;
     g_count   = 1;
+    g_requested = 1;
 }
 
 int mynah_slm_threads_count(void) { return g_count; }
@@ -266,7 +296,10 @@ long mynah_slm_threads_spin_us(void) {
     return ns < 0 ? -1 : ns / 1000;
 }
 
-void mynah_slm_threads_set_spin_us(long us) { atomic_store(&g_spin_ns, us < 0 ? 0 : us * 1000); }
+void mynah_slm_threads_set_spin_us(long us) {
+    g_spin_overridden = 1;
+    atomic_store(&g_spin_ns, clamp_spin_us(us) * 1000);
+}
 
 /* A region wider than the claim word can count is split into several, each
  * running fn at an offset. No call site comes near 2^20 tasks; this exists so
@@ -276,6 +309,8 @@ static void offset_task(void *c, int i) {
     const offset_job *o = c;
     o->fn(o->ctx, o->base + i);
 }
+
+static void run_region(int n, void (*fn)(void *ctx, int i), void *ctx);
 
 void mynah_slm_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
     if (n <= 0) return;
@@ -291,7 +326,18 @@ void mynah_slm_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) {
         }
         return;
     }
+    /* Nested, or another thread's region is live: run inline (see g_busy). */
+    if (tl_in_region || atomic_flag_test_and_set_explicit(&g_busy, memory_order_acquire)) {
+        for (int i = 0; i < n; i++) fn(ctx, i);
+        return;
+    }
+    tl_in_region = 1;
+    run_region(n, fn, ctx);
+    tl_in_region = 0;
+    atomic_flag_clear_explicit(&g_busy, memory_order_release);
+}
 
+static void run_region(int n, void (*fn)(void *ctx, int i), void *ctx) {
     /* Publish. The previous region is complete (we waited for it), so no
      * worker can be reading g_r: a late worker holds at most a stale claim
      * word, and its compare-exchange fails on the generation. */

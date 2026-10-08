@@ -32,7 +32,12 @@ int mynah_slm_threads_count(void);
 
 /* Runs fn(ctx, i) for i in [0, n). The caller takes part rather than idling,
  * so a 4-way split uses 4 threads and not 5. With n <= 1 or a single thread it
- * runs inline with no synchronization at all. */
+ * runs inline with no synchronization at all.
+ *
+ * ONE REGION AT A TIME. Called from inside a task (nested), or from a second
+ * thread while another thread's region is live, it runs fn inline on the
+ * calling thread: correct, but serial. Performance-sensitive callers must not
+ * rely on either; the scheduler thread should be the only one that computes. */
 void mynah_slm_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx);
 
 /* How long an idle worker spins before it parks, and how long the caller
