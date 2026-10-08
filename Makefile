@@ -1,4 +1,5 @@
-# mynah-slm — build. CPU-first: BLAS = Accelerate (macOS) / OpenBLAS (Linux).
+# mynah-slm — build. CPU-first: BLAS = Accelerate (macOS) / OpenBLAS (Linux),
+# or our own GEMM with BLAS=none (no vendor dependency, see below).
 CC      ?= cc
 # NOTE: deliberately NO -ffast-math (mynah-asr uses it, we don't). A decoder
 # runs expf over logits and softmax over attention scores; under -ffast-math an
@@ -15,21 +16,53 @@ LDFLAGS ?=
 CFLAGS += -fPIC
 
 UNAME_S := $(shell uname -s)
+
+# BLAS: which f32 GEMM prefill and batched attention run on. Four values:
+#
+#   auto        `openblas` on Linux, `accelerate` on macOS — the default, and
+#               unchanged from before src/sgemm.c existed.
+#   none        OUR src/sgemm.c, no vendor BLAS in the process and no -dev
+#               package to install. Deterministic (bit-identical across
+#               thread counts) and on our own thread pool — the reasons
+#               mynah-tts made the same move (its .work/no-blas.md). OPT-IN,
+#               NOT THE DEFAULT: on the prefill shapes that dominate
+#               (T=256 batches) it measured 0.5-0.65x OpenBLAS on a 4-vCPU
+#               Cascade Lake VM. The flip is gated in .work/no-blas.md.
+#   openblas    Linux vendor BLAS.
+#   accelerate  macOS.
+#
+# With a vendor linked, MYNAH_SLM_SGEMM=own routes to ours at run time, so the
+# A/B runs interleaved in one process (`tests/test_sgemm bench`). Whatever
+# links, src/sgemm.c owns the one entry point (mynah_slm_sgemm).
+BLAS ?= auto
 ifeq ($(UNAME_S),Darwin)
+  BLAS_RESOLVED := $(if $(filter auto,$(BLAS)),accelerate,$(BLAS))
+else
+  BLAS_RESOLVED := $(if $(filter auto,$(BLAS)),openblas,$(BLAS))
+endif
+
+ifeq ($(BLAS_RESOLVED),none)
+  BLAS_DEF := MYNAH_SLM_BLAS_NONE
+else ifeq ($(BLAS_RESOLVED),accelerate)
+  ifneq ($(UNAME_S),Darwin)
+    $(error BLAS=accelerate is macOS-only; this host is $(UNAME_S))
+  endif
   LDFLAGS += -framework Accelerate
   BLAS_DEF := MYNAH_SLM_BLAS_ACCELERATE
-  CFLAGS  += -DMYNAH_SLM_BLAS_ACCELERATE -DACCELERATE_NEW_LAPACK
-else
+  CFLAGS  += -DACCELERATE_NEW_LAPACK
+else ifeq ($(BLAS_RESOLVED),openblas)
   LDFLAGS += -lopenblas
   BLAS_DEF := MYNAH_SLM_BLAS_OPENBLAS
-  CFLAGS  += -DMYNAH_SLM_BLAS_OPENBLAS
   # fail early with a clear hint instead of "cblas.h: No such file or directory"
   ifeq ($(filter clean help,$(MAKECMDGOALS)),)
     ifeq ($(shell printf '\043include <cblas.h>\n' | $(CC) -E -xc - >/dev/null 2>&1 && echo ok),)
-      $(error OpenBLAS headers not found. Install them first: `sudo apt install libopenblas-dev` (Debian/Ubuntu) or `sudo dnf install openblas-devel` (Fedora))
+      $(error OpenBLAS headers not found. Install them first (`sudo apt install libopenblas-dev`), or build without a vendor BLAS: `make BLAS=none`)
     endif
   endif
+else
+  $(error BLAS=$(BLAS) is not a profile. Use auto, none, openblas or accelerate)
 endif
+CFLAGS += -D$(BLAS_DEF)
 LDFLAGS += -lpthread -lm
 
 # hook for recursive variant builds: these ADD to the flags this Makefile
@@ -116,7 +149,7 @@ $(OBJ): | $(INGOT_LIB)
 # test_ingot needs no model: it pins the container-layer contract (block
 # geometry, dequant coverage) so a bad subtree update fails here and not
 # three modules later.
-TESTS := tests/test_batch tests/test_ingot tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer tests/test_tools
+TESTS := tests/test_batch tests/test_ingot tests/test_sgemm tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer tests/test_tools
 
 # The parity harness is built like the others but driven separately: it dumps
 # activations, and tools/eval/compare.py is what judges them.

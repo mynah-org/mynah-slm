@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: MIT */
 #include "qmat.h"
 
+#include "sgemm.h"
 #include "threads.h"
 
 #include "ingot/dtype.h"
@@ -12,11 +13,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(MYNAH_SLM_BLAS_ACCELERATE)
-#include <Accelerate/Accelerate.h>
-#else
-#include <cblas.h>
-#endif
 
 /* ── our Q4_K matvec ────────────────────────────────────────────────────────
  * Q4_K stores 256 weights in 144 bytes: two f16 (d, dmin), eight 6-bit
@@ -522,13 +518,14 @@ int mynah_slm_qmatmat(int type, const void *weights, size_t rows, size_t cols,
         mynah_slm_parallel_for(chunks, dequant_chunk, &j);
         if (j.rc != 0) return -1;
 
-        /* BLAS is called from ONE thread with the pool idle, never from inside
-         * a parallel region: it brings its own threads, and two pools over the
-         * same cores is the throughput collapse mynah-asr measured. */
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    (int)tokens, (int)n_rows, (int)cols,
-                    1.0f, in, (int)cols, scratch, (int)cols,
-                    0.0f, out + row0, (int)rows);
+        /* Called from ONE thread with the pool idle, never from inside a
+         * parallel region: ours runs its own region on the pool, and a vendor
+         * BLAS brings its own threads — two pools over the same cores is the
+         * throughput collapse mynah-asr measured. NT: both operands are
+         * contiguous along cols, so nothing is transposed or packed. */
+        if (mynah_slm_sgemm(1, tokens, n_rows, cols, 1.0f, in, cols,
+                            scratch, cols, 0.0f, out + row0, rows) != 0)
+            return -1;
     }
     return 0;
 }
