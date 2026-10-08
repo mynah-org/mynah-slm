@@ -77,6 +77,34 @@ instrumentation, M3 CLI polish, M5b quantization & footprint, M6 release.
 
 - [~] M0-M6 → [`.work/archive-2026-08-tasks.md`](.work/archive-2026-08-tasks.md)
 
+### P / K / S / G — porting from mynah-tts and mynah-asr (cloud branch, 2026-10)
+
+Written on a cloud VM with no model weights and no GPU: every item below is
+proven only as far as unit tests, sanitizers, cross-ISA runs under qemu and
+synthetic benchmarks go. Real-model and hardware validation is downstream,
+per commit, listed in the matrix note.
+
+- [x] **P1** — what transfers from the sibling engines, what does not, and why
+      → [`.work/sibling-port-map.md`](.work/sibling-port-map.md)
+- [~] **V1** — per-commit validation matrix for this branch: what was proven
+      here, what to run on real hardware → [`.work/cloud-branch-validation.md`](.work/cloud-branch-validation.md)
+- [~] **K1** — our own f32 GEMM, opt-in `BLAS=none`; 0.3-0.85x OpenBLAS on the
+      prefill shapes here, default flip gated → [`.work/no-blas.md`](.work/no-blas.md)
+- [~] **K2** — pool: atomic claim, bounded spin, affinity width; 4x on a
+      synthetic region, decode tok/s unmeasured → [`.work/thread-pool-spin.md`](.work/thread-pool-spin.md)
+- [ ] **K3** — Q4_K int8 kernel restructure (4 rows per activation load,
+      deferred float reduction); note written with the work
+- [ ] **K4** — int8-activation kernels for Q8_0 and Q6_K, opt-in like `--fast`;
+      note written with the work
+- [ ] **K5** — runtime ISA dispatch for our own kernels, for portable
+      `make dist` binaries; note written with the work
+- [ ] **K6** — native BF16 weight matvec, if the formats make it useful; note
+      written with the work
+- [ ] **S1** — serving foundation: slots, scheduler, continuous batching,
+      batched decode, sliced prefill; note written with the work
+- [ ] **G1** — CUDA backend foundation for Qwen3 (GQA, head_dim 128, NeoX RoPE,
+      RMSNorm / QK-norm); note written with the work
+
 ### R — research items
 
 - [~] **R1** — can a pretrained Qwen3-0.6B be post-training ternarized and still
