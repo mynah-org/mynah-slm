@@ -22,6 +22,8 @@ struct mynah_slm_sched {
     mynah_slm_jobq        *q;
     slot                  *slots;
     uint64_t               next_seq;
+    /* A job admit() answered "not now": first in line, ahead of the queue. */
+    void                  *held;
 
     /* step scratch, allocated once */
     void     **jobs;
@@ -131,16 +133,31 @@ static int admit_pass(mynah_slm_sched *s, int block_when_idle) {
         if (free_i == s->cfg.slots) return 0;
 
         const uint32_t live = s->cfg.slots - count_state(s, SLOT_FREE);
-        const int block = block_when_idle && live == 0;
-        void *job = mynah_slm_jobq_pop(s->q, block);
-        if (!job) return block ? 1 : 0;      /* blocking pop returns NULL only when closed */
+        void *job = s->held;
+        s->held = NULL;
+        if (!job) {
+            const int block = block_when_idle && live == 0;
+            job = mynah_slm_jobq_pop(s->q, block);
+            if (!job) return block ? 1 : 0;  /* blocking pop returns NULL only when closed */
+        }
 
         slot *sl = &s->slots[free_i];
         sl->job = job;
         /* Someone who left while queued costs nothing: not a byte of state
          * is built for them. */
         if (is_cancelled(s, job)) { retire(s, free_i, MYNAH_SLM_JOB_CANCELLED); continue; }
-        if (s->eng.admit(s->eng.ud, job, free_i) != 0) {
+        const int rc = s->eng.admit(s->eng.ud, job, free_i);
+        if (rc > 0 && live > 0) {
+            /* Not now: keep it first in line (FIFO — nothing overtakes it)
+             * until a live job leaves and frees what it needs. */
+            sl->job = NULL;
+            s->held = job;
+            pthread_mutex_lock(&s->stat_mu);
+            s->st.deferrals++;
+            pthread_mutex_unlock(&s->stat_mu);
+            return 0;
+        }
+        if (rc != 0) {
             retire(s, free_i, MYNAH_SLM_JOB_REFUSED);
             continue;
         }
@@ -167,6 +184,12 @@ static void reap_pass(mynah_slm_sched *s) {
     for (size_t k = 0; k < n; k++) {
         s->eng.retire(s->eng.ud, s->purged[k], MYNAH_SLM_SCHED_NO_SLOT,
                       MYNAH_SLM_JOB_CANCELLED);
+        count(s, &s->st.cancelled, 1);
+    }
+    if (s->held && is_cancelled(s, s->held)) {
+        void *job = s->held;
+        s->held = NULL;
+        s->eng.retire(s->eng.ud, job, MYNAH_SLM_SCHED_NO_SLOT, MYNAH_SLM_JOB_CANCELLED);
         count(s, &s->st.cancelled, 1);
     }
 }
@@ -273,9 +296,10 @@ int mynah_slm_sched_iterate(mynah_slm_sched *s, int block_when_idle) {
     s->st.preparing = count_state(s, SLOT_PREPARING);
     s->st.decoding  = count_state(s, SLOT_DECODING);
     s->st.live      = s->st.preparing + s->st.decoding;
+    s->st.held      = s->held != NULL;
     const uint32_t live = s->st.live;
     pthread_mutex_unlock(&s->stat_mu);
-    return drained && live == 0;
+    return drained && live == 0 && !s->held;
 }
 
 void mynah_slm_sched_run(mynah_slm_sched *s) {

@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 /* Unsent stream bytes past which a client counts as too slow and is
  * cancelled (MYNAH_SLM_STREAM_MAX_BYTES). The writer drains into the socket
@@ -41,6 +42,7 @@ typedef struct slots_req {
     char  *text; size_t text_used, text_cap;        /* non-stream answer */
     char  *tool; size_t tool_used, tool_cap;        /* tool channel */
     int    admitted, done, oom;
+    int    error_status;          /* written by the scheduler before `done` */
     mynah_slm_job_outcome outcome;
     char   error[192];
 
@@ -63,6 +65,10 @@ static struct {
     size_t          max_pending;
     mynah_slm_state ws;
     mynah_slm_seq  *seqs;           /* one per slot, pooled across requests */
+    uint8_t        *slot_live;      /* scheduler thread: the slot holds a request */
+    /* KV budget: bytes of cache every slot holds together (allocated). */
+    uint64_t        kv_budget, kv_per_pos;
+    atomic_ullong   kv_held;        /* for /health; the scheduler writes it */
     mynah_slm_jobq *q;
     mynah_slm_sched *sched;
     /* Requests in the system — queued or holding a slot — counted at
@@ -198,9 +204,49 @@ static int tool_cb(void *ctx, uint32_t id, const char *text, size_t len) {
     return rc;
 }
 
+/* KV bytes the slots hold right now (allocations, pooled or live). */
+static uint64_t kv_total(void) {
+    uint64_t t = 0;
+    for (uint32_t i = 0; i < S.n_slots; i++) t += mynah_slm_kv_bytes(&S.seqs[i].kv);
+    return t;
+}
+
+/* Would giving `slot` a cache of `need` positions keep every slot within the
+ * budget? Idle slots' pooled caches are given back first if that helps.
+ * 1 fits, 0 not now (others are live), -1 never (not even alone). */
+static int kv_fits(uint32_t slot, uint64_t need) {
+    const uint64_t want = need * S.kv_per_pos;
+    if (want > S.kv_budget) return -1;
+    const mynah_slm_seq *q = &S.seqs[slot];
+    const uint64_t mine = mynah_slm_kv_bytes(&q->kv);
+    if (q->n_ctx >= need && mine) return 1;               /* reused as it is */
+    if (kv_total() - mine + want <= S.kv_budget) return 1;
+    for (uint32_t i = 0; i < S.n_slots; i++)             /* idle pools first */
+        if (i != slot && !S.slot_live[i] && mynah_slm_kv_bytes(&S.seqs[i].kv))
+            mynah_slm_seq_free(&S.seqs[i]);
+    atomic_store(&S.kv_held, kv_total());
+    if (kv_total() - mine + want <= S.kv_budget) return 1;
+    return 0;
+}
+
 static int e_admit(void *ud, void *job, uint32_t slot) {
     (void)ud;
     slots_req *r = job;
+    if (r->p.n_prompt + 1 <= S.ctx_cap) {
+        uint64_t need = (uint64_t)r->p.n_prompt + r->p.max_new + 8;
+        if (need > S.ctx_cap) need = S.ctx_cap;
+        const int fit = kv_fits(slot, need);
+        if (fit == 0) return 1;           /* first in line until someone leaves */
+        if (fit < 0) {
+            snprintf(r->error, sizeof r->error,
+                     "this request needs %.1f MiB of KV cache (%llu positions); the server's "
+                     "KV budget is %.1f MiB: lower max_tokens or the prompt",
+                     (double)(need * S.kv_per_pos) / 1048576.0, (unsigned long long)need,
+                     (double)S.kv_budget / 1048576.0);
+            r->error_status = 503;
+            return -1;
+        }
+    }
     r->admitted_at = mynah_slm_now();
     mynah_slm_timing_reset(&r->tm);
     r->tm.n_threads = mynah_slm_threads_count();
@@ -217,8 +263,11 @@ static int e_admit(void *ud, void *job, uint32_t slot) {
     uint64_t need = (uint64_t)r->p.n_prompt + r->p.max_new + 8;
     if (need > S.ctx_cap) need = S.ctx_cap;
     if (mynah_slm_seq_reserve(&S.seqs[slot], S.model, (uint32_t)need, MYNAH_SLM_KV_BF16,
-                              MYNAH_SLM_KV_BF16, r->error, sizeof r->error) != 0)
+                              MYNAH_SLM_KV_BF16, r->error, sizeof r->error) != 0) {
+        atomic_store(&S.kv_held, kv_total());
         return -1;
+    }
+    atomic_store(&S.kv_held, kv_total());
     mynah_slm_timing_end_load(&r->tm);
 
     r->sam = mynah_slm_sampler_new(&r->p.sp, mynah_slm_vocab_size(S.model));
@@ -250,6 +299,7 @@ static int e_admit(void *ud, void *job, uint32_t slot) {
         return -1;
     }
     r->started = 1;
+    S.slot_live[slot] = 1;
 
     /* Admission is when the client hears back: its writer sends the SSE
      * header now, so TTFB means "you have a slot" (tts serving-design §7). */
@@ -298,6 +348,15 @@ static void e_retire(void *ud, void *job, uint32_t slot, mynah_slm_job_outcome h
     (void)ud;
     (void)slot;
     slots_req *r = job;
+    if (r->started && slot != MYNAH_SLM_SCHED_NO_SLOT) {
+        S.slot_live[slot] = 0;
+        /* A cache grown past this slot's fair share of the budget is given
+         * back now: one long request must not keep its peak for good. */
+        if (mynah_slm_kv_bytes(&S.seqs[slot].kv) > S.kv_budget / S.n_slots) {
+            mynah_slm_seq_free(&S.seqs[slot]);
+            atomic_store(&S.kv_held, kv_total());
+        }
+    }
     if (r->started) {
         mynah_slm_gen_finish(&r->gen);          /* flushes held bytes, ends the clock */
         if (how == MYNAH_SLM_JOB_CANCELLED) r->tm.cancelled = 1;
@@ -336,7 +395,7 @@ static void *sched_main(void *arg) {
 
 int slots_start(mynah_slm_model_t *m, const mynah_slm_tokenizer *tok,
                 uint32_t n_slots, uint32_t ctx_cap, uint32_t queue_cap,
-                char *err, size_t errsz) {
+                uint32_t kv_budget_mb, char *err, size_t errsz) {
     memset(&S, 0, sizeof S);
     pthread_mutex_init(&S.life_mu, NULL);
     pthread_cond_init(&S.life_cv, NULL);
@@ -353,6 +412,28 @@ int slots_start(mynah_slm_model_t *m, const mynah_slm_tokenizer *tok,
         return -1;
     S.ctx_cap = S.ws.ctx_cap;
     S.seqs = calloc(S.n_slots, sizeof *S.seqs);
+    S.slot_live = calloc(S.n_slots, 1);
+    {
+        /* Bytes per position, measured on a one-position cache rather than
+         * re-derived: whatever layout kvcache.c uses is what is counted. */
+        mynah_slm_seq probe;
+        memset(&probe, 0, sizeof probe);
+        if (mynah_slm_seq_init(&probe, m, 1, MYNAH_SLM_KV_BF16, MYNAH_SLM_KV_BF16, err, errsz) != 0)
+            return -1;
+        S.kv_per_pos = mynah_slm_kv_bytes(&probe.kv);
+        mynah_slm_seq_free(&probe);
+        const uint64_t one = (uint64_t)S.ctx_cap * S.kv_per_pos;
+        uint64_t b = (uint64_t)kv_budget_mb << 20;
+        if (!kv_budget_mb) {
+            b = one * S.n_slots;
+            const long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGESIZE);
+            if (pages > 0 && psz > 0 && b > (uint64_t)pages * (uint64_t)psz / 4)
+                b = (uint64_t)pages * (uint64_t)psz / 4;
+            if (b < one) b = one;
+        }
+        S.kv_budget = b;
+        atomic_init(&S.kv_held, 0);
+    }
     S.step_seqs = calloc(S.n_slots, sizeof *S.step_seqs);
     S.step_tok = calloc(S.n_slots, sizeof *S.step_tok);
     S.step_logits = calloc(S.n_slots, sizeof *S.step_logits);
@@ -364,7 +445,8 @@ int slots_start(mynah_slm_model_t *m, const mynah_slm_tokenizer *tok,
     /* The ring holds everything that may be in flight, so a push the
      * counter allowed can never fail on it. */
     S.q = mynah_slm_jobq_new(S.capacity);
-    if (!S.seqs || !S.step_seqs || !S.step_tok || !S.step_logits || !S.step_pick || !S.q) {
+    if (!S.seqs || !S.slot_live || !S.step_seqs || !S.step_tok || !S.step_logits ||
+        !S.step_pick || !S.q) {
         snprintf(err, errsz, "out of memory for %u slots", S.n_slots);
         return -1;
     }
@@ -379,9 +461,11 @@ int slots_start(mynah_slm_model_t *m, const mynah_slm_tokenizer *tok,
      * is what /health reports, so the dispatch that RAN is on record. */
     S.product = mynah_slm_decode_product_name();
     fprintf(stderr, "slots: %u | capacity %zu (slots + queue) | ctx %u | decode product %s | prefill slice %u "
-                    "tokens, %.0f ms per step while decoding, %u tokens when idle\n",
+                    "tokens, %.0f ms per step while decoding, %u tokens when idle | KV budget %.1f MiB "
+                    "(%.1f KiB per position)\n",
             S.n_slots, mynah_slm_jobq_cap(S.q), S.ctx_cap, S.product,
-            cfg.prefill_slice, cfg.prefill_budget_s * 1000.0, cfg.prefill_batch);
+            cfg.prefill_slice, cfg.prefill_budget_s * 1000.0, cfg.prefill_batch,
+            (double)S.kv_budget / 1048576.0, (double)S.kv_per_pos / 1024.0);
     if (pthread_create(&S.thread, NULL, sched_main, NULL) != 0) {
         snprintf(err, errsz, "cannot start the scheduler thread");
         return -1;
@@ -420,6 +504,7 @@ int slots_free(int wait_ms) {
     mynah_slm_sched_free(S.sched);
     mynah_slm_jobq_free(S.q);
     for (uint32_t i = 0; i < S.n_slots; i++) mynah_slm_seq_free(&S.seqs[i]);
+    free(S.slot_live);
     free(S.seqs); free(S.step_seqs); free(S.step_tok); free(S.step_logits); free(S.step_pick);
     mynah_slm_state_free(&S.ws);
     S.sched = NULL;
@@ -533,6 +618,7 @@ static int run_entered(http_conn *conn, const slots_params *p, slots_result *out
     out->client_gone = atomic_load(&r->gone);
     out->shutdown = atomic_load(&r->shutdown);
     out->stop = r->started ? (int)r->gen.stop : MYNAH_SLM_STOP_NONE;
+    out->error_status = r->error_status;
     if (r->oom && out->outcome == MYNAH_SLM_JOB_DONE) out->outcome = MYNAH_SLM_JOB_FAILED;
     snprintf(out->error, sizeof out->error, "%s", r->error);
     pthread_mutex_unlock(&r->mu);
@@ -577,10 +663,13 @@ static int health_entered(char *buf, size_t n) {
         "\"capacity\":%u,\"steps\":%llu,\"mean_batch\":%.2f,"
         "\"aggregate_decode_tok_s\":%.2f,\"recent_stream_decode_tok_s\":%.2f,"
         "\"slot_cancelled\":%llu,\"slot_failed\":%llu,\"slot_done\":%llu,"
-        "\"decode_product\":\"%s\"",
-        S.n_slots, st.live, st.preparing, st.decoding, mynah_slm_jobq_depth(S.q),
+        "\"decode_product\":\"%s\",\"kv_bytes\":%llu,\"kv_budget_bytes\":%llu,"
+        "\"kv_deferrals\":%llu",
+        S.n_slots, st.live, st.preparing, st.decoding, mynah_slm_jobq_depth(S.q) + st.held,
         S.capacity, (unsigned long long)st.steps,
         st.steps ? (double)st.step_rows / (double)st.steps : 0.0, agg, per,
         (unsigned long long)st.cancelled, (unsigned long long)st.failed,
-        (unsigned long long)st.done, S.product);
+        (unsigned long long)st.done, S.product,
+        (unsigned long long)atomic_load(&S.kv_held), (unsigned long long)S.kv_budget,
+        (unsigned long long)st.deferrals);
 }

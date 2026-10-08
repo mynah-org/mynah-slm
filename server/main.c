@@ -490,7 +490,8 @@ static void chat_slots(server_ctx *c, http_conn *conn, const uint32_t *ids, size
                 req_id, r.tm.t0_ == 0.0 ? "the queue" : r.tm.n_prompt ? "decode" : "prefill",
                 r.tm.n_gen, max_new, n_prompt, r.queue_ms);
     } else if (r.outcome != MYNAH_SLM_JOB_DONE) {
-        const int status = r.outcome == MYNAH_SLM_JOB_REFUSED ? 400 : 500;
+        const int status = r.error_status ? r.error_status
+                         : r.outcome == MYNAH_SLM_JOB_REFUSED ? 400 : 500;
         const char *msg = r.error[0] ? r.error : "generation failed";
         if (r.header_sent) {
             char esc[256], frame[512];
@@ -856,6 +857,9 @@ static void usage_text(FILE *f) {
         "  --slots N            continuous batching: N requests per decode step,\n"
         "                       one scheduler thread (default 1 = serialized)\n"
         "  --queue N            requests waiting for a slot before a 503 (default 2N)\n"
+        "  --kv-budget-mb N     KV cache all slots may hold together; a request that\n"
+        "                       would pass it waits, or gets 503 if it never fits\n"
+        "                       (default: slots x ctx, at most 1/4 of RAM)\n"
         "  --send-timeout-ms N  a client that stops reading is dropped (default 5000)\n"
         "  --probe-interval-ms N  liveness write period once a client's read side\n"
         "                       reached EOF (default 250)\n"
@@ -879,7 +883,7 @@ int main(int argc, char **argv) {
     const char *model_path = NULL, *host = "127.0.0.1";
     int port = 8080, n_ctx = 0, threads = 0;
     http_limits limits = { 0, 0, 0, 0, 0, 0, 0 };
-    int slots = 1, queue = 0, grace_ms = 0;
+    int slots = 1, queue = 0, grace_ms = 0, kv_budget_mb = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -892,6 +896,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--max-conns") && v)       { limits.max_conns = atoi(v); i++; }
         else if (!strcmp(a, "--slots") && v)           { slots = atoi(v); i++; }
         else if (!strcmp(a, "--queue") && v)           { queue = atoi(v); i++; }
+        else if (!strcmp(a, "--kv-budget-mb") && v)    { kv_budget_mb = atoi(v); i++; }
         else if (!strcmp(a, "--send-timeout-ms") && v) { limits.send_timeout_ms = atoi(v); i++; }
         else if (!strcmp(a, "--shutdown-grace-ms") && v) { grace_ms = atoi(v); i++; }
         else if (!strcmp(a, "--probe-interval-ms") && v) { limits.probe_interval_ms = atoi(v); i++; }
@@ -933,7 +938,8 @@ int main(int argc, char **argv) {
     ctx.slots = slots > 1 ? (uint32_t)slots : 1;
     if (ctx.slots > 1 &&
         slots_start(ctx.model, ctx.tok, ctx.slots, ctx.n_ctx,
-                    queue > 0 ? (uint32_t)queue : 0, err, sizeof err) != 0) {
+                    queue > 0 ? (uint32_t)queue : 0,
+                    kv_budget_mb > 0 ? (uint32_t)kv_budget_mb : 0, err, sizeof err) != 0) {
         fprintf(stderr, "mynah-slm-server: --slots %u: %s\n", ctx.slots, err);
         return 1;
     }

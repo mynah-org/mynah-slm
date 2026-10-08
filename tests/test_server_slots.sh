@@ -537,6 +537,72 @@ PY
 done
 fi
 
+if want 14; then
+# ── 14. one KV budget for every slot ──────────────────────────────────────────
+# Review R6: each slot's cache was sized per request and never shrank, with
+# no bound on the sum: N slots could each keep their largest request's cache
+# for good. The fixture's cache is 8 KiB a position (4 layers x 4 KV heads x
+# 128 x 2 x bf16), so --kv-budget-mb 2 is 256 positions:
+#   - a request needing 433 positions (25 + 400 + 8) can never fit: 503
+#   - two needing 183 each (25 + 150 + 8, 1.43 MiB) do not fit together:
+#     the second waits first in line and runs when the first is done
+#   - a 1.43 MiB cache is over the 1 MiB fair share (budget / 2 slots) and
+#     is given back when its request ends
+start "$TMP/kv.log" --slots 2 --kv-budget-mb 2
+python3 - "$PORT" > "$TMP/kv.out" 2>&1 <<'PY'
+import json, socket, sys, threading, time
+port = int(sys.argv[1])
+def health():
+    s = socket.create_connection(('127.0.0.1', port)); s.sendall(b'GET /health HTTP/1.1\r\n\r\n')
+    r = b''
+    while True:
+        c = s.recv(65536)
+        if not c: break
+        r += c
+    return json.loads(r.split(b'\r\n\r\n', 1)[1])
+def post(n, out, key):
+    b = json.dumps({'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': n, 'temperature': 0}).encode()
+    s = socket.create_connection(('127.0.0.1', port)); s.settimeout(120)
+    s.sendall(b'POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n' % len(b) + b)
+    r = b''
+    while True:
+        c = s.recv(65536)
+        if not c: break
+        r += c
+    out[key] = r.split(b'\r\n')[0].decode()
+out = {}
+post(400, out, 'huge')
+print('huge', out['huge'])
+ta = threading.Thread(target=post, args=(150, out, 'a')); tb = threading.Thread(target=post, args=(150, out, 'b'))
+ta.start(); time.sleep(0.3); tb.start()
+max_live = 0; max_kv = 0; budget = None; held = 0
+while ta.is_alive() or tb.is_alive():
+    h = health()
+    budget = h.get('kv_budget_bytes'); max_kv = max(max_kv, h.get('kv_bytes', 0))
+    max_live = max(max_live, h['live'])
+    if h['live'] == 1 and h['queued'] == 1: held = 1
+    time.sleep(0.05)
+ta.join(); tb.join()
+time.sleep(0.2)
+h = health()
+print('pair', out['a'], '|', out['b'], 'max_live', max_live, 'waited', held)
+print('kv max', max_kv, 'budget', budget, 'after', h.get('kv_bytes'))
+PY
+stop
+grep -q "^huge HTTP/1.1 503" "$TMP/kv.out" && ok "a request whose KV could never fit the budget gets 503" \
+    || bad "a request past the KV budget is refused" "$(grep huge "$TMP/kv.out")"
+grep -q "^pair HTTP/1.1 200 OK | HTTP/1.1 200 OK max_live 1 waited 1" "$TMP/kv.out" \
+    && ok "two that do not fit together run one after the other, both 200" \
+    || bad "the KV budget serializes requests that do not fit together" "$(grep pair "$TMP/kv.out")"
+python3 - "$TMP/kv.out" <<'PY' && ok "the slots never held more KV than the budget, and gave the peak back ($(grep '^kv' "$TMP/kv.out"))" \
+    || bad "KV held stays within the budget and shrinks after" "$(grep '^kv' "$TMP/kv.out")"
+import sys
+f = [l.split() for l in open(sys.argv[1]) if l.startswith('kv')][0]
+mx, budget, after = int(f[2]), f[4], f[6]
+sys.exit(0 if budget != 'None' and 0 < mx <= int(budget) and after != 'None' and int(after) <= int(budget) // 2 else 1)
+PY
+fi
+
 if grep -l "Sanitizer" "$TMP"/*.log >/dev/null 2>&1; then
     bad "no sanitizer report in any server log" "$(grep -h -A3 Sanitizer "$TMP"/*.log | head -12)"
 fi

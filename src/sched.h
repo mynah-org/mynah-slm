@@ -64,7 +64,11 @@ typedef enum {
 typedef struct {
     void *ud;
     /* Build the job's per-request state in slot `slot` (reserve its KV, start
-     * its clock). 0, or -1 to refuse it (it is then retired REFUSED). */
+     * its clock). 0; -1 to refuse it (it is then retired REFUSED); or 1 =
+     * NOT NOW (it does not fit a resource bound while others are live): the
+     * job stays first in line, nothing else is admitted before it, and it
+     * is offered again at the next iteration. A "not now" with nothing live
+     * could never be satisfied and is turned into a refusal. */
     int  (*admit)(void *ud, void *job, uint32_t slot);
     /* At most `budget` more prompt tokens (0 = all). 1 = prompt done,
      * 0 = more remains, -1 = failed. */
@@ -114,6 +118,9 @@ typedef struct {
     uint64_t step_rows;                  /* sum of batch widths: mean width = rows / steps */
     uint64_t prefill_slices, isolations;
     uint64_t admitted, done, failed, cancelled, refused;
+    uint32_t held;                       /* 1 when a job waits first in line
+                                            after admit said "not now" */
+    uint64_t deferrals;                  /* "not now" answers */
 } mynah_slm_sched_stats;
 
 typedef struct mynah_slm_sched mynah_slm_sched;

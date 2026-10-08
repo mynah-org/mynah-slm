@@ -59,15 +59,26 @@ typedef struct {
     int    client_gone;
     int    shutdown;        /* cancelled because the server is stopping */
     int    stop;            /* mynah_slm_stop: why the generation ended */
+    int    error_status;    /* HTTP status for a refusal/failure (0 = default) */
     char   error[192];      /* why it was refused or failed */
 } slots_result;
 
 /* Loads nothing: takes the loaded model and tokenizer, builds the workspace
  * for `ctx_cap` positions and `n_slots` sequences, and starts the scheduler
- * thread. queue_cap bounds the requests waiting for a slot. 0 or -1. */
+ * thread. queue_cap bounds the requests waiting for a slot. 0 or -1.
+ *
+ * kv_budget_mb bounds the KV cache ALL slots hold together (allocated, not
+ * used: a pooled slot keeps its cache between requests). A request whose
+ * cache would pass it waits first in line while others run, and is refused
+ * (503) if it could not fit even alone. A slot whose cache grew past its
+ * fair share (budget / slots) gives it back when its request ends.
+ * 0 = default: slots x ctx positions, capped at a quarter of physical
+ * memory, never below one full-context request. Per position the cache is
+ * 2 (K, V) x layers x kv_heads x head_dim x 2 bytes (bf16): 112 KiB for a
+ * 0.6B Qwen3 (28 x 8 x 128), so --slots 4 --ctx 8192 is 3.5 GiB at most. */
 int  slots_start(mynah_slm_model_t *m, const mynah_slm_tokenizer *tok,
                  uint32_t n_slots, uint32_t ctx_cap, uint32_t queue_cap,
-                 char *err, size_t errsz);
+                 uint32_t kv_budget_mb, char *err, size_t errsz);
 
 /* Shutdown, in two calls, because connection threads are detached and may
  * still be inside slots_run / slots_health when the accept loop returns:

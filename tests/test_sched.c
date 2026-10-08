@@ -37,6 +37,8 @@ typedef struct {
     int max_steps;       /* finishes (status 0) after this many steps */
     int poison;          /* fails every step, alone or not */
     int cancel_at;       /* the client leaves once this many tokens are prefilled */
+    int big;             /* admit() says "not now": 1 while anything else is
+                            live, 2 always (it can never fit) */
     int refuse;          /* admit() refuses it */
     atomic_int cancel;   /* the client left */
 
@@ -76,6 +78,7 @@ static void logev(fake *f, char k, int who, int arg) {
 static int f_admit(void *ud, void *j_, uint32_t slot) {
     fake *f = ud; job *j = j_;
     if (j->refuse) return -1;
+    if ((j->big == 1 && f->live > 0) || j->big == 2) return 1;
     j->admitted_slot = (int)slot;
     j->admit_iter = f->iter;
     j->first_step_iter = -1;
@@ -432,6 +435,60 @@ static void t_admit_mid_prefill(void) {
     mynah_slm_jobq_free(q);
 }
 
+/* admit() answering "not now" (the server's KV budget): the job waits FIRST
+ * in line — nothing overtakes it, a free slot notwithstanding — and is
+ * admitted once the live job leaves. With nothing live it is refused, since
+ * nothing could ever make room. Review R6. */
+static void t_not_now(void) {
+    printf("\n-- admission: \"not now\" keeps the job first in line --\n");
+    fake f = { .cost_token = 0.001, .cost_step = 0.01 };
+    mynah_slm_jobq *q = mynah_slm_jobq_new(8);
+    mynah_slm_sched_engine e = engine_for(&f);
+    mynah_slm_sched_cfg cfg = { 3, 32, 0.040, 0 };
+    mynah_slm_sched *s = mynah_slm_sched_new(&cfg, &e, q);
+    job a, big, c;
+    job_init(&a, 0, 1, 4);
+    job_init(&big, 1, 1, 2);
+    big.big = 1;
+    job_init(&c, 2, 1, 2);
+    mynah_slm_jobq_push(q, &a);
+    mynah_slm_jobq_push(q, &big);
+    mynah_slm_jobq_push(q, &c);
+    f.iter++; mynah_slm_sched_iterate(s, 0);
+    mynah_slm_sched_stats st;
+    mynah_slm_sched_get_stats(s, &st);
+    char d[200];
+    snprintf(d, sizeof d, "big admitted %d, c admitted %d, held %u, deferrals %llu, queue %zu",
+             big.admitted_slot, c.admitted_slot, st.held, (unsigned long long)st.deferrals,
+             mynah_slm_jobq_depth(q));
+    check("a job told \"not now\" waits first in line; nothing overtakes it",
+          big.admitted_slot < 0 && c.admitted_slot < 0 && st.held == 1 && !big.retired, d);
+    run_until_done(s, &f, &a, 1, 20);
+    for (int i = 0; i < 4; i++) { f.iter++; mynah_slm_sched_iterate(s, 0); }
+    snprintf(d, sizeof d, "a retired %d, big admitted at %ld (outcome %d), c admitted at %ld",
+             a.retired, big.admit_iter, (int)big.outcome, c.admit_iter);
+    check("... and is admitted once the live job left, before the one behind it",
+          a.retired == 1 && big.admitted_slot >= 0 && c.admitted_slot >= 0 &&
+          big.admit_iter <= c.admit_iter && big.admit_iter >= a.retire_iter, d);
+    /* nothing live: "not now" can never come true -> refused */
+    for (int i = 0; i < 10 && !(big.retired && c.retired); i++) { f.iter++; mynah_slm_sched_iterate(s, 0); }
+    job lone;
+    job_init(&lone, 3, 1, 2);
+    lone.big = 2;
+    job other;
+    job_init(&other, 4, 1, 2);
+    mynah_slm_jobq_push(q, &lone);
+    mynah_slm_jobq_push(q, &other);
+    f.iter++; mynah_slm_sched_iterate(s, 0);
+    snprintf(d, sizeof d, "lone retired %d outcome %d", lone.retired, (int)lone.outcome);
+    check("with nothing live it never could fit: refused, not parked forever",
+          lone.retired == 1 && lone.outcome == MYNAH_SLM_JOB_REFUSED, d);
+    mynah_slm_jobq_close(q);
+    mynah_slm_sched_run(s);
+    mynah_slm_sched_free(s);
+    mynah_slm_jobq_free(q);
+}
+
 static void t_cancel_and_isolation(void) {
     printf("\n-- cancellation and isolation --\n");
     fake f = { .cost_token = 0.001, .cost_step = 0.01 };
@@ -673,6 +730,7 @@ int main(void) {
     t_prefill_turns_decoder();
     t_idle_full_batch();
     t_admit_mid_prefill();
+    t_not_now();
     t_cancel_and_isolation();
     t_queued_ghosts();
     t_queue_bound();
