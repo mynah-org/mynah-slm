@@ -351,7 +351,8 @@ confirmed by reading `server/main.c` / `server/http.c` at `2f9977b`):
   (`POLLIN | POLLRDHUP` on Linux), and a one-byte `MSG_PEEK | MSG_DONTWAIT`
   when readable — EOF is gone, a pipelined byte is not. Sticky, and set too by
   a failed or timed-out send. ~1 µs; asked once per step, so free against a
-  10-60 ms step.
+  10-60 ms step. **Superseded by review R2** (below): an EOF alone is no
+  longer "gone"; a write resolves it.
 - `mynah_slm_gen_params.cancel`: polled before every prefill batch and every
   decode step, on every channel; stop = `CANCELLED`, `timing.cancelled = 1`
   (the CLI summary line says `CANCELLED`). generate() returns the tokens it
@@ -396,8 +397,8 @@ stream and non-stream, then an 8-token request within 3x its solo time + 2 s,
 a second request's `ttft_ms` equal to its value on an idle server.
 
 **Not covered**: the hybrid short-conv path (same hook, no fixture); a client
-that half-closes its write side but keeps reading (POLLRDHUP calls it gone —
-HTTP/1.1 clients do not do that, and tts made the same call); prefill
+that half-closes its write side but keeps reading (POLLRDHUP called it gone —
+which the review found real clients DO do: fixed by R2 below); prefill
 cancellation granularity is one batch, so a 256-token batch on a large model
 can still run ~1 s after the client left.
 
@@ -507,6 +508,67 @@ against TTFT and inter-token gaps on a real checkpoint before changing it.
 finish reason, final SSE frames or the JSON body) is one function,
 `send_completion`, used by both modes; the slot path's usage carries the same
 members plus `queue_ms` and `slots`.
+
+### Review findings and fixes (adversarial review of S1, 2026-10-08)
+
+An adversarial review of S1 (reproducers on the "slow" fixture, Python + C)
+found four bugs (B), seven risks (R) and a set of nits. Each is fixed in its
+own commit, with a regression test that was run against the parent commit
+first and FAILED there (the commit bodies record how). Server cases live in
+`tests/test_server_slots.sh` as self-contained sections: `ONLY="7 8"` runs a
+subset; the whole script runs in `make test-server-slots`.
+
+| finding | fix | commit | regression test (failed on the parent) |
+|---|---|---|---|
+| B4 prefill budget decided once per pass: a job that started decoding mid-pass waited for every other prompt (1.8 s in the reproducer) | the pass stops when a prompt completes in an uncapped pass; the new decoder steps in the same iteration | `20b54a1` | `test_sched` t_prefill_turns_decoder |
+| B1 use-after-free at shutdown (`--slots N`): the queue and scheduler were freed under live connection threads | `slots_shutdown` (mark STOPPING under a lock, close, join) and `slots_free` (only once no thread is inside); late requests and /health get 503 | `074a29b` | section 7, ASan: heap-use-after-free in `jobq_push` before |
+| R1 SIGTERM drained every admitted and queued job to max_tokens | queued requests 503 at once, live ones stop at their next step with an SSE `server_shutdown` error event (or 503); `--shutdown-grace-ms` | `ea42b13` | section 8: exit in 0.2 s, 3/3 final answers (was 30 s / none, and > 200 s) |
+| B2 clients that left while queued kept their place and capacity: live clients got 503 behind ghosts | the writer probes while queued; every scheduler iteration takes cancelled jobs out of the queue (`jobq_remove_if`) | `e4beb46` | `test_sched` t_queued_ghosts; section 9 |
+| B3 a full context failed the step: 500 and lost output in slots mode; no mode ever said `length` | `gen_params.n_ctx`: a full cache is a LENGTH stop before stepping; `finish_reason` is `length` for max_tokens or context | `16a882d` | section 10; `test_synth` full-context case |
+| R2 POLLRDHUP/EOF counted as gone: a half-closing client got no answer in either mode | gone = write error or POLLERR/POLLHUP; an EOF is resolved by `http_keepalive` (start the response, then an SSE comment or a JSON-whitespace byte every `--probe-interval-ms`) | `189b723` | section 11; `test_http` half-close and FIN cases |
+| R3 slowloris: SO_RCVTIMEO bounds one recv, not a request | absolute deadlines: headers `--header-timeout-ms` (10 s), body `--body-timeout-ms` (30 s), then 408 | `181baee` | section 12 |
+| R4 a stream client that stops reading was never cancelled (autotuned send buffer) | the acknowledged byte count (sent - SIOCOUTQ) must move within the send timeout; stream SO_SNDBUF capped at 64 KiB (`--stream-sndbuf-kb`) | `366781d` | section 13: cancelled after 3.6 / 3.9 s (was never in 20 s) |
+| R5 32-token slices with nobody decoding: TTFT 2.6x | `prefill_batch` (the workspace's batch width) while nobody decodes, cancellation still asked per slice | `c3cce54` | `test_sched` t_idle_full_batch; TTFT 2500 -> 733 ms median (serialized 746), noisy VM |
+| R7 head-of-line admission during a long uncapped prefill | a non-blocking admission pass after every prefill slice | `3e239a7` | `test_sched` t_admit_mid_prefill; SSE header 3.7-4.3 s -> 0.25-0.95 s |
+| R6 KV per slot unbounded, never shrank | one budget for every slot's cache (`--kv-budget-mb`, default slots x ctx capped at 1/4 of RAM); over it a request waits first in line ("not now") or gets 503; a slot over its fair share gives its cache back | `2398c64` | section 14; `test_sched` t_not_now |
+| NITs: max_tokens validation, prompt > ctx, OOM -> 503, 5xx error types, Content-Length as a header name, truncated body -> 400 | validated before dispatch, the same in both modes | `280620f` | section 15 (14 failures on the parent) |
+| NITs: realloc in the token loop, `aggregate_decode_tok_s` math, `sched_free` on an uninitialized mutex | buffers sized at arrival (counted: `/health.token_loop_allocs`); tokens over summed step time; mutex initialized first | `7310a9e` | section 16; control with the preallocation reverted counts 6 / 1 |
+
+**KV arithmetic (R6).** Per position, bf16: 2 (K, V) x layers x kv_heads x
+head_dim x 2 bytes. Qwen3-0.6B: 2 x 28 x 8 x 128 x 2 = 114688 B = 112 KiB, so
+one 8192-position context is 896 MiB and `--slots 4 --ctx 8192` at most
+3.5 GiB. The slow fixture: 2 x 4 x 4 x 128 x 2 = 8 KiB. The server measures it
+on a one-position cache at start and prints it.
+
+**Latency bounds that changed.**
+
+- A client that closes (FIN) is no longer "gone" at the first probe: the
+  probe sees an EOF, the response is started (that write is the question),
+  and the reset it provokes is seen by the next probe — one decode step, one
+  prefill batch, or the slot writer's next 50 ms wake later than before.
+  `test_server_cancel.sh` still passes unchanged (its "next request after a
+  client left" checks: 0.4-1.2 s on a loaded VM).
+- A non-stream client whose read side hit EOF has its 200 committed early; a
+  failure after that arrives as a JSON error object in a 200 body.
+- A lone prompt's cancellation granularity is one full batch (256 tokens by
+  default) instead of one 32-token slice — the serialized path's granularity.
+- A stopped reader: time to fill its receive window + the send timeout.
+- Shutdown: one step or one prefill slice after `--shutdown-grace-ms`, plus
+  the accept loop's 1 s poll; a connection still reading its request is
+  waited for up to its header deadline.
+
+**Sanitizers.** ASan+UBSan and TSan servers through every section of
+`test_server_slots.sh` and `test_server_cancel.sh` at `7310a9e`: no report.
+Timing checks fail under TSan's ~10x slowdown, as before. Under ASan one did
+too: section 5 counted capacity while section 4's departed streams were
+still being noticed (one more write + reset since R2), so 3 of its 6
+requests were refused; the section now waits for `live` 0 first (`b58f8b6`),
+and passes under ASan.
+
+**Still open.** Every number above is on the noise fixture (cloud VM, load ~5
+from other tenants); none is a claim about a real checkpoint. Real EOS
+(`finish_reason` "stop") is never sampled by the fixture. macOS has no
+SIOCOUTQ (the capped send buffer and SO_SNDTIMEO are the bound there).
 
 ## Conclusion
 
