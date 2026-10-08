@@ -149,6 +149,10 @@ echo "     (3 long streams still decoding: $B)"
 spawn_wait
 
 # ── 5. slots full and queue full: 503 + Retry-After, at once ──────────────────
+# The streams of section 4 have just been closed by their clients; a closed
+# client is noticed when a write to it is answered with a reset (review R2),
+# so give the server a moment to free their slots before counting capacity.
+for _ in $(seq 50); do [ "$(health "['live']")" = 0 ] && break; sleep 0.1; done
 for i in 1 2 3 4 5 6; do
     curl -s --max-time 6 -o /dev/null -X POST "localhost:$PORT/v1/chat/completions" \
         -H 'Content-Type: application/json' -d "$(body 4000 0 "${PROMPTS[$((i % 4))]}")" &
