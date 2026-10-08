@@ -106,6 +106,8 @@ help:
 	@echo "  test-parity  C forward pass vs the numpy oracle, stage by stage"
 	@echo "  test-server  end-to-end HTTP checks (needs a minute of generation)"
 	@echo "  bench        per-tensor matvec throughput"
+	@echo "  cuda         opt-in CUDA build in build/cuda/ (CUDA_ARCH=sm_89; needs nvcc)"
+	@echo "  cuda-test    build and run the CUDA self-test (skips without a device)"
 	@echo "  check-x86    cross-compile the AVX2 paths"
 	@echo "  test-x86-rosetta  build x86_64 and RUN the suite under Rosetta"
 	@echo "  golden-dump  regenerate the oracle's reference activations"
@@ -207,6 +209,69 @@ golden-dump:
 	@mkdir -p $(GOLDEN_DIR)
 	cd tools && uv run python -m oracle.generate ../$(MODEL) \
 	  --prompt "$(PROMPT)" --dump-dir ../$(GOLDEN_DIR) -n 1
+
+# ── CUDA, opt-in ───────────────────────────────────────────────────────────
+# The default build never needs nvcc and never sees gpu/. `make cuda` builds a
+# SEPARATE tree, build/cuda/: every C source again with -DMYNAH_SLM_ENABLE_CUDA
+# (which is what lets src/backend.c reach the CUDA backend at all), plus the
+# .cu files through nvcc, linked by nvcc so the CUDA runtime comes from the
+# toolkit and no -lcuda driver library is named. Structure from mynah-tts
+# Makefile:836-922.
+#
+#   make cuda CUDA_ARCH=sm_89     the CLI and the self-test binary
+#   make cuda-test                build and run the self-test (77 = no device)
+#
+# CUDA_ARCH defaults to `native`, which asks the installed GPU — so on a
+# machine without one (every CI runner) it must be named. It is part of the
+# object ABI and goes through a stamp file: switching sm_80 -> sm_89 rebuilds
+# the .cu objects instead of silently relinking the old cubin.
+NVCC      ?= nvcc
+CUDA_ARCH ?= native
+NVCCFLAGS ?= -O2 -std=c++17
+CUDA_BUILD := build/cuda
+ifeq ($(CUDA_ARCH),native)
+  CUDA_ARCH_FLAGS := -arch=native
+else
+  CUDA_ARCH_FLAGS := -arch=$(CUDA_ARCH)
+endif
+CUDA_HDR        := $(HDR) $(wildcard gpu/cuda/*.h)
+CUDA_CU_OBJ     := $(patsubst %.cu,$(CUDA_BUILD)/%.o,$(wildcard gpu/cuda/*.cu))
+CUDA_SRC_OBJ    := $(SRC:%.c=$(CUDA_BUILD)/%.o)
+CUDA_TEST_OBJ   := $(CUDA_BUILD)/gpu/cuda/self_test.o $(CUDA_BUILD)/gpu/cuda/test_cuda.o
+CUDA_ARCH_STAMP := $(CUDA_BUILD)/.cuda-arch
+
+$(CUDA_BUILD)/%.o: %.c $(CUDA_HDR)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -DMYNAH_SLM_ENABLE_CUDA -iquote gpu/cuda -c $< -o $@
+
+$(CUDA_BUILD)/gpu/cuda/%.o: gpu/cuda/%.cu $(CUDA_HDR) $(CUDA_ARCH_STAMP)
+	@mkdir -p $(@D)
+	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc is required for make cuda; install the NVIDIA CUDA toolkit" >&2; exit 2; }
+	$(NVCC) $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) -Isrc -Igpu/cuda -I$(INGOT_DIR)/include -Iinclude \
+	  -Xcompiler -Wall,-Wextra,-fPIC -c $< -o $@
+
+.PHONY: cuda-arch-stamp-force
+cuda-arch-stamp-force:
+$(CUDA_ARCH_STAMP): cuda-arch-stamp-force
+	@mkdir -p $(@D)
+	@if test ! -f "$@" || ! grep -Fqx '$(CUDA_ARCH)' "$@"; then printf '%s\n' '$(CUDA_ARCH)' > "$@"; fi
+
+$(CUDA_SRC_OBJ) $(CUDA_TEST_OBJ) $(CUDA_BUILD)/cli/main.o: | $(INGOT_LIB)
+
+$(CUDA_BUILD)/mynah-slm: $(CUDA_SRC_OBJ) $(CUDA_BUILD)/cli/main.o $(CUDA_CU_OBJ) $(INGOT_LIB)
+	$(NVCC) $(CUDA_ARCH_FLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
+
+$(CUDA_BUILD)/test_cuda: $(CUDA_SRC_OBJ) $(CUDA_TEST_OBJ) $(CUDA_CU_OBJ) $(INGOT_LIB)
+	$(NVCC) $(CUDA_ARCH_FLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
+
+cuda: $(CUDA_BUILD)/mynah-slm $(CUDA_BUILD)/test_cuda
+	@echo "CUDA build ready ($(CUDA_ARCH)): $(CUDA_BUILD)/mynah-slm $(CUDA_BUILD)/test_cuda"
+
+# Every CUDA kernel against the CPU backend (gpu/cuda/self_test.c). Without a
+# device it says so and skips, like the model-backed tests do.
+cuda-test: $(CUDA_BUILD)/test_cuda
+	@$(CUDA_BUILD)/test_cuda; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP cuda-test: no CUDA device"; exit 0; else exit $$rc; fi
 
 # ── x86, from an arm64 laptop ──────────────────────────────────────────────
 # The AVX2 paths in src/qmat.c, src/kvcache.c and src/kernels.c would otherwise
@@ -354,4 +419,4 @@ dist: mynah-slm mynah-slm-server libmynah_slm.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all help lib shared test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot
+.PHONY: all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot

@@ -241,10 +241,79 @@ What ran, `make test` with 4 pool threads, OpenBLAS and `BLAS=none`:
 No existing code path changed: nothing outside the new files calls the
 backend yet.
 
+### G1-b — the CUDA backend behind `make cuda` (2026-10-08, cloud VM, NO GPU)
+
+Toolchain: Ubuntu 24.04 `nvidia-cuda-toolkit` **12.0.140** (apt, ~4 GB),
+host compiler gcc 12 via the packaged nvcc profile. No device, no driver.
+
+Files, all under `gpu/cuda/`, none compiled by the default build:
+
+- `kernels_cuda.{h,cu}` — the Qwen3 kernels listed in the Plan table: GEMV
+  (warp per row, tokens on grid.y for a correct-but-slow matmat) and block
+  decode for F32 / Q8_0 / Q4_K / Q6_K, RMSNorm (block per row, f32 tree),
+  QK-RMSNorm (warp per head), RoPE (NeoX and interleaved, table built by the
+  CPU's `mynah_slm_rope_init` and uploaded), SwiGLU (stable sigmoid), add,
+  add_scaled, bf16 KV append (the integer RNE of `kvcache.c`), GQA attention
+  over bf16 KV templated on head_dim 64/128/256 (block per (q head, query
+  row), 4 warps split positions, online softmax, fixed-order merge), argmax
+  (one block, first index). The block decode, f16 decode, bf16 rounding and
+  RoPE pair rotation are `__host__ __device__` so the host can run them.
+- `backend_cuda.cu` — lifecycle (device count, `MYNAH_SLM_CUDA_DEVICE`, one
+  non-blocking stream, pinned 4-byte argmax slot, a 4096-id token buffer
+  sized at open), `ce()` with the allocation-record clear, weight upload by
+  handle (`cudaMalloc` + one synchronous copy at load), the vtable. KV is bf16
+  only; f32/q8/fp8 and head_dim outside 64/128/256 return **1**.
+- `self_test.c` (C, through `src/backend.h` on BOTH sides) —
+  `mynah_slm_cuda_self_test()`: every op vs the CPU backend at Qwen3 shapes
+  (1024 / 3072 wide Q4_K both ways, a 4096 x 1024 Q6_K LM-head slab, 16/8 x 128
+  GQA over 200 positions decode + causal batch of 8, MQA 8/1 x 64, 8/2 x 256,
+  argmax over 151936 with a planted tie, the three refusals). Tolerances as in
+  the Plan table. Returns 77 with "no CUDA device" when there is none.
+- `test_cuda.c` — `make cuda-test`: host check, then device self-test.
+
+What ran here:
+
+- `make cuda CUDA_ARCH=sm_80`, `sm_89`, `sm_90`, with OpenBLAS and with
+  `BLAS=none`: **compile and link**. The arch stamp rebuilds the `.cu`
+  objects on a switch. Both `.cu` files also compile with
+  `-Werror all-warnings -Xcompiler -Wall,-Wextra,-Werror`. The only link
+  output is nvlink's harmless "Skipping incompatible libpthread.a" (it scans
+  `-l` libraries for device code).
+- **Host check** (`mynah_slm_cuda_host_check`, executes the device helpers on
+  the CPU): f16 decode of all 65536 halves == `ingot_f16_to_f32`; `dq<F32,
+  Q8_0, Q4_K, Q6_K>` over 4 x 1024 == `ingot_dequant_matrix`; bf16 RNE ==
+  `mynah_slm_kv_roundtrip` on 4096 values incl. two exact ties; NeoX and
+  interleaved `rope_pair` over every pair == `mynah_slm_rope_apply` at
+  positions 1000..1002 — **all bitwise (err 0)**.
+- **Mutation check:** shifting Q6_K quad 1's high bits by 4 instead of 2, and
+  reading Q4_K's packed min from the wrong nibble, fail the host check (err
+  4.5 and 0.406); reverted and re-passed.
+- `build/cuda/test_cuda` without a device: prints the host results, then
+  "SKIP cuda self-test: no CUDA device: no CUDA-capable device is detected",
+  exit 77; `make cuda-test` reports SKIP and exits 0. No crash.
+
+What did NOT run: **every device kernel**. The warp reductions, the online
+softmax and its merge, the launch geometry, the stream ordering and the
+`ce()` paths are compiled, not executed. The device self-test is written and
+linked and is the first thing to run on a GPU.
+
 ## Conclusion
 
-(Open.)
+G1-a: **KEEP** — the boundary exists, the CPU side of it is the engine's own
+arithmetic to the bit, and nothing routes through it yet.
+G1-b: **INCONCLUSIVE** until `make cuda-test` runs on a GPU. Compile/link on
+three architectures and the bitwise host half are real evidence for the
+layouts; none of it is evidence that a kernel launches or that a warp
+reduction is right.
 
 ## Next action
 
-G1-b: `gpu/cuda/` behind `make cuda`, and `make cuda-test`.
+1. On an L4 or L40S: `make cuda-test CUDA_ARCH=sm_89` (expect every line `ok`);
+   then `compute-sanitizer --tool memcheck build/cuda/test_cuda` and
+   `--tool racecheck` (the attention merge and the norm reduction use shared
+   memory).
+2. Only then the integration in the Plan above, behind `--device cuda`, with
+   `tests/test_parity` stage dumps as its gate.
+3. Speed work (GEMV with lanes per block and hoisted scales; a dequant-strip +
+   cuBLASLt prefill product; graphs per width bucket) each as its own A/B
+   against this correct-first version, with nsys proving the kernel ran.
