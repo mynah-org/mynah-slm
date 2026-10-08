@@ -10,6 +10,8 @@
 #include "ingot/quant.h"
 
 #include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,19 +20,55 @@
  * file is the API, the activation prep and the dispatch through the table
  * src/isa.c resolved (kern.h). */
 
-static int g_own = -1;      /* -1 = not resolved yet */
+/* The three switches below come from the environment, read ONCE: getenv in a
+ * matvec called ~200 times per token would be its own measurement problem.
+ *
+ * Once means pthread_once, not "if (g < 0) g = ...": the first matvec of a
+ * process can run inside the pool's workers, and several of them resolving
+ * the same plain int at once is a data race (ThreadSanitizer reported it,
+ * review R2) — benign in practice, undefined in C. After the once, the values
+ * are relaxed atomics: the setters below exist for tests and benches that
+ * flip a switch between calls, with the pool idle, and a relaxed load is a
+ * plain load on every target we build. */
+enum { INT8_Q4_K = 1, INT8_Q8_0 = 2, INT8_Q6_K = 4, INT8_ALL = 7 };
 
-static int use_own_kernels(void) {
-    /* Read once. getenv in a matvec called ~200 times per token would be its
-     * own measurement problem. */
-    if (g_own < 0) {
-        const char *e = getenv("MYNAH_SLM_KERNELS");
-        g_own = (e && strcmp(e, "ingot") == 0) ? 0 : 1;
-    }
-    return g_own;
+static pthread_once_t g_env_once = PTHREAD_ONCE_INIT;
+static _Atomic int g_own = 1;           /* our kernels (0: MYNAH_SLM_KERNELS=ingot) */
+static _Atomic int g_int8 = 0;          /* int8 requested (MYNAH_SLM_INT8 / --fast) */
+static _Atomic int g_int8_types = INT8_ALL;
+
+static int parse_int8_types(const char *e);
+
+static void env_init(void) {
+    const char *e = getenv("MYNAH_SLM_KERNELS");
+    atomic_store_explicit(&g_own, (e && strcmp(e, "ingot") == 0) ? 0 : 1,
+                          memory_order_relaxed);
+    /* Off unless asked for. It trades accuracy for speed, and a default that
+     * quietly does that is how a quantization claim stops meaning anything.
+     * `mynah-slm ppl` is what decides, not this. */
+    e = getenv("MYNAH_SLM_INT8");
+    atomic_store_explicit(&g_int8, (e && strcmp(e, "0") != 0) ? 1 : 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&g_int8_types, parse_int8_types(getenv("MYNAH_SLM_INT8_TYPES")),
+                          memory_order_relaxed);
 }
 
-void mynah_slm_matvec_set_enabled(int on) { g_own = on ? 1 : 0; }
+static void env_resolve(void) { pthread_once(&g_env_once, env_init); }
+
+static int env_get(_Atomic int *v) {
+    env_resolve();
+    return atomic_load_explicit(v, memory_order_relaxed);
+}
+
+/* A setter resolves first, so a later lazy init cannot overwrite it. */
+static void env_set(_Atomic int *v, int value) {
+    env_resolve();
+    atomic_store_explicit(v, value, memory_order_relaxed);
+}
+
+static int use_own_kernels(void) { return env_get(&g_own); }
+
+void mynah_slm_matvec_set_enabled(int on) { env_set(&g_own, on ? 1 : 0); }
 
 /* Every kernel exists in a vector form per ISA and a scalar reference. The
  * scalar one is not a fallback nobody runs — it is the definition the others
@@ -41,37 +79,33 @@ void mynah_slm_matvec_set_enabled(int on) { g_own = on ? 1 : 0; }
  * test-x86-rosetta` builds the suite as x86_64 and RUNS it under Rosetta.
  * `mynah-slm --dispatch` says which tables actually resolved. */
 
-static int g_int8 = -1;
-
 /* Requested (MYNAH_SLM_INT8 / --fast) AND the resolved ISA has vector int8
  * kernels. On a CPU without them the request is not honoured, and
  * `--dispatch` says so: int8 through a scalar twin would be slower than the
  * f32 path it replaces. */
 int mynah_slm_matvec_int8_enabled(void) {
-    if (g_int8 < 0) {
-        /* Off unless asked for. It trades accuracy for speed, and a default
-         * that quietly does that is how a quantization claim stops meaning
-         * anything. `mynah-slm ppl` is what decides, not this. */
-        const char *e = getenv("MYNAH_SLM_INT8");
-        g_int8 = (e && strcmp(e, "0") != 0) ? 1 : 0;
-    }
-    return g_int8 && mynah_slm_kern_qmat()->int8;
+    return env_get(&g_int8) && mynah_slm_kern_qmat()->int8;
 }
 
-int mynah_slm_matvec_int8_requested(void) {
-    (void)mynah_slm_matvec_int8_enabled();
-    return g_int8 > 0;
-}
+int mynah_slm_matvec_int8_requested(void) { return env_get(&g_int8) > 0; }
 
-void mynah_slm_matvec_set_int8(int on) { g_int8 = on ? 1 : 0; }
+void mynah_slm_matvec_set_int8(int on) { env_set(&g_int8, on ? 1 : 0); }
 
 /* Which types the int8 switch applies to: MYNAH_SLM_INT8_TYPES, a comma list
  * of q4_k / q8_0 / q6_k, default all three. It can only NARROW the switch,
  * never turn int8 on by itself. It exists so the perplexity gate can price
  * each type on ONE binary — the Q6_K head in front of the softmax is a
  * different quality question from the Q4_K layers (.work/int8-q8_0-q6_k.md). */
-enum { INT8_Q4_K = 1, INT8_Q8_0 = 2, INT8_Q6_K = 4, INT8_ALL = 7 };
-static int g_int8_types = -1;
+static int parse_int8_types(const char *e) {
+    int mask = INT8_ALL;
+    if (e && *e) {
+        mask = 0;
+        if (strstr(e, "q4_k") || strstr(e, "Q4_K")) mask |= INT8_Q4_K;
+        if (strstr(e, "q8_0") || strstr(e, "Q8_0")) mask |= INT8_Q8_0;
+        if (strstr(e, "q6_k") || strstr(e, "Q6_K")) mask |= INT8_Q6_K;
+    }
+    return mask;
+}
 
 static int int8_type_bit(int type) {
     return type == INGOT_TYPE_Q4_K ? INT8_Q4_K :
@@ -80,22 +114,12 @@ static int int8_type_bit(int type) {
 }
 
 static int int8_type_on(int type) {
-    if (g_int8_types < 0) {
-        const char *e = getenv("MYNAH_SLM_INT8_TYPES");
-        int mask = INT8_ALL;
-        if (e && *e) {
-            mask = 0;
-            if (strstr(e, "q4_k") || strstr(e, "Q4_K")) mask |= INT8_Q4_K;
-            if (strstr(e, "q8_0") || strstr(e, "Q8_0")) mask |= INT8_Q8_0;
-            if (strstr(e, "q6_k") || strstr(e, "Q6_K")) mask |= INT8_Q6_K;
-        }
-        g_int8_types = mask;
-    }
-    return (g_int8_types & int8_type_bit(type)) != 0;
+    return (env_get(&g_int8_types) & int8_type_bit(type)) != 0;
 }
 
 void mynah_slm_matvec_set_int8_types(int q4_k, int q8_0, int q6_k) {
-    g_int8_types = (q4_k ? INT8_Q4_K : 0) | (q8_0 ? INT8_Q8_0 : 0) | (q6_k ? INT8_Q6_K : 0);
+    env_set(&g_int8_types,
+            (q4_k ? INT8_Q4_K : 0) | (q8_0 ? INT8_Q8_0 : 0) | (q6_k ? INT8_Q6_K : 0));
 }
 
 int mynah_slm_matvec_have(int type) {

@@ -236,7 +236,7 @@ $(OBJ): | $(INGOT_LIB)
 # test_ingot needs no model: it pins the container-layer contract (block
 # geometry, dequant coverage) so a bad subtree update fails here and not
 # three modules later.
-TESTS := tests/test_backend tests/test_forward_backend tests/test_batch tests/test_ingot tests/test_sgemm tests/test_threads tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer tests/test_tools tests/test_isa tests/test_synth tests/test_http tests/test_sched
+TESTS := tests/test_backend tests/test_forward_backend tests/test_batch tests/test_ingot tests/test_sgemm tests/test_threads tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer tests/test_tools tests/test_isa tests/test_synth tests/test_http tests/test_sched tests/test_qmat_init
 
 # The parity harness is built like the others but driven separately: it dumps
 # activations, and tools/eval/compare.py is what judges them.
@@ -511,13 +511,15 @@ asan:
 	$(MAKE) clean && $(MAKE) EXTRA_CFLAGS="$(SAN_ADD) -O1 -fsanitize=address,undefined" \
 	  EXTRA_LDFLAGS="-fsanitize=address,undefined" all test && $(MAKE) clean
 
-# The concurrency the server runs on — the pending queue, the scheduler loop
+# The concurrency the server runs on — the first qmat dispatch from pool
+# workers (test_qmat_init), the pending queue, the scheduler loop
 # with producer threads, and the pool — under ThreadSanitizer. BLAS=none so no
 # uninstrumented vendor threads are in the process. Linux/clang or gcc.
 tsan:
 	$(MAKE) clean && $(MAKE) BLAS=none EXTRA_CFLAGS="$(SAN_ADD) -O1 -fsanitize=thread" \
-	  EXTRA_LDFLAGS="-fsanitize=thread" tests/test_sched tests/test_threads tests/test_synth
-	TSAN_OPTIONS=halt_on_error=1 tests/test_sched && TSAN_OPTIONS=halt_on_error=1 tests/test_threads \
+	  EXTRA_LDFLAGS="-fsanitize=thread" tests/test_qmat_init tests/test_sched tests/test_threads tests/test_synth
+	TSAN_OPTIONS=halt_on_error=1 tests/test_qmat_init && TSAN_OPTIONS=halt_on_error=1 tests/test_sched \
+	  && TSAN_OPTIONS=halt_on_error=1 tests/test_threads \
 	  && TSAN_OPTIONS=halt_on_error=1 tests/test_synth; rc=$$?; $(MAKE) clean; exit $$rc
 
 leaks: mynah-slm $(TESTS)
