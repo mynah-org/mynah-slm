@@ -180,7 +180,15 @@ static void prefill_pass(mynah_slm_sched *s) {
                                       s->cfg.prefill_slice);
         served++;
         if (rc < 0) retire(s, pick, MYNAH_SLM_JOB_FAILED);
-        else if (rc == 1) s->slots[pick].state = SLOT_DECODING;
+        else if (rc == 1) {
+            s->slots[pick].state = SLOT_DECODING;
+            /* Someone decodes now. An uncapped pass was uncapped only
+             * because nobody did: carrying on would make this new stream
+             * wait for every other queued prompt before its first step.
+             * Stop here, step it in this iteration, and let the next pass
+             * run under the budget. */
+            if (!capped && s->cfg.prefill_budget_s > 0.0) break;
+        }
     }
     if (served) count(s, &s->st.prefill_slices, served);
 }

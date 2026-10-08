@@ -21,7 +21,10 @@
  *              until it is done), within `prefill_budget_s` of wall time per
  *              iteration while anyone is decoding — at least one slice
  *              always runs, so a prefill cannot starve. With nobody
- *              decoding there is nobody to stall, and prefill runs uncapped.
+ *              decoding there is nobody to stall, and prefill runs uncapped
+ *              — until a prompt completes: from then on someone decodes, so
+ *              the pass stops there and that job is stepped at once rather
+ *              than after every other queued prompt.
  *              A job whose prefill completes is stepped in the SAME
  *              iteration.
  *   4. STEP    one decode step for every decoding job, as ONE engine call

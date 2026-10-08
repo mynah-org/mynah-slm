@@ -279,6 +279,63 @@ static void t_prefill_policy(void) {
     mynah_slm_jobq_free(q);
 }
 
+/* A prompt that completes during an UNCAPPED pass (nobody was decoding when
+ * it began) turns its job into a decoder: the pass must not go on prefilling
+ * every other queued prompt before that job's first step. The review's
+ * reproducer (three 3-slice prompts, 0.3 s a slice, a 40 ms budget): A's
+ * first step came 1.8 s of B's and C's prefill after its prompt was done. */
+static void t_prefill_turns_decoder(void) {
+    printf("\n-- prefill: a job that starts decoding mid-pass is stepped at once --\n");
+    fake f = { .cost_token = 0.3 / 32, .cost_step = 0.02 };
+    mynah_slm_jobq *q = mynah_slm_jobq_new(8);
+    mynah_slm_sched_engine e = engine_for(&f);
+    mynah_slm_sched_cfg cfg = { 4, 32, 0.040 };
+    mynah_slm_sched *s = mynah_slm_sched_new(&cfg, &e, q);
+    job a, b, c;
+    job_init(&a, 0, 96, 50);
+    job_init(&b, 1, 96, 50);
+    job_init(&c, 2, 96, 50);
+    mynah_slm_jobq_push(q, &a);
+    mynah_slm_jobq_push(q, &b);
+    mynah_slm_jobq_push(q, &c);
+    f.iter++;
+    mynah_slm_sched_iterate(s, 0);
+    const int a_step = index_of(&f, 'S', 0), b_pre = index_of(&f, 'P', 1);
+    double ms = 0.0;     /* prefill run between A's last slice and its first step */
+    int after_a = 0;
+    for (int i = 0; i < f.n && (a_step < 0 || i < a_step); i++) {
+        if (f.kind[i] == 'P' && f.who[i] == 0) { after_a = 1; ms = 0.0; continue; }
+        if (after_a && f.kind[i] == 'P') ms += f.arg[i] * f.cost_token * 1000.0;
+    }
+    char d[160];
+    snprintf(d, sizeof d, "A stepped at event %d, B's first slice at event %d; %.0f ms of "
+             "other prefill between A's prompt and its first step", a_step, b_pre, ms);
+    check("a prompt finished in an uncapped pass is stepped before any other prompt is prefilled",
+          a_step >= 0 && a.first_step_iter == 1 && (b_pre < 0 || a_step < b_pre), d);
+    /* From then on the budget applies: B and C advance by at most budget +
+     * one slice per iteration while A decodes every iteration. */
+    int worst = 0, a_steps0 = a.steps, iters = 0;
+    while (!(b.steps && c.steps) && iters < 50) {
+        const int n0 = f.n;
+        f.iter++; iters++;
+        mynah_slm_sched_iterate(s, 0);
+        int slices = 0;
+        for (int i = n0; i < f.n; i++) slices += f.kind[i] == 'P';
+        if (slices > worst) worst = slices;
+    }
+    snprintf(d, sizeof d, "%d iterations, at most %d slices in one, A stepped %d times",
+             iters, worst, a.steps - a_steps0);
+    check("... and the other prompts then run under the budget (one 300 ms slice per iteration)",
+          worst == 1 && a.steps - a_steps0 == iters, d);
+    atomic_store(&a.cancel, 1);
+    atomic_store(&b.cancel, 1);
+    atomic_store(&c.cancel, 1);
+    mynah_slm_jobq_close(q);
+    mynah_slm_sched_run(s);
+    mynah_slm_sched_free(s);
+    mynah_slm_jobq_free(q);
+}
+
 static void t_cancel_and_isolation(void) {
     printf("\n-- cancellation and isolation --\n");
     fake f = { .cost_token = 0.001, .cost_step = 0.01 };
@@ -463,6 +520,7 @@ static void t_threaded(void) {
 int main(void) {
     t_admission_order();
     t_prefill_policy();
+    t_prefill_turns_decoder();
     t_cancel_and_isolation();
     t_queue_bound();
     t_threaded();
