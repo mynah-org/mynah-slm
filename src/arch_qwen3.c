@@ -376,6 +376,7 @@ void mynah_slm_state_free(mynah_slm_state *s) {
     mynah_slm_aligned_free(s->mscores);
     mynah_slm_aligned_free(s->mlogits);
     free(s->mattn);
+    mynah_slm_aligned_free(s->mprep);
     memset(s, 0, sizeof *s);
 }
 
@@ -750,16 +751,20 @@ int mynah_slm_state_init_decode(mynah_slm_state *s, uint32_t dec_max,
     mynah_slm_aligned_free(s->mscores);
     mynah_slm_aligned_free(s->mlogits);
     free(s->mattn);
+    mynah_slm_aligned_free(s->mprep);
     s->mscores = alloc_f32((size_t)dec_max * c->n_heads * s->ctx_cap);
     s->mlogits = alloc_f32((size_t)dec_max * c->vocab_size);
     s->mattn   = calloc(dec_max, sizeof *s->mattn);
-    if (!s->mscores || !s->mlogits || !s->mattn) {
+    s->mprep   = mynah_slm_aligned_alloc((size_t)dec_max * sizeof *s->mprep);
+    if (!s->mscores || !s->mlogits || !s->mattn || !s->mprep) {
         snprintf(err, errsz, "out of memory for a %u-sequence decode step", dec_max);
         mynah_slm_aligned_free(s->mscores);
         mynah_slm_aligned_free(s->mlogits);
         free(s->mattn);
+        mynah_slm_aligned_free(s->mprep);
         s->mscores = s->mlogits = NULL;
         s->mattn = NULL;
+        s->mprep = NULL;
         s->dec_max = 0;
         return -1;
     }
@@ -767,34 +772,110 @@ int mynah_slm_state_init_decode(mynah_slm_state *s, uint32_t dec_max,
     return 0;
 }
 
-/* -1 unresolved, 0 matvec, 1 matmat. Read and written on the one thread that
- * runs the model. */
-static int g_decode_matmat = -1;
+/* -1 unresolved, else a MYNAH_SLM_DECODE_* value. Read and written on the one
+ * thread that runs the model. */
+static int g_decode_product = -1;
 
-static int decode_matmat(void) {
-    if (g_decode_matmat < 0) {
+static int decode_product(void) {
+    if (g_decode_product < 0) {
         const char *e = getenv("MYNAH_SLM_DECODE_PRODUCT");
         /* matvec by default: measured, one qmatmat per weight lost 3-5x to
          * B solo steps at B = 2..8 on the 0.6B geometry
          * (.work/serving-continuous-batching.md S1-c). */
-        g_decode_matmat = (e && strcmp(e, "matmat") == 0) ? 1 : 0;
+        g_decode_product = !e                       ? MYNAH_SLM_DECODE_MATVEC :
+                           strcmp(e, "matmat") == 0 ? MYNAH_SLM_DECODE_MATMAT :
+                           strcmp(e, "ws") == 0     ? MYNAH_SLM_DECODE_WS :
+                                                      MYNAH_SLM_DECODE_MATVEC;
     }
-    return g_decode_matmat;
+    return g_decode_product;
 }
 
 const char *mynah_slm_decode_product_name(void) {
-    return decode_matmat() ? "matmat" : "matvec";
+    switch (decode_product()) {
+    case MYNAH_SLM_DECODE_MATMAT: return "matmat";
+    case MYNAH_SLM_DECODE_WS:     return "ws";
+    default:                      return "matvec";
+    }
 }
 
-void mynah_slm_decode_product_set(int matmat) {
-    g_decode_matmat = matmat < 0 ? -1 : (matmat ? 1 : 0);
+void mynah_slm_decode_product_set(int product) {
+    g_decode_product = (product == MYNAH_SLM_DECODE_MATMAT || product == MYNAH_SLM_DECODE_WS ||
+                        product == MYNAH_SLM_DECODE_MATVEC) ? product : -1;
+}
+
+/* The weight-stationary product (K7, .work/batched-decode-kernel.md): each
+ * weight read once for the n rows, split over the pool by output rows exactly
+ * like mynah_slm_project, so every row's result is the single-token kernel's
+ * for every sequence. */
+typedef struct {
+    const uint8_t *base;
+    float         *out;
+    const float   *in;
+    const mynah_slm_matvec_in *prep;
+    size_t         cols, row_bytes, rows_per_chunk, rows, ntok;
+    int            type, rc;
+} ws_job;
+
+static void ws_chunk(void *ctx, int i) {
+    ws_job *j = ctx;
+    const size_t first = (size_t)i * j->rows_per_chunk;
+    if (first >= j->rows) return;
+    size_t n = j->rows_per_chunk;
+    if (first + n > j->rows) n = j->rows - first;
+    if (mynah_slm_matvec_ws(j->type, j->base + first * j->row_bytes, n, j->cols, j->ntok,
+                            j->in, j->cols, j->prep, j->out + first, j->rows) != 0)
+        j->rc = -1;              /* benign race: any failure sets the same -1 */
+}
+
+/* 0 done, 1 declined (the caller does the rows one projection at a time —
+ * the solo path, so nothing changes), -1 error. It declines exactly where the
+ * solo path would not run one kernel of ours for every row: ingot's types,
+ * int8 off for Q8_0/Q6_K, a non-finite row on the int8 path. */
+static int project_ws(mynah_slm_state *s, const ingot_tensor *w, const float *in,
+                      float *out, uint32_t n) {
+    const mynah_slm_model_t *m = s->model;
+    const size_t cols = (size_t)w->ne[0];
+    const size_t rows = (w->rank >= 2) ? (size_t)w->ne[1] : 1;
+    uint64_t block_elems = 0, block_bytes = 0;
+    if (!s->mprep || !mynah_slm_matvec_have(w->type) || cols % 32 != 0 ||
+        cols / 32 > MYNAH_SLM_XSUM_MAX ||
+        ingot_type_geometry(w->type, &block_elems, &block_bytes) != 0 ||
+        block_elems == 0 || cols % block_elems != 0)
+        return 1;
+    const uint8_t *base = ingot_gguf_data(m->gguf, w);
+    if (!base) return -1;
+
+    /* The same preparation the solo path makes, once per row. */
+    for (uint32_t b = 0; b < n; b++)
+        mynah_slm_matvec_prepare(in + (size_t)b * cols, cols, &s->mprep[b]);
+    if (!mynah_slm_matvec_ws_ok(w->type, cols, n, s->mprep)) return 1;
+
+    const int nth = mynah_slm_threads_count();
+    if (nth <= 1 || rows < 64)
+        return mynah_slm_matvec_ws(w->type, base, rows, cols, n, in, cols, s->mprep,
+                                   out, rows) == 0 ? 0 : -1;
+    int chunks = nth * 4;
+    if ((size_t)chunks > rows) chunks = (int)rows;
+    ws_job j = {
+        .base = base, .out = out, .in = in, .prep = s->mprep,
+        .cols = cols, .row_bytes = (cols / block_elems) * block_bytes,
+        .rows_per_chunk = (rows + (size_t)chunks - 1) / (size_t)chunks,
+        .rows = rows, .ntok = n, .type = w->type, .rc = 0,
+    };
+    mynah_slm_parallel_for(chunks, ws_chunk, &j);
+    return j.rc;
 }
 
 /* out[n][rows] = in[n][cols] * W^T, by whichever product is selected. */
 static int project_rows(mynah_slm_state *s, const ingot_tensor *w, const float *in,
                         float *out, uint32_t n) {
     const mynah_slm_model_t *m = s->model;
-    if (decode_matmat()) return project_batch(m, w, s, in, out, n);
+    const int product = decode_product();
+    if (product == MYNAH_SLM_DECODE_MATMAT) return project_batch(m, w, s, in, out, n);
+    if (product == MYNAH_SLM_DECODE_WS) {
+        const int rc = project_ws(s, w, in, out, n);
+        if (rc <= 0) return rc;
+    }
     const size_t cols = (size_t)w->ne[0];
     const size_t rows = (w->rank >= 2) ? (size_t)w->ne[1] : 1;
     for (uint32_t b = 0; b < n; b++)

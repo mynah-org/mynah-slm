@@ -19,6 +19,7 @@
 #include "sampler.h"
 #include "model.h"
 #include "mynah_slm.h"
+#include "qmat.h"
 #include "threads.h"
 #include "tokenizer.h"
 
@@ -376,7 +377,7 @@ static int prefill_seq(mynah_slm_state *ws, mynah_slm_seq *q, const uint32_t *id
     return 0;
 }
 
-static void check_multi(mynah_slm_model_t *m, const uint32_t *ids, long n_tok, int matmat) {
+static void check_multi(mynah_slm_model_t *m, const uint32_t *ids, long n_tok, int product) {
     char err[256] = "", what[128], detail[256];
     const uint32_t vocab = mynah_slm_vocab_size(m);
     mynah_slm_state ws;
@@ -385,7 +386,7 @@ static void check_multi(mynah_slm_model_t *m, const uint32_t *ids, long n_tok, i
     memset(batch, 0, sizeof batch);
     float *ref = malloc(vocab * sizeof *ref);
     float *gotbuf = malloc((size_t)MULTI_MAX * vocab * sizeof *gotbuf);
-    mynah_slm_decode_product_set(matmat);
+    mynah_slm_decode_product_set(product);
 
     int ok = mynah_slm_state_init_workspace(&ws, m, 256, err, sizeof err) == 0 &&
              mynah_slm_state_init_decode(&ws, MULTI_MAX, err, sizeof err) == 0;
@@ -441,11 +442,12 @@ static void check_multi(mynah_slm_model_t *m, const uint32_t *ids, long n_tok, i
                  mynah_slm_decode_product_name(), B);
         snprintf(detail, sizeof detail, "%d steps, worst rel %.2e, argmax %s, bit-identical %s",
                  MULTI_STEPS, worst, argmax_ok ? "same" : "DIFFERS", bit_ok ? "yes" : "no");
-        /* B == 1 is the single-token path verbatim, and the matvec product is
-         * the same kernels in the same order as the solo path: both must be
+        /* B == 1 is the single-token path verbatim; the matvec product is the
+         * same kernels in the same order as the solo path, and ws (K7) is the
+         * weight-stationary twin of those kernels, bit-identical per token: all
          * memcmp-identical. matmat is a reorder: the 1e-4 gate test_batch
          * holds a real checkpoint to, and the same argmax. */
-        const int exact_required = (B == 1 || !matmat);
+        const int exact_required = (B == 1 || product != MYNAH_SLM_DECODE_MATMAT);
         check(what, rc_ok && past_ok && argmax_ok && worst < 1e-4 &&
               (!exact_required || bit_ok), detail);
         printf("     %s\n", detail);
@@ -595,8 +597,32 @@ static void run(const char *label, int quant) {
     mynah_slm_state_free(&st);
     check_generate(m, tok);
     check_two_sequences(m, ids, n_tok);
-    check_multi(m, ids, n_tok, 1);
-    check_multi(m, ids, n_tok, 0);
+    check_multi(m, ids, n_tok, MYNAH_SLM_DECODE_MATMAT);
+    check_multi(m, ids, n_tok, MYNAH_SLM_DECODE_MATVEC);
+    check_multi(m, ids, n_tok, MYNAH_SLM_DECODE_WS);
+    /* The weight-stationary product must actually have run on the quantized
+     * fixture (on the F32 one every tensor is ingot's and it declines). */
+    char detail[96];
+    snprintf(detail, sizeof detail, "%lu weight-stationary calls",
+             (unsigned long)mynah_slm_matvec_ws_count());
+    check(quant ? "[ws] the weight-stationary kernels ran" : "[ws] declined every F32 tensor",
+          quant ? mynah_slm_matvec_ws_count() > 0 : mynah_slm_matvec_ws_count() == 0, detail);
+    printf("     %s\n", detail);
+    if (quant) {
+        /* --fast: the solo step and both exact products run the int8 kernels
+         * (where this CPU has them), so batched == solo must still be memcmp. */
+        printf("     (int8 activations, kernels: %s)\n", mynah_slm_matvec_int8_isa());
+        mynah_slm_matvec_set_int8(1);
+        check_multi(m, ids, n_tok, MYNAH_SLM_DECODE_MATVEC);
+        const unsigned long before = mynah_slm_matvec_ws_count();
+        check_multi(m, ids, n_tok, MYNAH_SLM_DECODE_WS);
+        snprintf(detail, sizeof detail, "%lu weight-stationary calls with int8 on",
+                 (unsigned long)(mynah_slm_matvec_ws_count() - before));
+        check("[ws] ...and ran with int8 activations too",
+              mynah_slm_matvec_ws_count() > before, detail);
+        printf("     %s\n", detail);
+        mynah_slm_matvec_set_int8(0);
+    }
 out:
     free(ref); free(got); free(ids);
     mynah_slm_tokenizer_free(tok);

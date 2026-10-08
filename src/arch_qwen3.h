@@ -140,6 +140,9 @@ typedef struct {
     float *mscores;                   /* [dec_max][n_heads][ctx_cap] */
     float *mlogits;                   /* [dec_max][vocab] */
     mynah_slm_attn_seq *mattn;        /* [dec_max] */
+    /* [dec_max] prepared activations (qmat.h), one per sequence, for the
+     * weight-stationary product (MYNAH_SLM_DECODE_PRODUCT=ws, K7) */
+    struct mynah_slm_matvec_in *mprep;
 
     mynah_slm_final_cb on_embed;   /* the residual stream before layer 0 */
     mynah_slm_layer_cb on_layer;
@@ -241,12 +244,19 @@ int  mynah_slm_forward_multi(mynah_slm_state *s, mynah_slm_seq *const *seqs,
  *   "matmat"            one mynah_slm_qmatmat over the n rows — weights read
  *                       once, but each strip is dequantized to f32 first.
  *                       MEASURED 3-5x SLOWER than n solo steps at n = 2..8 on
- *                       the 0.6B geometry (bench_decode, S1-c), so opt-in until
- *                       a weight-stationary batched kernel exists.
- * The setter exists for an interleaved in-process A/B (1 matmat, 0 matvec,
- * -1 back to the environment's choice); call it between steps. */
+ *                       the 0.6B geometry (bench_decode, S1-c). Opt-in.
+ *   "ws"                one weight-stationary pass per weight (K7,
+ *                       mynah_slm_matvec_ws): weights read once for all n,
+ *                       each weight unit decoded once, and STILL bit-identical
+ *                       to each sequence's solo step. Where our kernels do
+ *                       not take the tensor (ingot's types) it is "matvec".
+ * The setter exists for an interleaved in-process A/B (a MYNAH_SLM_DECODE_*
+ * value, or -1 back to the environment's choice); call it between steps. */
+#define MYNAH_SLM_DECODE_MATVEC 0
+#define MYNAH_SLM_DECODE_MATMAT 1
+#define MYNAH_SLM_DECODE_WS     2
 const char *mynah_slm_decode_product_name(void);
-void        mynah_slm_decode_product_set(int matmat);
+void        mynah_slm_decode_product_set(int product);
 
 /* Rows the batch scratch was sized for. `MYNAH_SLM_BATCH` in the environment
  * overrides the default — it is how the width gets measured rather than

@@ -50,7 +50,7 @@
  *           path. Only filled when that path is on — and have_int8 stays 0
  *           for a vector holding a NaN or inf, so it takes the f32 path,
  *           which propagates it (int8 would return a finite number). */
-typedef struct {
+typedef struct mynah_slm_matvec_in {
     float  xsum[MYNAH_SLM_XSUM_MAX];
     float  xscale[MYNAH_SLM_XSUM_MAX];
     int8_t xq[MYNAH_SLM_XQ_MAX];
@@ -114,6 +114,10 @@ int mynah_slm_matvec_ws(int type, const void *weights, size_t rows, size_t cols,
                         const mynah_slm_matvec_in *prep, float *out, size_t ldo);
 int mynah_slm_matvec_ws_ok(int type, size_t cols, size_t ntok,
                            const mynah_slm_matvec_in *prep);
+
+/* How many mynah_slm_matvec_ws calls ran a kernel, process-wide: the proof a
+ * benchmark or a test of the ws path needs that the path was taken. */
+unsigned long mynah_slm_matvec_ws_count(void);
 
 /* Fill `prep` from the input. Does the int8 half only when that path is on. */
 void mynah_slm_matvec_prepare(const float *input, size_t cols,

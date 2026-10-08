@@ -176,7 +176,7 @@ help:
 	@echo "  cuda-test    build and run the CUDA self-test (skips without a device)"
 	@echo "  bench-qmat   kernel A/B on synthetic matrices (no model)"
 	@echo "  dispatch     which kernels resolved on this CPU (mynah-slm --dispatch)"
-	@echo "  bench-decode one decode step for B streams: solo vs batched (S1-c)"
+	@echo "  bench-decode one decode step for B streams: solo vs matvec vs ws (S1-c, K7)"
 	@echo "  check-x86    cross-compile the AVX2 paths"
 	@echo "  test-x86-rosetta  build x86_64 and RUN the suite under Rosetta"
 	@echo "  golden-dump  regenerate the oracle's reference activations"
@@ -299,14 +299,16 @@ bench: $(BENCH)
 BENCH_QMAT := tests/bench_qmat
 bench-qmat: $(BENCH_QMAT)
 	@$(BENCH_QMAT) all
-# One decode step for B streams, three ways (B solo steps / one forward_multi
-# step with one qmatmat per weight / one with B matvecs per weight), interleaved
-# in one process. With no MODEL it writes a 0.6B-GEOMETRY fixture with noise
-# weights (~400 MB in TMPDIR) — real shapes, so real costs, no quality claim.
-# Not part of `test`: it measures. .work/serving-continuous-batching.md S1-c.
+# One decode step for B streams, interleaved in one process: B solo steps / one
+# forward_multi step with B matvecs per weight / one with a weight-stationary
+# pass per weight (K7); `tests/bench_decode - 128 7 1,4 all` adds the qmatmat
+# arm. With no MODEL it writes a 0.6B-GEOMETRY fixture with noise weights
+# (~400 MB in TMPDIR) — real shapes, so real costs, no quality claim. Not part
+# of `test`: it measures. .work/serving-continuous-batching.md S1-c,
+# .work/batched-decode-kernel.md.
 BENCH_DECODE := tests/bench_decode
 bench-decode: $(BENCH_DECODE)
-	@if [ -e "$(MODEL)" ]; then $(BENCH_DECODE) "$(MODEL)"; else $(BENCH_DECODE); fi
+	@if [ -e "$(MODEL)" ]; then $(BENCH_DECODE) "$(MODEL)"; else $(BENCH_DECODE) - 128 7 1,0; fi
 
 # `run --device`, model-free (also part of `test`): cpu-backend output ==
 # the default path byte for byte, the speed line names the device, and

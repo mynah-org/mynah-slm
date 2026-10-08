@@ -334,6 +334,14 @@ int mynah_slm_matvec_ws_ok(int type, size_t cols, size_t ntok,
     return ws_path(mynah_slm_kern_qmat(), type, cols, ntok, prep) != WS_NONE;
 }
 
+/* Calls that ran a weight-stationary kernel: how a test or a benchmark proves
+ * the path it claims to measure was taken. One relaxed add per row chunk. */
+static _Atomic unsigned long g_ws_calls = 0;
+
+unsigned long mynah_slm_matvec_ws_count(void) {
+    return atomic_load_explicit(&g_ws_calls, memory_order_relaxed);
+}
+
 int mynah_slm_matvec_ws(int type, const void *weights, size_t rows, size_t cols,
                         size_t ntok, const float *in, size_t ldx,
                         const mynah_slm_matvec_in *prep, float *out, size_t ldo) {
@@ -361,6 +369,7 @@ int mynah_slm_matvec_ws(int type, const void *weights, size_t rows, size_t cols,
         else if (path == WS_INT8)         k->q4k_i8_ws(w, rows, cols / 256, nt, xq, xs, xm, o);
         else                              k->q4k_f32_ws(w, rows, cols / 256, nt, x, xm, o);
     }
+    atomic_fetch_add_explicit(&g_ws_calls, 1, memory_order_relaxed);
     return 0;
 }
 
