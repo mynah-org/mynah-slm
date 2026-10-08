@@ -22,6 +22,7 @@
  *              iteration while anyone is decoding — at least one slice
  *              always runs, so a prefill cannot starve. With nobody
  *              decoding there is nobody to stall, and prefill runs uncapped
+ *              in slices of the full batch width (`prefill_batch`)
  *              — until a prompt completes: from then on someone decodes, so
  *              the pass stops there and that job is stepped at once rather
  *              than after every other queued prompt.
@@ -91,9 +92,15 @@ typedef struct {
 
 typedef struct {
     uint32_t slots;            /* jobs live at once: the decode width */
-    uint32_t prefill_slice;    /* prompt tokens per slice; 0 = whole prompt */
+    uint32_t prefill_slice;    /* prompt tokens per slice while anyone
+                                  decodes; 0 = whole prompt */
     double   prefill_budget_s; /* prefill wall time per iteration while anyone
                                   decodes; 0 = uncapped */
+    uint32_t prefill_batch;    /* prompt tokens per slice while NOBODY decodes:
+                                  the engine's full batch width, so a lone
+                                  prompt is not cut into small slices for
+                                  nobody's sake (cancellation is still asked
+                                  between slices). 0 = prefill_slice */
 } mynah_slm_sched_cfg;
 
 /* Defaults, overridable by MYNAH_SLM_PREFILL_SLICE / MYNAH_SLM_PREFILL_STEP_MS:

@@ -172,7 +172,13 @@ static void reap_pass(mynah_slm_sched *s) {
 }
 
 static void prefill_pass(mynah_slm_sched *s) {
-    const int capped = s->cfg.prefill_budget_s > 0.0 && count_state(s, SLOT_DECODING) > 0;
+    const int decoders = count_state(s, SLOT_DECODING) > 0;
+    const int capped = s->cfg.prefill_budget_s > 0.0 && decoders;
+    /* Small slices exist to keep live streams' steps coming; with nobody
+     * decoding they only cost TTFT (a 32-token batch runs the weights at a
+     * fraction of what a full one does), so take the full width then. */
+    const uint32_t slice = (!decoders && s->cfg.prefill_batch) ? s->cfg.prefill_batch
+                                                               : s->cfg.prefill_slice;
     const double t0 = capped ? now_s(s) : 0.0;
     uint64_t served = 0;
     for (;;) {
@@ -195,8 +201,7 @@ static void prefill_pass(mynah_slm_sched *s) {
             retire(s, pick, MYNAH_SLM_JOB_CANCELLED);
             continue;
         }
-        const int rc = s->eng.prefill(s->eng.ud, s->slots[pick].job, pick,
-                                      s->cfg.prefill_slice);
+        const int rc = s->eng.prefill(s->eng.ud, s->slots[pick].job, pick, slice);
         served++;
         if (rc < 0) retire(s, pick, MYNAH_SLM_JOB_FAILED);
         else if (rc == 1) {

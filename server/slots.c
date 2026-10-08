@@ -370,6 +370,7 @@ int slots_start(mynah_slm_model_t *m, const mynah_slm_tokenizer *tok,
     }
     mynah_slm_sched_cfg cfg;
     mynah_slm_sched_cfg_defaults(&cfg, S.n_slots);
+    cfg.prefill_batch = mynah_slm_batch_max(&S.ws);
     mynah_slm_sched_engine eng = { NULL, e_admit, e_prefill, e_step, e_retire,
                                    e_cancelled, NULL };
     S.sched = mynah_slm_sched_new(&cfg, &eng, S.q);
@@ -378,9 +379,9 @@ int slots_start(mynah_slm_model_t *m, const mynah_slm_tokenizer *tok,
      * is what /health reports, so the dispatch that RAN is on record. */
     S.product = mynah_slm_decode_product_name();
     fprintf(stderr, "slots: %u | capacity %zu (slots + queue) | ctx %u | decode product %s | prefill slice %u "
-                    "tokens, %.0f ms per step\n",
+                    "tokens, %.0f ms per step while decoding, %u tokens when idle\n",
             S.n_slots, mynah_slm_jobq_cap(S.q), S.ctx_cap, S.product,
-            cfg.prefill_slice, cfg.prefill_budget_s * 1000.0);
+            cfg.prefill_slice, cfg.prefill_budget_s * 1000.0, cfg.prefill_batch);
     if (pthread_create(&S.thread, NULL, sched_main, NULL) != 0) {
         snprintf(err, errsz, "cannot start the scheduler thread");
         return -1;

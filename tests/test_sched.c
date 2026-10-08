@@ -36,6 +36,7 @@ typedef struct {
     int prompt;          /* tokens to prefill */
     int max_steps;       /* finishes (status 0) after this many steps */
     int poison;          /* fails every step, alone or not */
+    int cancel_at;       /* the client leaves once this many tokens are prefilled */
     int refuse;          /* admit() refuses it */
     atomic_int cancel;   /* the client left */
 
@@ -84,6 +85,7 @@ static int f_prefill(void *ud, void *j_, uint32_t slot, uint32_t budget) {
     int take = j->prompt - j->prefilled;
     if (budget && take > (int)budget) take = (int)budget;
     j->prefilled += take;
+    if (j->cancel_at && j->prefilled >= j->cancel_at) atomic_store(&j->cancel, 1);
     f->clock += take * f->cost_token;
     logev(f, 'P', j->id, take);
     return j->prefilled == j->prompt ? 1 : 0;
@@ -164,7 +166,7 @@ static void t_admission_order(void) {
     fake f = { .cost_token = 0.001, .cost_step = 0.01 };
     mynah_slm_jobq *q = mynah_slm_jobq_new(16);
     mynah_slm_sched_engine e = engine_for(&f);
-    mynah_slm_sched_cfg cfg = { 2, 0, 0 };
+    mynah_slm_sched_cfg cfg = { 2, 0, 0, 0 };
     mynah_slm_sched *s = mynah_slm_sched_new(&cfg, &e, q);
     job jobs[5];
     for (int k = 0; k < 5; k++) { job_init(&jobs[k], k, 3, 2); mynah_slm_jobq_push(q, &jobs[k]); }
@@ -211,7 +213,7 @@ static void t_prefill_policy(void) {
     fake f = { .cost_token = 0.010, .cost_step = 0.030 };
     mynah_slm_jobq *q = mynah_slm_jobq_new(16);
     mynah_slm_sched_engine e = engine_for(&f);
-    mynah_slm_sched_cfg cfg = { 4, 32, 0.5 };
+    mynah_slm_sched_cfg cfg = { 4, 32, 0.5, 0 };
     mynah_slm_sched *s = mynah_slm_sched_new(&cfg, &e, q);
 
     job dec, big1, big2;
@@ -289,7 +291,7 @@ static void t_prefill_turns_decoder(void) {
     fake f = { .cost_token = 0.3 / 32, .cost_step = 0.02 };
     mynah_slm_jobq *q = mynah_slm_jobq_new(8);
     mynah_slm_sched_engine e = engine_for(&f);
-    mynah_slm_sched_cfg cfg = { 4, 32, 0.040 };
+    mynah_slm_sched_cfg cfg = { 4, 32, 0.040, 0 };
     mynah_slm_sched *s = mynah_slm_sched_new(&cfg, &e, q);
     job a, b, c;
     job_init(&a, 0, 96, 50);
@@ -336,12 +338,61 @@ static void t_prefill_turns_decoder(void) {
     mynah_slm_jobq_free(q);
 }
 
+/* Nobody decoding: the prompt goes in slices of the engine's full batch
+ * width, not the 32-token slice that exists for live streams' sake (review
+ * R5: TTFT 2.6x with nobody to protect). Cancellation is still asked
+ * between those slices. */
+static void t_idle_full_batch(void) {
+    printf("\n-- prefill: full batch width when nobody decodes --\n");
+    fake f = { .cost_token = 0.001, .cost_step = 0.01 };
+    mynah_slm_jobq *q = mynah_slm_jobq_new(8);
+    mynah_slm_sched_engine e = engine_for(&f);
+    mynah_slm_sched_cfg cfg = { 2, 32, 0.040, 128 };
+    mynah_slm_sched *s = mynah_slm_sched_new(&cfg, &e, q);
+    job lone;
+    job_init(&lone, 0, 300, 1000);
+    mynah_slm_jobq_push(q, &lone);
+    int n0 = f.n;
+    f.iter++; mynah_slm_sched_iterate(s, 0);
+    char d[200]; int k = 0, sizes[8] = {0};
+    for (int i = n0; i < f.n && k < 8; i++) if (f.kind[i] == 'P') sizes[k++] = f.arg[i];
+    snprintf(d, sizeof d, "%d slices: %d %d %d %d ...", k, sizes[0], sizes[1], sizes[2], sizes[3]);
+    check("alone, a 300-token prompt goes in 128-token slices (128 128 44) and steps at once",
+          k == 3 && sizes[0] == 128 && sizes[1] == 128 && sizes[2] == 44 && lone.steps == 1, d);
+    /* Now someone decodes: back to 32-token slices under the budget. */
+    job next;
+    job_init(&next, 1, 100, 5);
+    mynah_slm_jobq_push(q, &next);
+    n0 = f.n;
+    f.iter++; mynah_slm_sched_iterate(s, 0);
+    int big = 0, slices = 0;
+    for (int i = n0; i < f.n; i++) if (f.kind[i] == 'P') { slices++; if (f.arg[i] > 32) big = 1; }
+    snprintf(d, sizeof d, "%d slices, a slice over 32: %d", slices, big);
+    check("beside a decoding stream the slice is prefill_slice again", slices >= 1 && !big, d);
+    atomic_store(&lone.cancel, 1);
+    atomic_store(&next.cancel, 1);
+    for (int i = 0; i < 4; i++) { f.iter++; mynah_slm_sched_iterate(s, 0); }
+    /* Cancellation between full-width slices: leaves after the first. */
+    job gone;
+    job_init(&gone, 2, 1000, 5);
+    gone.cancel_at = 128;
+    mynah_slm_jobq_push(q, &gone);
+    f.iter++; mynah_slm_sched_iterate(s, 0);
+    snprintf(d, sizeof d, "prefilled %d of 1000, outcome %d", gone.prefilled, (int)gone.outcome);
+    check("a client that leaves mid-prompt stops it at the next full-width slice",
+          gone.retired == 1 && gone.outcome == MYNAH_SLM_JOB_CANCELLED && gone.prefilled == 128, d);
+    mynah_slm_jobq_close(q);
+    mynah_slm_sched_run(s);
+    mynah_slm_sched_free(s);
+    mynah_slm_jobq_free(q);
+}
+
 static void t_cancel_and_isolation(void) {
     printf("\n-- cancellation and isolation --\n");
     fake f = { .cost_token = 0.001, .cost_step = 0.01 };
     mynah_slm_jobq *q = mynah_slm_jobq_new(16);
     mynah_slm_sched_engine e = engine_for(&f);
-    mynah_slm_sched_cfg cfg = { 2, 16, 0.02 };
+    mynah_slm_sched_cfg cfg = { 2, 16, 0.02, 0 };
     mynah_slm_sched *s = mynah_slm_sched_new(&cfg, &e, q);
 
     /* A decoding job whose client leaves: retired at the NEXT iteration,
@@ -441,7 +492,7 @@ static void t_queued_ghosts(void) {
     fake f = { .cost_token = 0.001, .cost_step = 0.01 };
     mynah_slm_jobq *q = mynah_slm_jobq_new(4);
     mynah_slm_sched_engine e = engine_for(&f);
-    mynah_slm_sched_cfg cfg = { 2, 16, 0.02 };
+    mynah_slm_sched_cfg cfg = { 2, 16, 0.02, 0 };
     mynah_slm_sched *s = mynah_slm_sched_new(&cfg, &e, q);
     job a, b, g1, g2, w;
     job_init(&a, 0, 1, 1000);
@@ -531,7 +582,7 @@ static void t_threaded(void) {
     mynah_slm_jobq *q = mynah_slm_jobq_new(8);
     mynah_slm_sched_engine e = engine_for(&f);
     e.now = NULL;                           /* the real clock */
-    mynah_slm_sched_cfg cfg = { 3, 4, 0.001 };
+    mynah_slm_sched_cfg cfg = { 3, 4, 0.001, 0 };
     mynah_slm_sched *s = mynah_slm_sched_new(&cfg, &e, q);
 
     static job jobs[PRODUCERS * PER_PROD];
@@ -575,6 +626,7 @@ int main(void) {
     t_admission_order();
     t_prefill_policy();
     t_prefill_turns_decoder();
+    t_idle_full_batch();
     t_cancel_and_isolation();
     t_queued_ghosts();
     t_queue_bound();
