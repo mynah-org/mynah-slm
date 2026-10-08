@@ -163,6 +163,7 @@ help:
 	@echo "  test-parity  C forward pass vs the numpy oracle, stage by stage"
 	@echo "  test-server  end-to-end HTTP checks (needs a minute of generation)"
 	@echo "  test-server-cancel  disconnects cost no CPU, 503 at the cap (no model needed)"
+	@echo "  test-server-slots   --slots 4 continuous batching end to end (no model needed)"
 	@echo "  bench        per-tensor matvec throughput"
 	@echo "  cuda         opt-in CUDA build in build/cuda/ (CUDA_ARCH=sm_89; needs nvcc)"
 	@echo "  cuda-test    build and run the CUDA self-test (skips without a device)"
@@ -190,7 +191,7 @@ help:
 mynah-slm: $(OBJ) build/cli/main.o $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
-SERVER_OBJ := build/server/main.o build/server/http.o
+SERVER_OBJ := build/server/main.o build/server/http.o build/server/slots.o
 mynah-slm-server: $(OBJ) $(SERVER_OBJ) $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
@@ -315,6 +316,14 @@ test-server: mynah-slm-server
 test-server-cancel: mynah-slm-server tests/write_fixture
 	@bash tests/test_server_cancel.sh; rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP test-server-cancel"; exit 0; else exit $$rc; fi
+
+# Continuous batching end to end (--slots 4), model-free on the "slow"
+# fixture: concurrent answers == the serialized server's, byte for byte;
+# steps really batched; first token beside 3 long streams; 503 + Retry-After
+# when slots and queue are full; leavers free their slots. ~2 minutes.
+test-server-slots: mynah-slm-server tests/write_fixture
+	@bash tests/test_server_slots.sh; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP test-server-slots"; exit 0; else exit $$rc; fi
 
 # Regenerate the oracle's reference activations. Slow (no KV cache, on purpose)
 # and only needed when the prompt or the dumped stages change.
@@ -557,4 +566,4 @@ dist: mynah-slm mynah-slm-server libmynah_slm.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot bench-qmat dispatch bench-decode test-server-cancel tsan
+.PHONY: all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot bench-qmat dispatch bench-decode test-server-cancel tsan test-server-slots

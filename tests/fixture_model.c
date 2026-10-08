@@ -37,6 +37,7 @@ void fixture_spec_slow(fixture_spec *s) {
     s->n_ctx = 8192;
     s->quant = 1;
     s->seed = 0x510e510eULL;
+    s->untied = 1;          /* answers that depend on the prompt */
 }
 
 void fixture_spec_06b_shape(fixture_spec *s) {
@@ -182,23 +183,24 @@ static int add_matrix(ingot_gguf_writer *w, const char *name, int type,
     return rc;
 }
 
-/* The tied embedding, with every CONTROL/channel token's row zeroed. The head
- * is tied, so those tokens' logits are exactly 0 while the ~280 noise logits
+/* A vocabulary-sized matrix — the embedding, or an untied head — with every
+ * CONTROL/channel token's row zeroed. As the head, those tokens' logits are
+ * exactly 0 while the ~280 noise logits
  * spread around it: greedy never picks one. Noise weights would otherwise
  * sample <|im_end|> about once per vocabulary-size tokens and end a
  * "long" generation by themselves, which a disconnect test cannot tell from
  * a cancellation. As an INPUT a zero row is harmless: the template's markers
  * go through RMSNorm as zero vectors, no NaN (eps). */
-static int add_embedding(ingot_gguf_writer *w, int type, uint64_t rows, uint64_t cols,
-                         uint64_t *rng) {
+static int add_vocab_matrix(ingot_gguf_writer *w, const char *name, int type,
+                            uint64_t rows, uint64_t cols, float gain, uint64_t *rng) {
     const size_t n = (size_t)(rows * cols);
     float *v = malloc(n * sizeof *v);
     if (!v) return -1;
-    for (size_t i = 0; i < n; i++) v[i] = rng_unit(rng);
+    for (size_t i = 0; i < n; i++) v[i] = gain * rng_unit(rng);
     for (size_t t = 256 + N_MERGES; t < N_TOKENS; t++)
         memset(v + t * (size_t)cols, 0, (size_t)cols * sizeof *v);
     const uint64_t ne[2] = { cols, rows };
-    const int rc = ingot_gguf_add_f32(w, "token_embd.weight", type, 2, ne, v);
+    const int rc = ingot_gguf_add_f32(w, name, type, 2, ne, v);
     free(v);
     return rc;
 }
@@ -237,9 +239,12 @@ int fixture_write(const char *path, const fixture_spec *s, char *err, size_t err
     const float g_q   = 1.0f / sqrtf((float)q_dim);
     const float g_ff  = 1.0f / sqrtf((float)s->d_ff);
 
-    rc |= add_embedding(w, pick_type(s, s->d_model, INGOT_TYPE_Q6_K), vocab,
-                        s->d_model, &rng);
+    rc |= add_vocab_matrix(w, "token_embd.weight", pick_type(s, s->d_model, INGOT_TYPE_Q6_K),
+                           vocab, s->d_model, 1.0f, &rng);
     rc |= add_matrix(w, "output_norm.weight", INGOT_TYPE_F32, 1, s->d_model, 0.1f, 1.0f, &rng);
+    if (s->untied)
+        rc |= add_vocab_matrix(w, "output.weight", pick_type(s, s->d_model, INGOT_TYPE_Q6_K),
+                               vocab, s->d_model, 1.0f / sqrtf((float)s->d_model), &rng);
 
     for (uint32_t l = 0; l < s->n_layers && rc == 0; l++) {
         char nm[96];

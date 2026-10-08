@@ -1,0 +1,84 @@
+/* slots.h — continuous batching for the server: the model-facing engine the
+ * scheduler (src/sched.h) drives, and the per-request writer.
+ *
+ * OWNERSHIP, which is the whole design (mynah-tts serving-design.md §2):
+ *
+ *   scheduler thread   the model, the pool, the workspace, every slot's
+ *                      sequence (KV), every request's sampler and generation.
+ *                      Never reads or writes a socket.
+ *   connection thread  its own socket: parses, enqueues (or answers 503),
+ *                      then becomes that request's WRITER — sends the SSE
+ *                      header when the request is admitted, then whatever
+ *                      the scheduler appended, and probes the peer while it
+ *                      waits. Never touches the model.
+ *
+ * Between them, per request, one mutex over an append buffer. The scheduler
+ * only ever appends and signals, so a slow client can never block a step:
+ * if its unsent bytes pass a cap, or its send times out, it is CANCELLED at
+ * the next iteration (backpressure is cancellation, never a blocking write).
+ *
+ * SPDX-License-Identifier: MIT */
+#ifndef MYNAH_SLM_SERVER_SLOTS_H
+#define MYNAH_SLM_SERVER_SLOTS_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "http.h"
+#include "model.h"
+#include "sampler.h"
+#include "sched.h"
+#include "timing.h"
+#include "tokenizer.h"
+
+/* What one chat request asks for. Pointers are borrowed for the duration of
+ * slots_run. */
+typedef struct {
+    const uint32_t *ids;
+    size_t          n_prompt;
+    uint32_t        max_new;
+    mynah_slm_sampler_params sp;
+    const uint32_t *eos;
+    size_t          n_eos;
+    long            think_open, think_close;    /* -1 = no split */
+    long            tool_open, tool_close;      /* -1 = no tool channel */
+    int             stream;
+    const char     *req_id;
+    const char     *model_json;                 /* already a JSON string */
+} slots_params;
+
+typedef struct {
+    mynah_slm_job_outcome outcome;
+    char  *content;         /* non-stream answer text, malloc'd (caller frees) */
+    size_t content_used;
+    char  *tool;            /* the tool channel, malloc'd (caller frees) */
+    size_t tool_used;
+    mynah_slm_timing tm;    /* clock started at ADMISSION */
+    double queue_ms;        /* arrival to admission */
+    int    header_sent;     /* the SSE header went out (at admission) */
+    int    client_gone;
+    char   error[192];      /* why it was refused or failed */
+} slots_result;
+
+/* Loads nothing: takes the loaded model and tokenizer, builds the workspace
+ * for `ctx_cap` positions and `n_slots` sequences, and starts the scheduler
+ * thread. queue_cap bounds the requests waiting for a slot. 0 or -1. */
+int  slots_start(mynah_slm_model_t *m, const mynah_slm_tokenizer *tok,
+                 uint32_t n_slots, uint32_t ctx_cap, uint32_t queue_cap,
+                 char *err, size_t errsz);
+
+/* Closes the queue, lets admitted requests finish, joins the thread. */
+void slots_stop(void);
+
+/* Runs one request on the calling connection thread: enqueue, then write
+ * what the scheduler produces until it retires the request. Returns 0 with
+ * `out` filled, or -1 when the queue is full (answer 503, nothing was
+ * written). */
+int  slots_run(http_conn *conn, const slots_params *p, slots_result *out);
+
+/* JSON object members for /health (no braces): slots, live, queue depth,
+ * steps, mean batch width, aggregate and per-stream recent decode t/s,
+ * cancellations, the decode product. */
+int  slots_health(char *buf, size_t n);
+
+#endif /* MYNAH_SLM_SERVER_SLOTS_H */

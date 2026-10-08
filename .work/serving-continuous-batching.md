@@ -440,10 +440,95 @@ producers x 60 jobs, one scheduler thread, some clients leaving) where every
 queued job retires exactly once and every refusal is counted — also under
 ThreadSanitizer.
 
+### S1-e — the server, behind `--slots N`
+
+`server/slots.{c,h}` is the model-facing engine for the scheduler, and
+`server/main.c` picks it with `--slots N` (N > 1). **`--slots 1` is the
+default and is the serialized path of S1-z unchanged**: the default does not
+move until a real checkpoint has measured the new one.
+
+| piece | how | ported from |
+|---|---|---|
+| ownership | the scheduler thread owns the model, the pool, the workspace, every slot's sequence, every request's sampler and generation; the connection thread owns its socket and becomes that request's WRITER | tts `scheduler_main` + `stream_out`; asr PR #3 slot ownership |
+| slot pool | one `mynah_slm_seq` per slot, `seq_reserve`d at admission to prompt + max_tokens + 8 (capped by `--ctx`), reused across requests: no allocation in steady state, none ever in the token loop; bf16 KV as before | tts `kv-window-allocation.md`, asr `slot.c` "pooled, reset per session" |
+| bounded admission, fail-fast 503 | requests in the system (queued + holding a slot) are counted at ARRIVAL; `live + queued >= slots + --queue` (default queue 2 x slots) → `503` + `Retry-After: 1` from the connection thread, before anything is written; `/health.rejected_queue`, `capacity` | tts's ladder: `running + queued >= slots + queue_cap` → 503 |
+| SSE header at admission | the writer sends it when the scheduler marks the request admitted, so a client's first byte means "you have a slot" and TTFB is not TTFT | tts `sink_next_job`, serving-design §7 |
+| per-stream writes that never block the step | the scheduler appends SSE frames to the request's buffer and signals; the writer drains it into the socket unlocked. Unsent bytes > 1 MiB (`MYNAH_SLM_STREAM_MAX_BYTES`), a failed send, a 5 s send timeout or the peer-gone probe mark the request gone; the scheduler reaps it at the next iteration | tts `stream_callback` ("backpressure is cancellation, never a blocking write"), `stream_out.c` |
+| TCP_NODELAY, timeouts, connection cap | from S1-z, unchanged | — |
+| timings | per request, clock started at ADMISSION (like the lock in the serialized path), TTFT stamped at the first token; `usage` adds `queue_ms` (arrival → admission) and `slots`, so queueing is reported, never folded in or hidden | repo rule "speed is always reported" |
+| /health | `slots`, `live`, `preparing`, `decoding`, `queued`, `queue_cap`, `steps`, `mean_batch`, `aggregate_decode_tok_s` (tokens over the last 10 s of steps), `recent_stream_decode_tok_s` (mean of the last 16 finished streams), `slot_cancelled/failed/done`, `decode_product` (the dispatch that ran, resolved before the scheduler starts) | AGENTS.md "/health exposes recent decode t/s" |
+
+**Evidence (cloud x86, contended, model-free — `tests/test_server_slots.sh`,
+`make test-server-slots`, on the "slow" fixture: 4 wide layers, untied
+noise head, ~8.6 ms/token here)**
+
+| check | result |
+|---|---|
+| 4 reference answers from `--slots 1` (seeded sampling, temperature 0.8) | 4 distinct answers |
+| the same 4 prompts concurrently on `--slots 4 --queue 2` | **byte-identical** to the serialized server's, and a fifth, streamed, reassembles to the same text |
+| were the steps batched? (`/health`) | mean batch 2.45 over 49 steps, `decode_product` matvec |
+| first token of a 37-token request admitted beside 3 long streams | 0.41 s at the client; server side `queue_ms` 9.7, `ttft_ms` 348 from admission |
+| 4 slots busy + 2 queued, a 7th request | `503` + `Retry-After` in 0.06 s; `rejected_queue` 1 |
+| all clients leave | `live` 0, next request 0.2 s, 0 CPU ticks in 1 s, `slot_cancelled` 9 |
+| ThreadSanitizer server (`BLAS=none`, `-fsanitize=thread`) driven by this test and by `test_server_cancel.sh` | **0 reports** (timing checks fail under TSan's ~10x slowdown, as expected) |
+| mutation: swap two sequences' input tokens inside the batched step | the concurrent-equality and stream checks FAIL |
+
+Found and fixed while making this pass:
+
+1. **The 503 was judged on the queue alone**: a burst of 5 requests on 4
+   free slots got 503s, because they arrived faster than the scheduler's next
+   admission pass and the 2-deep queue overflowed with slots standing free.
+   The refusal is now tts's rule — `live + queued >= slots + queue`, counted
+   at arrival (`/health.capacity`).
+2. **Noise weights with a tied head echo their input**: the residual stream
+   stays near the input token's embedding, whose self-logit (~|h||E|, ~600)
+   beats every other (~55), so every answer was the prompt's last token ("\n")
+   repeated and "same answer" comparisons were vacuous. The "slow" fixture now
+   has an untied head (control rows zeroed in both matrices); the test asserts
+   its reference answers are distinct before comparing them.
+3. **Shutdown freed the model under detached connection threads** (TSan,
+   serialized path, pre-existing): `main` now waits (bounded, 30 s) for the
+   live-connection counter to reach zero — the counter's decrement is each
+   thread's last act, so the wait is also the ordering — and exits without
+   freeing if threads remain.
+
+Noted, not acted on: `ttft_ms` 348 for a 37-token prompt means the two
+prefill slices (32 + 4 tokens) cost far more than two decode steps — the same
+f32-strip cost S1-c measured for `qmatmat` at small T, since prefill slices
+run through it. A 32-token slice may be the wrong default for this engine
+(tts's value, for a different per-token cost); measure slice 32 / 64 / 128
+against TTFT and inter-token gaps on a real checkpoint before changing it.
+
+**Response format is shared**: the tail of a completion (tool-call parse,
+finish reason, final SSE frames or the JSON body) is one function,
+`send_completion`, used by both modes; the slot path's usage carries the same
+members plus `queue_ms` and `slots`.
+
 ## Conclusion
 
-(open)
+The serving foundation exists and is proven model-free: per-request state,
+a multi-sequence decode step whose default product is bit-identical to solo
+decode, a scheduler whose every policy rule has a unit test, no zombie work
+in either serving mode, and `--slots N` end to end on a synthetic checkpoint.
+
+What is NOT shown, and is the question S1 exists to answer: that batching
+makes the server FASTER. On this VM the only batched product that reads the
+weights once (`matmat`) is 3-5x slower than B solo steps, so the default
+reads them B times and gains only 3-20% from sharing the attention region and
+the step. Continuous batching here buys fairness, admission, isolation and
+cancellation today; it buys throughput only once a weight-stationary batched
+quantized kernel exists. Verdict for the code: **KEEP** (behind a flag, the
+default unchanged); for the throughput claim: **INCONCLUSIVE** until measured.
 
 ## Next action
 
-S1-c, then S1-d (the scheduler, model-free).
+1. Downstream, on a host with a checkpoint (weights LOCAL): the rows of the
+   validation matrix in the final report — `make test-server`,
+   `make test-server-cancel MODEL=...`, `make test-server-slots` with the
+   model as `$1`, `make bench-decode`, and a concurrent-client load test at
+   C = 1, 2, 4, 8 with `--slots 1` and `--slots 8`.
+2. The weight-stationary batched kernel (sibling-port-map row 6) as its own
+   item: B rows against each Q4_K block while it is in registers. It plugs in
+   at `project_rows`; `bench_decode` is its A/B harness.
+3. Upstream ingot: Q8_0 dequant for rows that are not whole 256-blocks.
+4. Re-measure the prefill slice / step budget defaults for this engine.

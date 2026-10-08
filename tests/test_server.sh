@@ -27,7 +27,9 @@ bad()  { echo "FAIL $1  <- ${2:-}"; fail=$((fail+1)); }
 # (Seen once on 2026-08-07 on a loaded machine and not reproduced since; the
 # next occurrence should explain itself.)
 LOG=$(mktemp)
-"$SERVER" -m "$MODEL" --port "$PORT" >"$LOG" 2>&1 &
+# SERVER_ARGS="--slots 4" runs the whole suite against the continuous-batching
+# path: the concurrent-determinism block below then checks batching, too.
+"$SERVER" -m "$MODEL" --port "$PORT" ${SERVER_ARGS:-} >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null; rm -f "$LOG"' EXIT
 

@@ -28,6 +28,12 @@ typedef struct {
      * F32 norms (and F32 for any row that is not whole 256-blocks). */
     int      quant;
     uint64_t seed;
+    /* Write a separate output.weight instead of tying the head to the
+     * embedding. With a tied head and noise layers the residual stream stays
+     * close to the input token's own embedding, so its self-logit (~|h||E|,
+     * hundreds) beats every other (~tens) and the model echoes its input
+     * forever — every answer is the prompt's last token repeated. */
+    int      untied;
 } fixture_spec;
 
 /* d_model 256, 2 layers, 8 query heads / 2 KV heads of 64, d_ff 512, n_ctx 512.

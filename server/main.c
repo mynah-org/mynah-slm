@@ -1,5 +1,15 @@
 /* mynah-slm-server — OpenAI-compatible HTTP, no framework.
  *
+ * Two serving modes, chosen at start:
+ *
+ *   --slots 1 (default)  the serialized path described below, unchanged.
+ *   --slots N > 1        continuous batching (server/slots.h): one scheduler
+ *                        thread owns the model and advances up to N requests
+ *                        per decode step; prompts are prefilled in slices
+ *                        between steps; a full pending queue is a 503.
+ *                        Opt-in until a real checkpoint has measured it
+ *                        (.work/serving-continuous-batching.md).
+ *
  * Concurrency model, stated because it is a decision and not an oversight:
  * INFERENCE IS SERIALIZED. One request runs at a time, using every thread.
  *
@@ -32,6 +42,7 @@
 #include "model.h"
 #include "mynah_slm.h"
 #include "sampler.h"
+#include "slots.h"
 #include "template.h"
 #include "threads.h"
 #include "kvcache.h"
@@ -51,6 +62,8 @@ typedef struct {
     mynah_slm_tokenizer *tok;
     const char          *model_name;
     uint32_t             n_ctx;
+    uint32_t             slots;      /* > 1: continuous batching (slots.h) */
+    unsigned long        rejected_queue;   /* 503: every slot busy, queue full */
 
     /* The serialization point: one request inside the model at a time.
      * A flag under a mutex rather than the mutex itself, so a waiter can
@@ -188,6 +201,94 @@ static int answer_cb(void *ctx, uint32_t id, const char *text, size_t len) {
     return 0;
 }
 
+/* The end of a chat completion, shared by both serving modes: the tool call
+ * parsed out of its channel, the finish reason, and the final SSE frames or the
+ * whole JSON response. `buf` is the answer text (non-stream; may be NULL) and
+ * is trimmed in place; `usage` is the rendered "usage":{...} member. */
+static void send_completion(http_conn *conn, int stream, const char *req_id,
+                            const char *model_json, char *buf, size_t used,
+                            const char *tool, size_t tool_used, const char *usage) {
+    /* A function call is data, not prose: it leaves the answer channel empty
+     * and changes finish_reason. A client that ignores tool_calls must not be
+     * handed the raw JSON in `content` — that is what the channel split in
+     * generate.c is for. */
+    mynah_slm_tool_call parsed[16];
+    size_t n_parsed = 0;
+    char  *calls_json = NULL;
+    if (tool_used) {
+        size_t blocks = 0;
+        const long got = mynah_slm_tool_calls_parse(tool, tool_used, parsed,
+                                                    sizeof parsed / sizeof *parsed, &blocks);
+        if (got > 0) {
+            n_parsed = (size_t)(got < 16 ? got : 16);
+            const size_t nj = mynah_slm_tool_calls_to_json(parsed, n_parsed, NULL, 0) + 1;
+            calls_json = malloc(nj);
+            if (calls_json) mynah_slm_tool_calls_to_json(parsed, n_parsed, calls_json, nj);
+        }
+    }
+    const char *finish = calls_json ? "tool_calls" : "stop";
+
+    /* The newline the template puts between an answer and a call is glue, not
+     * content. Only trimmed when a call actually followed. */
+    if (calls_json && buf)
+        while (used && (buf[used - 1] == '\n' || buf[used - 1] == ' ' ||
+                          buf[used - 1] == '\t' || buf[used - 1] == '\r'))
+            buf[--used] = '\0';
+
+    if (stream) {
+        /* One frame carrying the whole call. Splitting a JSON object across
+         * deltas would let a client act on half an argument list. */
+        if (calls_json) {
+            const size_t cap = strlen(calls_json) + 512;
+            char *frame = malloc(cap);
+            if (frame) {
+                const int n = snprintf(frame, cap,
+                    "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+                    "\"model\":%s,\"choices\":[{\"index\":0,"
+                    "\"delta\":{\"tool_calls\":%s},\"finish_reason\":null}]}\n\n",
+                    req_id, model_json, calls_json);
+                http_write(conn, frame, (size_t)n);
+                free(frame);
+            }
+        }
+        char last[1024];
+        const int n = snprintf(last, sizeof last,
+            "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+            "\"model\":%s,\"choices\":[{\"index\":0,\"delta\":{},"
+            "\"finish_reason\":\"%s\"}],%s}\n\ndata: [DONE]\n\n",
+            req_id, model_json, finish, usage);
+        http_write(conn, last, (size_t)n);
+    } else {
+        char esc_stack[4096];
+        char *esc = esc_stack;
+        const size_t need_esc = json_escape(buf ? buf : "", used, NULL, 0) + 8;
+        if (need_esc > sizeof esc_stack) esc = malloc(need_esc);
+        if (esc) {
+            json_escape(buf ? buf : "", used, esc, need_esc);
+            size_t cap = need_esc + 1024 + (calls_json ? strlen(calls_json) : 0);
+            char *out = malloc(cap);
+            if (out) {
+                /* OpenAI sends content: null when the turn was only a call. */
+                const int n = snprintf(out, cap,
+                    "{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":%s,"
+                    "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
+                    "\"content\":%s%s%s},\"finish_reason\":\"%s\"}],%s}\n",
+                    req_id, model_json,
+                    (calls_json && used == 0) ? "null" : esc,
+                    calls_json ? ",\"tool_calls\":" : "",
+                    calls_json ? calls_json : "",
+                    finish, usage);
+                http_respond(conn, 200, "application/json", out, (size_t)n);
+                free(out);
+            }
+            if (esc != esc_stack) free(esc);
+        }
+    }
+
+    mynah_slm_tool_calls_free(parsed, n_parsed);
+    free(calls_json);
+}
+
 /* ── handlers ─────────────────────────────────────────────────────────────── */
 
 static void handle_health(server_ctx *c, http_conn *conn) {
@@ -204,8 +305,8 @@ static void handle_health(server_ctx *c, http_conn *conn) {
     const unsigned long cq = c->cancelled_queued, cr = c->cancelled_running;
     pthread_mutex_unlock(&c->gate_mu);
 
-    char body[768];
-    const int len = snprintf(body, sizeof body,
+    char body[2048];
+    int len = snprintf(body, sizeof body,
         "{\"status\":\"ok\",\"model\":\"%s\",\"n_ctx\":%u,\"threads\":%d,"
         "\"recent_requests\":%u,\"recent_decode_tok_s\":%.2f,"
         "\"running\":%d,\"waiting\":%u,\"connections\":%d,\"rejected\":%lu,"
@@ -213,6 +314,17 @@ static void handle_health(server_ctx *c, http_conn *conn) {
         c->model_name, c->n_ctx, mynah_slm_threads_count(), n, avg,
         busy, waiting, http_live_connections(), http_rejected_connections(),
         cq + cr, cq, cr);
+    if (c->slots > 1 && len > 2 && (size_t)len < sizeof body) {
+        /* Replace the closing "}\n" with the scheduler's members. */
+        len -= 2;
+        pthread_mutex_lock(&c->stat_mu);
+        const unsigned long rq = c->rejected_queue;
+        pthread_mutex_unlock(&c->stat_mu);
+        len += snprintf(body + len, sizeof body - (size_t)len, ",\"rejected_queue\":%lu,", rq);
+        if ((size_t)len < sizeof body) len += slots_health(body + len, sizeof body - (size_t)len);
+        if ((size_t)len + 3 < sizeof body) len += snprintf(body + len, sizeof body - (size_t)len, "}\n");
+    }
+    if ((size_t)len >= sizeof body) len = (int)sizeof body - 1;
     http_respond(conn, 200, "application/json", body, (size_t)len);
 }
 
@@ -257,6 +369,89 @@ static void handle_tokenize(server_ctx *c, http_conn *conn,
 
     http_respond(conn, 200, "application/json", out, o);
     free(out); free(ids); free(text);
+}
+
+/* ── the continuous-batching path (--slots N > 1) ─────────────────────────── */
+
+static void chat_slots(server_ctx *c, http_conn *conn, const uint32_t *ids, size_t n_prompt,
+                       int max_new, const mynah_slm_sampler_params *sp, int stream,
+                       const char *req_id, const char *model_json,
+                       long tool_open, long tool_close) {
+    const uint32_t eos[] = { mynah_slm_tokenizer_eos(c->tok), 151643u };
+    slots_params p;
+    memset(&p, 0, sizeof p);
+    p.ids = ids;
+    p.n_prompt = n_prompt;
+    p.max_new = max_new > 0 ? (uint32_t)max_new : 0;
+    p.sp = *sp;
+    p.eos = eos;
+    p.n_eos = 2;
+    p.think_open  = mynah_slm_token_find(c->tok, "<think>");
+    p.think_close = mynah_slm_token_find(c->tok, "</think>");
+    p.tool_open = tool_open;
+    p.tool_close = tool_close;
+    p.stream = stream;
+    p.req_id = req_id;
+    p.model_json = model_json;
+
+    if (http_peer_gone(conn)) {                       /* left while we parsed */
+        pthread_mutex_lock(&c->gate_mu);
+        c->cancelled_queued++;
+        pthread_mutex_unlock(&c->gate_mu);
+        return;
+    }
+    slots_result r;
+    if (slots_run(conn, &p, &r) != 0) {
+        /* Every slot busy and the queue full: refuse NOW, visibly, rather
+         * than park the client where no metric sees the wait. */
+        pthread_mutex_lock(&c->stat_mu);
+        c->rejected_queue++;
+        pthread_mutex_unlock(&c->stat_mu);
+        http_busy(conn, "every slot is busy and the queue is full, retry shortly", 1);
+        return;
+    }
+
+    if (r.outcome == MYNAH_SLM_JOB_CANCELLED || r.client_gone) {
+        pthread_mutex_lock(&c->gate_mu);
+        if (r.tm.t0_ == 0.0) c->cancelled_queued++; else c->cancelled_running++;
+        pthread_mutex_unlock(&c->gate_mu);
+        fprintf(stderr, "[%s cancelled: client gone during %s, %u tokens generated of "
+                        "max_tokens %d, prompt %zu, queued %.1f ms]\n",
+                req_id, r.tm.t0_ == 0.0 ? "the queue" : r.tm.n_prompt ? "decode" : "prefill",
+                r.tm.n_gen, max_new, n_prompt, r.queue_ms);
+    } else if (r.outcome != MYNAH_SLM_JOB_DONE) {
+        const int status = r.outcome == MYNAH_SLM_JOB_REFUSED ? 400 : 500;
+        const char *msg = r.error[0] ? r.error : "generation failed";
+        if (r.header_sent) {
+            char esc[256], frame[512];
+            json_escape(msg, strlen(msg), esc, sizeof esc);
+            const int n = snprintf(frame, sizeof frame,
+                                   "data: {\"error\":{\"message\":%s}}\n\ndata: [DONE]\n\n", esc);
+            http_write(conn, frame, (size_t)n);
+        } else {
+            http_error(conn, status, msg);
+        }
+    } else {
+        record_tok_s(c, mynah_slm_decode_tok_s(&r.tm));
+        /* The same members as the serialized path, plus where the time went
+         * before admission: TTFT is measured from ADMISSION (as it is from
+         * the lock there), so the queue is reported separately, never
+         * hidden inside it or left out. */
+        char usage[640];
+        snprintf(usage, sizeof usage,
+            "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,"
+            "\"total_tokens\":%u,\"load_ms\":%.1f,\"ttft_ms\":%.1f,"
+            "\"prefill_tok_s\":%.2f,\"decode_tok_s\":%.2f,\"threads\":%d,"
+            "\"queue_ms\":%.1f,\"slots\":%u}",
+            r.tm.n_prompt, r.tm.n_gen, r.tm.n_prompt + r.tm.n_gen,
+            r.tm.load_s * 1000.0, r.tm.ttft_s * 1000.0,
+            mynah_slm_prefill_tok_s(&r.tm), mynah_slm_decode_tok_s(&r.tm), r.tm.n_threads,
+            r.queue_ms, c->slots);
+        send_completion(conn, stream, req_id, model_json, r.content, r.content_used,
+                        r.tool, r.tool_used, usage);
+    }
+    free(r.content);
+    free(r.tool);
 }
 
 static void handle_chat(server_ctx *c, http_conn *conn,
@@ -405,6 +600,16 @@ static void handle_chat(server_ctx *c, http_conn *conn,
     char model_json[128];
     json_escape(c->model_name, strlen(c->model_name), model_json, sizeof model_json);
 
+    if (c->slots > 1) {
+        const mynah_slm_chat_family *cf = mynah_slm_chat_family_for(mynah_slm_arch(c->model));
+        chat_slots(c, conn, ids, (size_t)n_prompt, max_new, &sp, stream, req_id, model_json,
+                   tools ? mynah_slm_token_find(c->tok, cf->call_open) : -1,
+                   tools ? mynah_slm_token_find(c->tok, cf->call_close) : -1);
+        free(ids);
+        free(text);
+        goto cleanup_msgs;
+    }
+
     if (stream) http_begin_sse(conn);
 
     emit_ctx e = { .conn = conn, .id = req_id, .model_name = model_json, .stream = stream };
@@ -507,85 +712,8 @@ static void handle_chat(server_ctx *c, http_conn *conn,
         tm.load_s * 1000.0, tm.ttft_s * 1000.0,
         mynah_slm_prefill_tok_s(&tm), mynah_slm_decode_tok_s(&tm), tm.n_threads);
 
-    /* A function call is data, not prose: it leaves the answer channel empty
-     * and changes finish_reason. A client that ignores tool_calls must not be
-     * handed the raw JSON in `content` — that is what the channel split in
-     * generate.c is for. */
-    mynah_slm_tool_call parsed[16];
-    size_t n_parsed = 0;
-    char  *calls_json = NULL;
-    if (e_tool.used) {
-        size_t blocks = 0;
-        const long got = mynah_slm_tool_calls_parse(e_tool.buf, e_tool.used, parsed,
-                                                    sizeof parsed / sizeof *parsed, &blocks);
-        if (got > 0) {
-            n_parsed = (size_t)(got < 16 ? got : 16);
-            const size_t nj = mynah_slm_tool_calls_to_json(parsed, n_parsed, NULL, 0) + 1;
-            calls_json = malloc(nj);
-            if (calls_json) mynah_slm_tool_calls_to_json(parsed, n_parsed, calls_json, nj);
-        }
-    }
-    const char *finish = calls_json ? "tool_calls" : "stop";
-
-    /* The newline the template puts between an answer and a call is glue, not
-     * content. Only trimmed when a call actually followed. */
-    if (calls_json && e.buf)
-        while (e.used && (e.buf[e.used - 1] == '\n' || e.buf[e.used - 1] == ' ' ||
-                          e.buf[e.used - 1] == '\t' || e.buf[e.used - 1] == '\r'))
-            e.buf[--e.used] = '\0';
-
-    if (stream) {
-        /* One frame carrying the whole call. Splitting a JSON object across
-         * deltas would let a client act on half an argument list. */
-        if (calls_json) {
-            const size_t cap = strlen(calls_json) + 512;
-            char *frame = malloc(cap);
-            if (frame) {
-                const int n = snprintf(frame, cap,
-                    "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
-                    "\"model\":%s,\"choices\":[{\"index\":0,"
-                    "\"delta\":{\"tool_calls\":%s},\"finish_reason\":null}]}\n\n",
-                    req_id, model_json, calls_json);
-                http_write(conn, frame, (size_t)n);
-                free(frame);
-            }
-        }
-        char last[1024];
-        const int n = snprintf(last, sizeof last,
-            "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
-            "\"model\":%s,\"choices\":[{\"index\":0,\"delta\":{},"
-            "\"finish_reason\":\"%s\"}],%s}\n\ndata: [DONE]\n\n",
-            req_id, model_json, finish, usage);
-        http_write(conn, last, (size_t)n);
-    } else {
-        char esc_stack[4096];
-        char *esc = esc_stack;
-        const size_t need_esc = json_escape(e.buf ? e.buf : "", e.used, NULL, 0) + 8;
-        if (need_esc > sizeof esc_stack) esc = malloc(need_esc);
-        if (esc) {
-            json_escape(e.buf ? e.buf : "", e.used, esc, need_esc);
-            size_t cap = need_esc + 1024 + (calls_json ? strlen(calls_json) : 0);
-            char *out = malloc(cap);
-            if (out) {
-                /* OpenAI sends content: null when the turn was only a call. */
-                const int n = snprintf(out, cap,
-                    "{\"id\":\"%s\",\"object\":\"chat.completion\",\"model\":%s,"
-                    "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
-                    "\"content\":%s%s%s},\"finish_reason\":\"%s\"}],%s}\n",
-                    req_id, model_json,
-                    (calls_json && e.used == 0) ? "null" : esc,
-                    calls_json ? ",\"tool_calls\":" : "",
-                    calls_json ? calls_json : "",
-                    finish, usage);
-                http_respond(conn, 200, "application/json", out, (size_t)n);
-                free(out);
-            }
-            if (esc != esc_stack) free(esc);
-        }
-    }
-
-    mynah_slm_tool_calls_free(parsed, n_parsed);
-    free(calls_json);
+    send_completion(conn, stream, req_id, model_json, e.buf, e.used,
+                    e_tool.buf, e_tool.used, usage);
     free(e_tool.buf);
     free(e.buf);
     free(ids);
@@ -632,10 +760,14 @@ static void usage_text(FILE *f) {
         "  POST /v1/tokenize\n"
         "\n"
         "  --max-conns N        connections at once; one more gets 503 (default 64)\n"
+        "  --slots N            continuous batching: N requests per decode step,\n"
+        "                       one scheduler thread (default 1 = serialized)\n"
+        "  --queue N            requests waiting for a slot before a 503 (default 2N)\n"
         "  --send-timeout-ms N  a client that stops reading is dropped (default 5000)\n"
         "\n"
-        "Inference is serialized: one request at a time, all threads. A client\n"
-        "that disconnects stops costing CPU at the next step boundary.\n",
+        "By default inference is serialized: one request at a time, all threads.\n"
+        "With --slots N one scheduler thread steps up to N requests together.\n"
+        "Either way a client that disconnects stops costing CPU at the next step.\n",
         mynah_slm_version());
 }
 
@@ -643,6 +775,7 @@ int main(int argc, char **argv) {
     const char *model_path = NULL, *host = "127.0.0.1";
     int port = 8080, n_ctx = 0, threads = 0;
     http_limits limits = { 0, 0, 0 };
+    int slots = 1, queue = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -653,6 +786,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--ctx") && v)     { n_ctx = atoi(v); i++; }
         else if ((!strcmp(a, "-t") || !strcmp(a, "--threads")) && v) { threads = atoi(v); i++; }
         else if (!strcmp(a, "--max-conns") && v)       { limits.max_conns = atoi(v); i++; }
+        else if (!strcmp(a, "--slots") && v)           { slots = atoi(v); i++; }
+        else if (!strcmp(a, "--queue") && v)           { queue = atoi(v); i++; }
         else if (!strcmp(a, "--send-timeout-ms") && v) { limits.send_timeout_ms = atoi(v); i++; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage_text(stdout); return 0; }
         else { fprintf(stderr, "mynah-slm-server: unknown option '%s'\n", a); return 2; }
@@ -682,11 +817,36 @@ int main(int argc, char **argv) {
     ctx.n_ctx = n_ctx > 0 ? (uint32_t)n_ctx : mynah_slm_n_ctx(ctx.model);
 
     const int nth = mynah_slm_threads_init(threads);
+    ctx.slots = slots > 1 ? (uint32_t)slots : 1;
+    if (ctx.slots > 1 &&
+        slots_start(ctx.model, ctx.tok, ctx.slots, ctx.n_ctx,
+                    queue > 0 ? (uint32_t)queue : 0, err, sizeof err) != 0) {
+        fprintf(stderr, "mynah-slm-server: --slots %u: %s\n", ctx.slots, err);
+        return 1;
+    }
     fprintf(stderr, "mynah-slm-server %s | %s | ctx %u | %d threads | http://%s:%d\n",
             mynah_slm_version(), ctx.model_name, ctx.n_ctx, nth, host, port);
 
     const int rc = http_serve(host, port, on_request, &ctx, &limits, &g_stop, err, sizeof err);
     if (rc != 0) fprintf(stderr, "mynah-slm-server: %s\n", err);
+    if (ctx.slots > 1) slots_stop();
+
+    /* Connection threads are detached and use the model and the tokenizer:
+     * freeing those under a live one is a use-after-free, and even after the
+     * last one returned nothing orders its accesses before our free (TSan
+     * flagged exactly that). The live counter is decremented as each thread's
+     * last act, so waiting for zero is both the drain and the ordering. If
+     * they do not finish in time, exit without freeing: the OS reclaims it,
+     * which is safe; a free under a running thread is not. */
+    for (int i = 0; i < 300 && http_live_connections() > 0; i++) {
+        struct timespec ts = { 0, 100 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    if (http_live_connections() > 0) {
+        fprintf(stderr, "mynah-slm-server: %d connection(s) still running at exit; "
+                        "not freeing the model under them\n", http_live_connections());
+        return rc;
+    }
 
     mynah_slm_tokenizer_free(ctx.tok);
     mynah_slm_free(ctx.model);
