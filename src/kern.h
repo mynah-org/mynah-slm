@@ -105,7 +105,31 @@ typedef struct {
                    const int8_t *xq, const float *xscale, float *out);
     void (*q6k_i8)(const unsigned char *w, size_t rows, size_t nb,
                    const int8_t *xq, const float *xscale, float *out);
+
+    /* Weight-stationary twins of the four above (K7, .work/batched-decode-
+     * kernel.md): `nt` tokens (1..MYNAH_SLM_WS_MAX) against the same rows,
+     * each weight unit decoded ONCE and applied to every token. Token t reads
+     * x[t] / xq[t], xscale[t], xsum[t] and writes out[t][0..rows). Per token
+     * the result is BIT-IDENTICAL to the single-token entry of the same
+     * table: same operations in the same order. The int8 ones are NULL where
+     * the int8 ones above are. */
+    void (*q4k_f32_ws)(const unsigned char *w, size_t rows, size_t blocks, size_t nt,
+                       const float *const *x, const float *const *xsum,
+                       float *const *out);
+    void (*q4k_i8_ws)(const unsigned char *w, size_t rows, size_t blocks, size_t nt,
+                      const int8_t *const *xq, const float *const *xscale,
+                      const float *const *xsum, float *const *out);
+    void (*q80_i8_ws)(const unsigned char *w, size_t rows, size_t nb, size_t nt,
+                      const int8_t *const *xq, const float *const *xscale,
+                      float *const *out);
+    void (*q6k_i8_ws)(const unsigned char *w, size_t rows, size_t nb, size_t nt,
+                      const int8_t *const *xq, const float *const *xscale,
+                      float *const *out);
 } mynah_slm_qmat_kern;
+
+/* Tokens per weight-stationary call, and per register group inside one. */
+#define MYNAH_SLM_WS_MAX   16
+#define MYNAH_SLM_WS_GROUP 4
 
 /* ── attn: the attention inner loops (src/attn_kern.c) ─────────────────────
  * Dispatched once per HEAD, not once per position: an indirect call per

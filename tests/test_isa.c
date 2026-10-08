@@ -198,6 +198,21 @@ static void ulp_q4k_i8(const unsigned char *w, size_t rows, size_t blocks,
     out[0] = nextafterf(out[0], INFINITY);          /* one ulp: a reordered sum */
 }
 
+/* K7: weight-stationary entries one ulp off for ONE token of the group */
+static void ulp_q4k_f32_ws(const unsigned char *w, size_t rows, size_t blocks, size_t nt,
+                           const float *const *x, const float *const *xsum,
+                           float *const *out) {
+    g_wrapped->q4k_f32_ws(w, rows, blocks, nt, x, xsum, out);
+    out[nt - 1][0] = nextafterf(out[nt - 1][0], INFINITY);
+}
+
+static void ulp_q6k_i8_ws(const unsigned char *w, size_t rows, size_t nb, size_t nt,
+                          const int8_t *const *xq, const float *const *xscale,
+                          float *const *out) {
+    g_wrapped->q6k_i8_ws(w, rows, nb, nt, xq, xscale, out);
+    out[1][rows - 1] = nextafterf(out[1][rows - 1], -INFINITY);
+}
+
 static void test_verify_teeth(void) {
     char why[128];
     for (size_t i = 0; i < N_LEVELS; i++) {
@@ -227,7 +242,19 @@ static void test_verify_teeth(void) {
         check("verify REJECTS an int8 kernel one ulp off its twin",
               mynah_slm_isa_verify_qmat(&bad, why, sizeof why) != 0, "it passed");
         printf("     (%s)\n", why);
+        bad = *g_wrapped;
+        bad.q6k_i8_ws = ulp_q6k_i8_ws;
+        why[0] = '\0';
+        check("verify REJECTS a weight-stationary int8 kernel one ulp off for one token",
+              mynah_slm_isa_verify_qmat(&bad, why, sizeof why) != 0, "it passed");
+        printf("     (%s)\n", why);
     }
+    bad = *g_wrapped;
+    bad.q4k_f32_ws = ulp_q4k_f32_ws;
+    why[0] = '\0';
+    check("verify REJECTS a weight-stationary f32 kernel one ulp off for one token",
+          mynah_slm_isa_verify_qmat(&bad, why, sizeof why) != 0, "it passed");
+    printf("     (%s)\n", why);
 }
 
 /* ── every level against scalar, and threads, on the real shapes ─────────*/

@@ -927,7 +927,483 @@ static void q6k_i8_rows(const unsigned char *base, size_t rows, size_t nb,
     for (; r + 4 <= rows; r += 4) Q6K_I8_KERNEL(base + r * rb, rb, 4, nb, xq, xscale, out + r);
     for (; r < rows; r++)         Q6K_I8_KERNEL(base + r * rb, rb, 1, nb, xq, xscale, out + r);
 }
+
+/* ── int8, weight-stationary (K7, .work/batched-decode-kernel.md) ──────────
+ * ONE row against `nt` (1..4) token vectors: each weight unit is decoded once
+ * — nibbles split, 6-bit values reassembled, bias corrections taken — and
+ * then dotted against every token's int8 activations. Per token the float
+ * operations are the K3/K4 contract above, in the same order, so a token's
+ * result is bit-identical to the single-token kernels and the scalar twin
+ * (tests/test_kernels.c, memcmp, at every ISA level).
+ *
+ * The one reformulation: Q6_K on VNNI/AVX2. The single-token kernel feeds
+ * the stored u = q + 32 (unsigned) against the signed activations and
+ * removes 32 * SUM xq — an ACTIVATION-side term, shared by four rows. Here
+ * the sharing runs across TOKENS, so the sides swap: the activation is made
+ * unsigned (xq ^ 0x80 = xq + 128, one xor per load) against the signed
+ * q = u - 32, and 128 * SUM q is removed — a WEIGHT-side term, computed once
+ * per block for all the tokens. Both are exact in int32 and equal SUM q * xq
+ * lane by lane, so the floats that follow are the same floats. (maddubs:
+ * |255 * 32 * 2| = 16320 stays inside int16.) */
+#define QK_WSG MYNAH_SLM_WS_GROUP
+
+#if defined(MYNAH_SLM_HAVE_AVX512VNNI)
+Q4K_INLINE void q4k_i8_ws_avx512(const unsigned char *row, const int nt, size_t blocks,
+                                 const int8_t *const *xq, const float *const *xscale,
+                                 const float *const *xsum, float *res) {
+    __m512 acc[QK_WSG];
+    __m256 mins[QK_WSG];
+    for (int t = 0; t < nt; t++) {
+        acc[t]  = _mm512_setzero_ps();
+        mins[t] = _mm256_setzero_ps();
+    }
+    const __m256i nib = _mm256_set1_epi8(0x0f);
+    const __m512i sel[4] = {
+        _mm512_set_epi32(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0),
+        _mm512_set_epi32(3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2),
+        _mm512_set_epi32(5, 5, 5, 5, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4),
+        _mm512_set_epi32(7, 7, 7, 7, 7, 7, 7, 7, 6, 6, 6, 6, 6, 6, 6, 6),
+    };
+
+    for (size_t b = 0; b < blocks; b++) {
+        const unsigned char *block = row + b * 144;
+        uint8_t u[16];
+        q4_k_unpack8(block + 4, u);
+        const __m256 dsc  = _mm256_mul_ps(_mm256_set1_ps(mynah_slm_f16_to_f32(block)),
+                                          q4k_u8x8_f32(u));
+        const __m256 dmin = _mm256_set1_ps(mynah_slm_f16_to_f32(block + 2));
+        const __m256 mn   = q4k_u8x8_f32(u + 8);
+        __m512 s[QK_WSG];
+        for (int t = 0; t < nt; t++) {
+            s[t] = _mm512_castps256_ps512(_mm256_mul_ps(dsc, _mm256_loadu_ps(xscale[t] + b * 8)));
+            mins[t] = _mm256_fmadd_ps(dmin, _mm256_mul_ps(mn, _mm256_loadu_ps(xsum[t] + b * 8)),
+                                      mins[t]);
+        }
+        for (int p = 0; p < 4; p++) {
+            const unsigned char *q = block + 16 + (size_t)p * 32;
+            const __m256i pk = _mm256_loadu_si256((const __m256i *)(const void *)q);
+            const __m256i nl = _mm256_and_si256(pk, nib);
+            const __m256i nh = _mm256_and_si256(_mm256_srli_epi16(pk, 4), nib);
+            const __m512i w  = _mm512_inserti64x4(_mm512_castsi256_si512(nl), nh, 1);
+            for (int t = 0; t < nt; t++) {
+                const __m512i x = _mm512_loadu_si512(
+                    (const void *)(xq[t] + b * 256 + (size_t)p * 64));
+                const __m512i i32 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w, x);
+                acc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(i32),
+                                         _mm512_permutexvar_ps(sel[p], s[t]), acc[t]);
+            }
+        }
+    }
+    for (int t = 0; t < nt; t++) {
+        const __m256 lo = _mm512_castps512_ps256(acc[t]);
+        const __m256 hi = _mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(acc[t]), 1));
+        res[t] = q4k_tree256(_mm256_add_ps(lo, hi)) - q4k_tree256(mins[t]);
+    }
+}
+
+Q4K_INLINE void q80_i8_ws_avx512(const unsigned char *row, const int nt, size_t nb,
+                                 const int8_t *const *xq, const float *const *xscale,
+                                 float *res) {
+    __m512 acc[QK_WSG];
+    for (int t = 0; t < nt; t++) acc[t] = _mm512_setzero_ps();
+    const __m512i bias = _mm512_set1_epi8((char)0x80);
+    const __m512i zero = _mm512_setzero_si512();
+    size_t b = 0;
+    for (; b + 2 <= nb; b += 2) {
+        const unsigned char *blk = row + b * 34;
+        const __m512i w = _mm512_inserti64x4(
+            _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)(const void *)(blk + 2))),
+            _mm256_loadu_si256((const __m256i *)(const void *)(blk + 36)), 1);
+        const __m512i wc = _mm512_dpbusd_epi32(zero, bias, w);          /* 128 * SUM w */
+        const __m512  dh = q_halves(q_f16(blk), q_f16(blk + 34));
+        for (int t = 0; t < nt; t++) {
+            const __m512i xu = _mm512_xor_si512(
+                _mm512_loadu_si512((const void *)(xq[t] + b * 32)), bias);
+            const __m512i l = _mm512_sub_epi32(_mm512_dpbusd_epi32(zero, xu, w), wc);
+            const __m512  s = _mm512_mul_ps(dh, q_halves(xscale[t][b], xscale[t][b + 1]));
+            acc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(l), s, acc[t]);
+        }
+    }
+    if (b < nb) {                       /* an odd block count: the last is even, so E */
+        const unsigned char *blk = row + b * 34;
+        const __m256i bias8 = _mm256_set1_epi8((char)0x80);
+        const __m256i w  = _mm256_loadu_si256((const __m256i *)(const void *)(blk + 2));
+        const __m256i wc = _mm256_dpbusd_epi32(_mm256_setzero_si256(), bias8, w);
+        const float d = q_f16(blk);
+        for (int t = 0; t < nt; t++) {
+            const __m256i xu = _mm256_xor_si256(
+                _mm256_loadu_si256((const __m256i *)(const void *)(xq[t] + b * 32)), bias8);
+            const __m256i l = _mm256_sub_epi32(
+                _mm256_dpbusd_epi32(_mm256_setzero_si256(), xu, w), wc);
+            const __m256 s = _mm256_set1_ps(d * xscale[t][b]);
+            acc[t] = _mm512_mask3_fmadd_ps(_mm512_castps256_ps512(_mm256_cvtepi32_ps(l)),
+                                           _mm512_castps256_ps512(s), acc[t], 0x00ff);
+        }
+    }
+    for (int t = 0; t < nt; t++) {
+        const __m256 lo = _mm512_castps512_ps256(acc[t]);
+        const __m256 hi = _mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(acc[t]), 1));
+        res[t] = q4k_tree256(_mm256_add_ps(lo, hi));
+    }
+}
+
+Q4K_INLINE void q6k_i8_ws_avx512(const unsigned char *row, const int nt, size_t nb,
+                                 const int8_t *const *xq, const float *const *xscale,
+                                 float *res) {
+    __m512 acc[QK_WSG];
+    for (int t = 0; t < nt; t++) acc[t] = _mm512_setzero_ps();
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i m0f  = _mm512_set1_epi8(0x0f);
+    const __m512i m30  = _mm512_set1_epi8(0x30);
+    const __m512i c32  = _mm512_set1_epi8(32);
+    const __m512i bias = _mm512_set1_epi8((char)0x80);
+    const __m512i dup  = _mm512_set_epi32(7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0, 0);
+    const __m512i sel[4] = {
+        _mm512_set_epi32(3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0),
+        _mm512_set_epi32(7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4),
+        _mm512_set_epi32(11, 11, 11, 11, 10, 10, 10, 10, 9, 9, 9, 9, 8, 8, 8, 8),
+        _mm512_set_epi32(15, 15, 15, 15, 14, 14, 14, 14, 13, 13, 13, 13, 12, 12, 12, 12),
+    };
+
+    for (size_t b = 0; b < nb; b++) {
+        const unsigned char *blk = row + b * 210;
+        const __m512 sc = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+            _mm_loadu_si128((const __m128i *)(const void *)(blk + 192))));
+        const __m512 dsc = _mm512_mul_ps(_mm512_set1_ps(q_f16(blk + 208)), sc);
+        __m512 s[QK_WSG];
+        for (int t = 0; t < nt; t++)
+            s[t] = _mm512_mul_ps(dsc, _mm512_permutexvar_ps(
+                dup, _mm512_castps256_ps512(_mm256_loadu_ps(xscale[t] + b * 8))));
+        for (int h = 0; h < 2; h++) {
+            const __m512i ql = _mm512_loadu_si512((const void *)(blk + 64 * h));
+            const __m256i qh = _mm256_loadu_si256(
+                (const __m256i *)(const void *)(blk + 128 + 32 * h));
+            const __m512i h0 = _mm512_inserti64x4(_mm512_castsi256_si512(qh),
+                                                  _mm256_srli_epi16(qh, 2), 1);
+            const __m512i qa = _mm512_sub_epi8(_mm512_or_si512(
+                _mm512_and_si512(ql, m0f), _mm512_and_si512(_mm512_slli_epi16(h0, 4), m30)), c32);
+            const __m512i qc = _mm512_sub_epi8(_mm512_or_si512(
+                _mm512_and_si512(_mm512_srli_epi16(ql, 4), m0f), _mm512_and_si512(h0, m30)), c32);
+            const __m512i wa = _mm512_dpbusd_epi32(zero, bias, qa);      /* 128 * SUM q */
+            const __m512i wc = _mm512_dpbusd_epi32(zero, bias, qc);
+            for (int t = 0; t < nt; t++) {
+                const int8_t *xb = xq[t] + b * 256 + (size_t)h * 128;
+                const __m512i xa = _mm512_xor_si512(_mm512_loadu_si512((const void *)xb), bias);
+                const __m512i xc = _mm512_xor_si512(_mm512_loadu_si512((const void *)(xb + 64)), bias);
+                const __m512i la = _mm512_sub_epi32(_mm512_dpbusd_epi32(zero, xa, qa), wa);
+                const __m512i lc = _mm512_sub_epi32(_mm512_dpbusd_epi32(zero, xc, qc), wc);
+                acc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(la),
+                                         _mm512_permutexvar_ps(sel[2 * h], s[t]), acc[t]);
+                acc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(lc),
+                                         _mm512_permutexvar_ps(sel[2 * h + 1], s[t]), acc[t]);
+            }
+        }
+    }
+    for (int t = 0; t < nt; t++) {
+        const __m256 lo = _mm512_castps512_ps256(acc[t]);
+        const __m256 hi = _mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(acc[t]), 1));
+        res[t] = q4k_tree256(_mm256_add_ps(lo, hi));
+    }
+}
+#define Q4K_I8_WS_KERNEL q4k_i8_ws_avx512
+#define Q80_I8_WS_KERNEL q80_i8_ws_avx512
+#define Q6K_I8_WS_KERNEL q6k_i8_ws_avx512
+
+#elif defined(MYNAH_SLM_K_AVX2)
+Q4K_INLINE void q4k_i8_ws_avx2(const unsigned char *row, const int nt, size_t blocks,
+                               const int8_t *const *xq, const float *const *xscale,
+                               const float *const *xsum, float *res) {
+    __m256 e[QK_WSG], o[QK_WSG];
+    _Alignas(32) float mins[QK_WSG][8];
+    _Alignas(32) float s[QK_WSG][8];
+    for (int t = 0; t < nt; t++) {
+        e[t] = o[t] = _mm256_setzero_ps();
+        _mm256_store_ps(mins[t], _mm256_setzero_ps());
+    }
+    const __m256i nib  = _mm256_set1_epi8(0x0f);
+    const __m256i ones = _mm256_set1_epi16(1);
+
+    for (size_t b = 0; b < blocks; b++) {
+        const unsigned char *block = row + b * 144;
+        uint8_t u[16];
+        q4_k_unpack8(block + 4, u);
+        const __m256 dsc  = _mm256_mul_ps(_mm256_set1_ps(mynah_slm_f16_to_f32(block)),
+                                          q4k_u8x8_f32(u));
+        const __m256 dmin = _mm256_set1_ps(mynah_slm_f16_to_f32(block + 2));
+        const __m256 mn   = q4k_u8x8_f32(u + 8);
+        for (int t = 0; t < nt; t++) {
+            _mm256_store_ps(s[t], _mm256_mul_ps(dsc, _mm256_loadu_ps(xscale[t] + b * 8)));
+            _mm256_store_ps(mins[t], _mm256_fmadd_ps(
+                dmin, _mm256_mul_ps(mn, _mm256_loadu_ps(xsum[t] + b * 8)),
+                _mm256_load_ps(mins[t])));
+        }
+        for (int p = 0; p < 4; p++) {
+            const unsigned char *q = block + 16 + (size_t)p * 32;
+            const __m256i pk = _mm256_loadu_si256((const __m256i *)(const void *)q);
+            const __m256i nl = _mm256_and_si256(pk, nib);
+            const __m256i nh = _mm256_and_si256(_mm256_srli_epi16(pk, 4), nib);
+            for (int t = 0; t < nt; t++) {
+                const int8_t *xb = xq[t] + b * 256 + (size_t)p * 64;
+                const __m256i xl = _mm256_loadu_si256((const __m256i *)(const void *)xb);
+                const __m256i xh = _mm256_loadu_si256((const __m256i *)(const void *)(xb + 32));
+                const __m256i i0 = _mm256_madd_epi16(_mm256_maddubs_epi16(nl, xl), ones);
+                const __m256i i1 = _mm256_madd_epi16(_mm256_maddubs_epi16(nh, xh), ones);
+                e[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i0),
+                                       _mm256_broadcast_ss(&s[t][2 * p]), e[t]);
+                o[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i1),
+                                       _mm256_broadcast_ss(&s[t][2 * p + 1]), o[t]);
+            }
+        }
+    }
+    for (int t = 0; t < nt; t++)
+        res[t] = q4k_tree256(_mm256_add_ps(e[t], o[t])) -
+                 q4k_tree256(_mm256_load_ps(mins[t]));
+}
+
+Q4K_INLINE void q80_i8_ws_avx2(const unsigned char *row, const int nt, size_t nb,
+                               const int8_t *const *xq, const float *const *xscale,
+                               float *res) {
+    __m256 e[QK_WSG], o[QK_WSG];
+    for (int t = 0; t < nt; t++) e[t] = o[t] = _mm256_setzero_ps();
+    const __m256i ones = _mm256_set1_epi16(1);
+    for (size_t b = 0; b < nb; b++) {
+        const unsigned char *blk = row + b * 34;
+        const __m256i w  = _mm256_loadu_si256((const __m256i *)(const void *)(blk + 2));
+        const __m256i aw = _mm256_abs_epi8(w);
+        const float d = q_f16(blk);
+        for (int t = 0; t < nt; t++) {
+            const __m256i x = _mm256_loadu_si256((const __m256i *)(const void *)(xq[t] + b * 32));
+            const __m256i l = _mm256_madd_epi16(
+                _mm256_maddubs_epi16(aw, _mm256_sign_epi8(x, w)), ones);
+            const __m256 s = _mm256_set1_ps(d * xscale[t][b]);
+            if (b & 1) o[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(l), s, o[t]);
+            else       e[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(l), s, e[t]);
+        }
+    }
+    for (int t = 0; t < nt; t++) res[t] = q4k_tree256(_mm256_add_ps(e[t], o[t]));
+}
+
+Q4K_INLINE void q6k_i8_ws_avx2(const unsigned char *row, const int nt, size_t nb,
+                               const int8_t *const *xq, const float *const *xscale,
+                               float *res) {
+    __m256 e[QK_WSG], o[QK_WSG];
+    _Alignas(32) float s[QK_WSG][16];
+    for (int t = 0; t < nt; t++) e[t] = o[t] = _mm256_setzero_ps();
+    const __m256i ones = _mm256_set1_epi16(1);
+    const __m256i m0f  = _mm256_set1_epi8(0x0f);
+    const __m256i m30  = _mm256_set1_epi8(0x30);
+    const __m256i c32  = _mm256_set1_epi8(32);
+    const __m256i bias = _mm256_set1_epi8((char)0x80);
+    const __m256i dup  = _mm256_set_epi32(3, 3, 2, 2, 1, 1, 0, 0);
+    const __m256i sel[4] = {           /* lanes 0-3 <- 2k, 4-7 <- 2k+1 */
+        _mm256_set_epi32(1, 1, 1, 1, 0, 0, 0, 0), _mm256_set_epi32(3, 3, 3, 3, 2, 2, 2, 2),
+        _mm256_set_epi32(5, 5, 5, 5, 4, 4, 4, 4), _mm256_set_epi32(7, 7, 7, 7, 6, 6, 6, 6),
+    };
+
+    for (size_t b = 0; b < nb; b++) {
+        const unsigned char *blk = row + b * 210;
+        const __m256 d = _mm256_set1_ps(q_f16(blk + 208));
+        const __m128i sc = _mm_loadu_si128((const __m128i *)(const void *)(blk + 192));
+        const __m256 dsc_lo = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(sc)));
+        const __m256 dsc_hi = _mm256_mul_ps(
+            d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(sc, 8))));
+        for (int t = 0; t < nt; t++) {
+            const __m256 xs8 = _mm256_loadu_ps(xscale[t] + b * 8);
+            _mm256_store_ps(s[t], _mm256_mul_ps(dsc_lo, _mm256_permutevar8x32_ps(xs8, dup)));
+            _mm256_store_ps(s[t] + 8, _mm256_mul_ps(dsc_hi, _mm256_permutevar8x32_ps(
+                xs8, _mm256_add_epi32(dup, _mm256_set1_epi32(4)))));
+        }
+        for (int h = 0; h < 2; h++) {
+            for (int k = 0; k < 4; k++) {
+                const int c = 4 * h + k;
+                const __m256i ql = _mm256_loadu_si256(
+                    (const __m256i *)(const void *)(blk + 64 * h + 32 * (k & 1)));
+                const __m256i qh = _mm256_loadu_si256(
+                    (const __m256i *)(const void *)(blk + 128 + 32 * h));
+                __m256i lo, hi;
+                switch (k) {
+                case 0:  lo = ql;                        hi = _mm256_slli_epi16(qh, 4); break;
+                case 1:  lo = ql;                        hi = _mm256_slli_epi16(qh, 2); break;
+                case 2:  lo = _mm256_srli_epi16(ql, 4);  hi = qh;                       break;
+                default: lo = _mm256_srli_epi16(ql, 4);  hi = _mm256_srli_epi16(qh, 2); break;
+                }
+                const __m256i q = _mm256_sub_epi8(
+                    _mm256_or_si256(_mm256_and_si256(lo, m0f), _mm256_and_si256(hi, m30)), c32);
+                const __m256i wq = _mm256_madd_epi16(_mm256_maddubs_epi16(bias, q), ones);
+                for (int t = 0; t < nt; t++) {
+                    const __m256i xu = _mm256_xor_si256(_mm256_loadu_si256(
+                        (const __m256i *)(const void *)(xq[t] + b * 256 + (size_t)c * 32)), bias);
+                    const __m256i l = _mm256_sub_epi32(
+                        _mm256_madd_epi16(_mm256_maddubs_epi16(xu, q), ones), wq);
+                    const __m256 sv = _mm256_permutevar8x32_ps(
+                        _mm256_load_ps(s[t] + (c >= 4 ? 8 : 0)), sel[c & 3]);
+                    if (c & 1) o[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(l), sv, o[t]);
+                    else       e[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(l), sv, e[t]);
+                }
+            }
+        }
+    }
+    for (int t = 0; t < nt; t++) res[t] = q4k_tree256(_mm256_add_ps(e[t], o[t]));
+}
+#define Q4K_I8_WS_KERNEL q4k_i8_ws_avx2
+#define Q80_I8_WS_KERNEL q80_i8_ws_avx2
+#define Q6K_I8_WS_KERNEL q6k_i8_ws_avx2
+
+#elif defined(MYNAH_SLM_K_DOTPROD)
+Q4K_INLINE void q4k_i8_ws_neon(const unsigned char *row, const int nt, size_t blocks,
+                               const int8_t *const *xq, const float *const *xscale,
+                               const float *const *xsum, float *res) {
+    float32x4_t e0[QK_WSG], e1[QK_WSG], o0[QK_WSG], o1[QK_WSG], m0[QK_WSG], m1[QK_WSG];
+    float s[QK_WSG][8];
+    for (int t = 0; t < nt; t++)
+        e0[t] = e1[t] = o0[t] = o1[t] = m0[t] = m1[t] = vdupq_n_f32(0.0f);
+    const uint8x16_t nib = vdupq_n_u8(0x0f);
+    const int32x4_t  z   = vdupq_n_s32(0);
+
+    for (size_t b = 0; b < blocks; b++) {
+        const unsigned char *block = row + b * 144;
+        uint8_t u[16];
+        q4_k_unpack8(block + 4, u);
+        const float d    = mynah_slm_f16_to_f32(block);
+        const float dmin = mynah_slm_f16_to_f32(block + 2);
+        const uint8x8_t sc = vld1_u8(u), mn = vld1_u8(u + 8);
+        /* (d * sc) * xs: vmulq_n_f32 is sc*d, the same rounding. */
+        const float32x4_t dsc0 = vmulq_n_f32(q4k_u8x4_f32(sc, 0), d);
+        const float32x4_t dsc1 = vmulq_n_f32(q4k_u8x4_f32(sc, 1), d);
+        const float32x4_t mn0 = q4k_u8x4_f32(mn, 0), mn1 = q4k_u8x4_f32(mn, 1);
+        for (int t = 0; t < nt; t++) {
+            const float *xs = xscale[t] + b * 8, *xm = xsum[t] + b * 8;
+            vst1q_f32(s[t],     vmulq_f32(dsc0, vld1q_f32(xs)));
+            vst1q_f32(s[t] + 4, vmulq_f32(dsc1, vld1q_f32(xs + 4)));
+            m0[t] = vfmaq_n_f32(m0[t], vmulq_f32(mn0, vld1q_f32(xm)), dmin);
+            m1[t] = vfmaq_n_f32(m1[t], vmulq_f32(mn1, vld1q_f32(xm + 4)), dmin);
+        }
+        for (int p = 0; p < 4; p++) {
+            const unsigned char *q = block + 16 + (size_t)p * 32;
+            const uint8x16_t q0 = vld1q_u8(q), q1 = vld1q_u8(q + 16);
+            const int8x16_t l0 = vreinterpretq_s8_u8(vandq_u8(q0, nib));
+            const int8x16_t l1 = vreinterpretq_s8_u8(vandq_u8(q1, nib));
+            const int8x16_t h0 = vreinterpretq_s8_u8(vshrq_n_u8(q0, 4));
+            const int8x16_t h1 = vreinterpretq_s8_u8(vshrq_n_u8(q1, 4));
+            for (int t = 0; t < nt; t++) {
+                const int8_t *xb = xq[t] + b * 256 + (size_t)p * 64;
+                const float se = s[t][2 * p], so = s[t][2 * p + 1];
+                e0[t] = vfmaq_n_f32(e0[t], vcvtq_f32_s32(vdotq_s32(z, l0, vld1q_s8(xb))), se);
+                e1[t] = vfmaq_n_f32(e1[t], vcvtq_f32_s32(vdotq_s32(z, l1, vld1q_s8(xb + 16))), se);
+                o0[t] = vfmaq_n_f32(o0[t], vcvtq_f32_s32(vdotq_s32(z, h0, vld1q_s8(xb + 32))), so);
+                o1[t] = vfmaq_n_f32(o1[t], vcvtq_f32_s32(vdotq_s32(z, h1, vld1q_s8(xb + 48))), so);
+            }
+        }
+    }
+    for (int t = 0; t < nt; t++)
+        res[t] = q4k_tree_neon(vaddq_f32(e0[t], o0[t]), vaddq_f32(e1[t], o1[t])) -
+                 q4k_tree_neon(m0[t], m1[t]);
+}
+
+Q4K_INLINE void q80_i8_ws_neon(const unsigned char *row, const int nt, size_t nb,
+                               const int8_t *const *xq, const float *const *xscale,
+                               float *res) {
+    float32x4_t e0[QK_WSG], e1[QK_WSG], o0[QK_WSG], o1[QK_WSG];
+    for (int t = 0; t < nt; t++) e0[t] = e1[t] = o0[t] = o1[t] = vdupq_n_f32(0.0f);
+    const int32x4_t z = vdupq_n_s32(0);
+    for (size_t b = 0; b < nb; b++) {
+        const unsigned char *blk = row + b * 34;
+        const int8_t *w = (const int8_t *)(blk + 2);
+        const int8x16_t w0 = vld1q_s8(w), w1 = vld1q_s8(w + 16);
+        const float d = q_f16(blk);
+        for (int t = 0; t < nt; t++) {
+            const float s = d * xscale[t][b];
+            const float32x4_t l0 = vcvtq_f32_s32(vdotq_s32(z, w0, vld1q_s8(xq[t] + b * 32)));
+            const float32x4_t l1 = vcvtq_f32_s32(vdotq_s32(z, w1, vld1q_s8(xq[t] + b * 32 + 16)));
+            if (b & 1) { o0[t] = vfmaq_n_f32(o0[t], l0, s); o1[t] = vfmaq_n_f32(o1[t], l1, s); }
+            else       { e0[t] = vfmaq_n_f32(e0[t], l0, s); e1[t] = vfmaq_n_f32(e1[t], l1, s); }
+        }
+    }
+    for (int t = 0; t < nt; t++)
+        res[t] = q4k_tree_neon(vaddq_f32(e0[t], o0[t]), vaddq_f32(e1[t], o1[t]));
+}
+
+Q4K_INLINE void q6k_i8_ws_neon(const unsigned char *row, const int nt, size_t nb,
+                               const int8_t *const *xq, const float *const *xscale,
+                               float *res) {
+    float32x4_t e0[QK_WSG], e1[QK_WSG], o0[QK_WSG], o1[QK_WSG];
+    float s[QK_WSG][16];
+    for (int t = 0; t < nt; t++) e0[t] = e1[t] = o0[t] = o1[t] = vdupq_n_f32(0.0f);
+    const int32x4_t z = vdupq_n_s32(0);
+    const uint8x16_t m0f = vdupq_n_u8(0x0f), m03 = vdupq_n_u8(0x03);
+    const int8x16_t  c32 = vdupq_n_s8(32);
+
+    for (size_t b = 0; b < nb; b++) {
+        const unsigned char *blk = row + b * 210;
+        const float d = q_f16(blk + 208);
+        const int8_t *sc = (const int8_t *)(blk + 192);
+        for (int t = 0; t < nt; t++)
+            for (int g = 0; g < 16; g++) s[t][g] = (d * (float)sc[g]) * xscale[t][b * 8 + g / 2];
+        for (int c = 0; c < 8; c++) {
+            const int h = c / 4, k = c % 4;
+            const unsigned char *ql = blk + 64 * h + 32 * (k & 1);
+            const unsigned char *qh = blk + 128 + 32 * h;
+            const uint8x16_t l0 = vld1q_u8(ql), l1 = vld1q_u8(ql + 16);
+            const uint8x16_t h0 = vld1q_u8(qh), h1 = vld1q_u8(qh + 16);
+            uint8x16_t u0, u1;
+            switch (k) {
+            case 0:
+                u0 = vorrq_u8(vandq_u8(l0, m0f), vshlq_n_u8(vandq_u8(h0, m03), 4));
+                u1 = vorrq_u8(vandq_u8(l1, m0f), vshlq_n_u8(vandq_u8(h1, m03), 4));
+                break;
+            case 1:
+                u0 = vorrq_u8(vandq_u8(l0, m0f), vshlq_n_u8(vandq_u8(vshrq_n_u8(h0, 2), m03), 4));
+                u1 = vorrq_u8(vandq_u8(l1, m0f), vshlq_n_u8(vandq_u8(vshrq_n_u8(h1, 2), m03), 4));
+                break;
+            case 2:
+                u0 = vorrq_u8(vshrq_n_u8(l0, 4), vshlq_n_u8(vandq_u8(vshrq_n_u8(h0, 4), m03), 4));
+                u1 = vorrq_u8(vshrq_n_u8(l1, 4), vshlq_n_u8(vandq_u8(vshrq_n_u8(h1, 4), m03), 4));
+                break;
+            default:
+                u0 = vorrq_u8(vshrq_n_u8(l0, 4), vshlq_n_u8(vshrq_n_u8(h0, 6), 4));
+                u1 = vorrq_u8(vshrq_n_u8(l1, 4), vshlq_n_u8(vshrq_n_u8(h1, 6), 4));
+                break;
+            }
+            const int8x16_t q0 = vsubq_s8(vreinterpretq_s8_u8(u0), c32);
+            const int8x16_t q1 = vsubq_s8(vreinterpretq_s8_u8(u1), c32);
+            for (int t = 0; t < nt; t++) {
+                const int8_t *xb = xq[t] + b * 256 + c * 32;
+                const float32x4_t a  = vcvtq_f32_s32(vdotq_s32(z, q0, vld1q_s8(xb)));
+                const float32x4_t bq = vcvtq_f32_s32(vdotq_s32(z, q1, vld1q_s8(xb + 16)));
+                const float sa = s[t][2 * c], sb = s[t][2 * c + 1];
+                if (c & 1) { o0[t] = vfmaq_n_f32(o0[t], a, sa); o1[t] = vfmaq_n_f32(o1[t], bq, sb); }
+                else       { e0[t] = vfmaq_n_f32(e0[t], a, sa); e1[t] = vfmaq_n_f32(e1[t], bq, sb); }
+            }
+        }
+    }
+    for (int t = 0; t < nt; t++)
+        res[t] = q4k_tree_neon(vaddq_f32(e0[t], o0[t]), vaddq_f32(e1[t], o1[t]));
+}
+#define Q4K_I8_WS_KERNEL q4k_i8_ws_neon
+#define Q80_I8_WS_KERNEL q80_i8_ws_neon
+#define Q6K_I8_WS_KERNEL q6k_i8_ws_neon
+#endif
 #endif /* QK_INT8 */
+
+/* ── the f32 Q4_K kernel, as a TOKEN-GROUP template (K7) ──────────────────
+ * One row against `nt` token vectors at once: each 64-weight unit of the row
+ * is unpacked and widened to f32 ONCE, then every token runs exactly the
+ * single-token chain against it — its own lo/hi, its own total and mins, in
+ * the same order. The single-token kernel IS the nt = 1 instance (q4_k_row
+ * below), so a token's result in a weight-stationary call cannot differ from
+ * its solo result by a bit: same expressions, same compiler decisions —
+ * including clang's default -ffp-contract=on, which contracts per expression
+ * and would otherwise be free to fuse two hand-copied versions differently.
+ *
+ * Unlike the int8 kernels this is NOT bit-identical ACROSS ISAs (each ISA
+ * keeps its own order, as before K7); the contract is per ISA. */
+#if defined(__GNUC__) || defined(__clang__)
+#define Q4F_INLINE static inline __attribute__((always_inline))
+#else
+#define Q4F_INLINE static inline
+#endif
+
+#define QK_WS_GROUP MYNAH_SLM_WS_GROUP
 
 #if defined(MYNAH_SLM_K_NEON)
 static inline float32x4_t nib_to_f32(uint8x8_t v, int high) {
@@ -935,10 +1411,11 @@ static inline float32x4_t nib_to_f32(uint8x8_t v, int high) {
     return vcvtq_f32_u32(vmovl_u16(high ? vget_high_u16(w) : vget_low_u16(w)));
 }
 
-static float q4_k_row(const unsigned char *row, size_t blocks,
-                      const float *x, const float *xsum) {
-    float32x4_t total = vdupq_n_f32(0.0f);
-    float       mins  = 0.0f;
+Q4F_INLINE void q4_k_row_nt(const unsigned char *row, size_t blocks, const int nt,
+                            const float *const *x, const float *const *xsum, float *res) {
+    float32x4_t total[QK_WS_GROUP];
+    float       mins[QK_WS_GROUP];
+    for (int t = 0; t < nt; t++) { total[t] = vdupq_n_f32(0.0f); mins[t] = 0.0f; }
 
     for (size_t b = 0; b < blocks; b++) {
         const unsigned char *block = row + b * 144;
@@ -946,33 +1423,43 @@ static float q4_k_row(const unsigned char *row, size_t blocks,
         const float dmin = mynah_slm_f16_to_f32(block + 2);
         const unsigned char *scales = block + 4;
         const unsigned char *q      = block + 16;
-        const float         *bx     = x    + b * 256;
-        const float         *bs     = xsum + b * 8;
 
         for (int base = 0, si = 0; base < 256; base += 64, si += 2) {
             unsigned char sc0, mn0, sc1, mn1;
             q4_k_scale_min(scales, si,     &sc0, &mn0);
             q4_k_scale_min(scales, si + 1, &sc1, &mn1);
 
-            float32x4_t lo = vdupq_n_f32(0.0f), hi = vdupq_n_f32(0.0f);
-            for (int i = 0; i < 32; i += 8) {
-                const uint8x8_t packed = vld1_u8(q + i);
+            /* the 64 weights, widened once: wl[2k], wl[2k+1] are elements
+             * 8k..8k+3 and 8k+4..8k+7 of the low nibbles; wh the high */
+            float32x4_t wl[8], wh[8];
+            for (int k = 0; k < 4; k++) {
+                const uint8x8_t packed = vld1_u8(q + 8 * k);
                 const uint8x8_t nl = vand_u8(packed, vdup_n_u8(0x0f));
                 const uint8x8_t nh = vshr_n_u8(packed, 4);
-                lo = vmlaq_f32(lo, nib_to_f32(nl, 0), vld1q_f32(bx + base + i));
-                lo = vmlaq_f32(lo, nib_to_f32(nl, 1), vld1q_f32(bx + base + i + 4));
-                hi = vmlaq_f32(hi, nib_to_f32(nh, 0), vld1q_f32(bx + base + i + 32));
-                hi = vmlaq_f32(hi, nib_to_f32(nh, 1), vld1q_f32(bx + base + i + 36));
+                wl[2 * k] = nib_to_f32(nl, 0); wl[2 * k + 1] = nib_to_f32(nl, 1);
+                wh[2 * k] = nib_to_f32(nh, 0); wh[2 * k + 1] = nib_to_f32(nh, 1);
             }
-            /* One scale application per 32 weights instead of 32. */
-            total = vmlaq_n_f32(total, lo, d * (float)sc0);
-            total = vmlaq_n_f32(total, hi, d * (float)sc1);
-            mins += dmin * ((float)mn0 * bs[base / 32] +
-                            (float)mn1 * bs[base / 32 + 1]);
+            for (int t = 0; t < nt; t++) {
+                const float *bx = x[t]    + b * 256;
+                const float *bs = xsum[t] + b * 8;
+                float32x4_t lo = vdupq_n_f32(0.0f), hi = vdupq_n_f32(0.0f);
+                for (int k = 0; k < 4; k++) {
+                    const int i = 8 * k;
+                    lo = vmlaq_f32(lo, wl[2 * k],     vld1q_f32(bx + base + i));
+                    lo = vmlaq_f32(lo, wl[2 * k + 1], vld1q_f32(bx + base + i + 4));
+                    hi = vmlaq_f32(hi, wh[2 * k],     vld1q_f32(bx + base + i + 32));
+                    hi = vmlaq_f32(hi, wh[2 * k + 1], vld1q_f32(bx + base + i + 36));
+                }
+                /* One scale application per 32 weights instead of 32. */
+                total[t] = vmlaq_n_f32(total[t], lo, d * (float)sc0);
+                total[t] = vmlaq_n_f32(total[t], hi, d * (float)sc1);
+                mins[t] += dmin * ((float)mn0 * bs[base / 32] +
+                                   (float)mn1 * bs[base / 32 + 1]);
+            }
             q += 32;
         }
     }
-    return vaddvq_f32(total) - mins;
+    for (int t = 0; t < nt; t++) res[t] = vaddvq_f32(total[t]) - mins[t];
 }
 
 #elif defined(MYNAH_SLM_K_AVX2)
@@ -983,10 +1470,11 @@ static inline float hsum256(__m256 v) {
     return _mm_cvtss_f32(a);
 }
 
-static float q4_k_row(const unsigned char *row, size_t blocks,
-                      const float *x, const float *xsum) {
-    __m256 total = _mm256_setzero_ps();
-    float  mins  = 0.0f;
+Q4F_INLINE void q4_k_row_nt(const unsigned char *row, size_t blocks, const int nt,
+                            const float *const *x, const float *const *xsum, float *res) {
+    __m256 total[QK_WS_GROUP];
+    float  mins[QK_WS_GROUP];
+    for (int t = 0; t < nt; t++) { total[t] = _mm256_setzero_ps(); mins[t] = 0.0f; }
 
     for (size_t b = 0; b < blocks; b++) {
         const unsigned char *block = row + b * 144;
@@ -994,40 +1482,48 @@ static float q4_k_row(const unsigned char *row, size_t blocks,
         const float dmin = mynah_slm_f16_to_f32(block + 2);
         const unsigned char *scales = block + 4;
         const unsigned char *q      = block + 16;
-        const float         *bx     = x    + b * 256;
-        const float         *bs     = xsum + b * 8;
 
         for (int base = 0, si = 0; base < 256; base += 64, si += 2) {
             unsigned char sc0, mn0, sc1, mn1;
             q4_k_scale_min(scales, si,     &sc0, &mn0);
             q4_k_scale_min(scales, si + 1, &sc1, &mn1);
 
-            __m256 lo = _mm256_setzero_ps(), hi = _mm256_setzero_ps();
-            for (int i = 0; i < 32; i += 8) {
-                const __m128i packed = _mm_loadl_epi64((const __m128i *)(const void *)(q + i));
+            __m256 wl[4], wh[4];               /* the 64 weights, widened once */
+            for (int k = 0; k < 4; k++) {
+                const __m128i packed = _mm_loadl_epi64((const __m128i *)(const void *)(q + 8 * k));
                 const __m128i nl = _mm_and_si128(packed, _mm_set1_epi8(0x0f));
                 const __m128i nh = _mm_and_si128(_mm_srli_epi16(packed, 4),
                                                  _mm_set1_epi8(0x0f));
-                lo = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(nl)),
-                                     _mm256_loadu_ps(bx + base + i), lo);
-                hi = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(nh)),
-                                     _mm256_loadu_ps(bx + base + i + 32), hi);
+                wl[k] = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(nl));
+                wh[k] = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(nh));
             }
-            total = _mm256_fmadd_ps(lo, _mm256_set1_ps(d * (float)sc0), total);
-            total = _mm256_fmadd_ps(hi, _mm256_set1_ps(d * (float)sc1), total);
-            mins += dmin * ((float)mn0 * bs[base / 32] +
-                            (float)mn1 * bs[base / 32 + 1]);
+            const __m256 s0 = _mm256_set1_ps(d * (float)sc0);
+            const __m256 s1 = _mm256_set1_ps(d * (float)sc1);
+            for (int t = 0; t < nt; t++) {
+                const float *bx = x[t]    + b * 256;
+                const float *bs = xsum[t] + b * 8;
+                __m256 lo = _mm256_setzero_ps(), hi = _mm256_setzero_ps();
+                for (int k = 0; k < 4; k++) {
+                    lo = _mm256_fmadd_ps(wl[k], _mm256_loadu_ps(bx + base + 8 * k), lo);
+                    hi = _mm256_fmadd_ps(wh[k], _mm256_loadu_ps(bx + base + 8 * k + 32), hi);
+                }
+                total[t] = _mm256_fmadd_ps(lo, s0, total[t]);
+                total[t] = _mm256_fmadd_ps(hi, s1, total[t]);
+                mins[t] += dmin * ((float)mn0 * bs[base / 32] +
+                                   (float)mn1 * bs[base / 32 + 1]);
+            }
             q += 32;
         }
     }
-    return hsum256(total) - mins;
+    for (int t = 0; t < nt; t++) res[t] = hsum256(total[t]) - mins[t];
 }
 
 #else   /* the scalar twin, and the reference for what the other two mean */
 
-static float q4_k_row(const unsigned char *row, size_t blocks,
-                      const float *x, const float *xsum) {
-    float total = 0.0f, mins = 0.0f;
+Q4F_INLINE void q4_k_row_nt(const unsigned char *row, size_t blocks, const int nt,
+                            const float *const *x, const float *const *xsum, float *res) {
+    float total[QK_WS_GROUP], mins[QK_WS_GROUP];
+    for (int t = 0; t < nt; t++) { total[t] = 0.0f; mins[t] = 0.0f; }
 
     for (size_t b = 0; b < blocks; b++) {
         const unsigned char *block = row + b * 144;
@@ -1035,29 +1531,44 @@ static float q4_k_row(const unsigned char *row, size_t blocks,
         const float dmin = mynah_slm_f16_to_f32(block + 2);
         const unsigned char *scales = block + 4;
         const unsigned char *q      = block + 16;
-        const float         *bx     = x    + b * 256;
-        const float         *bs     = xsum + b * 8;
 
         for (int base = 0, si = 0; base < 256; base += 64, si += 2) {
             unsigned char sc0, mn0, sc1, mn1;
             q4_k_scale_min(scales, si,     &sc0, &mn0);
             q4_k_scale_min(scales, si + 1, &sc1, &mn1);
 
-            float lo = 0.0f, hi = 0.0f;
+            float wl[32], wh[32];              /* the 64 weights, widened once */
             for (int i = 0; i < 32; i++) {
-                lo += (float)(q[i] & 0x0f) * bx[base + i];
-                hi += (float)(q[i] >> 4)   * bx[base + i + 32];
+                wl[i] = (float)(q[i] & 0x0f);
+                wh[i] = (float)(q[i] >> 4);
             }
-            total += d * ((float)sc0 * lo + (float)sc1 * hi);
-            mins  += dmin * ((float)mn0 * bs[base / 32] +
-                             (float)mn1 * bs[base / 32 + 1]);
+            for (int t = 0; t < nt; t++) {
+                const float *bx = x[t]    + b * 256;
+                const float *bs = xsum[t] + b * 8;
+                float lo = 0.0f, hi = 0.0f;
+                for (int i = 0; i < 32; i++) {
+                    lo += wl[i] * bx[base + i];
+                    hi += wh[i] * bx[base + i + 32];
+                }
+                total[t] += d * ((float)sc0 * lo + (float)sc1 * hi);
+                mins[t]  += dmin * ((float)mn0 * bs[base / 32] +
+                                    (float)mn1 * bs[base / 32 + 1]);
+            }
             q += 32;
         }
     }
-    return total - mins;
+    for (int t = 0; t < nt; t++) res[t] = total[t] - mins[t];
 }
 
 #endif
+
+/* The single-token kernel: the template at nt = 1. */
+static float q4_k_row(const unsigned char *row, size_t blocks,
+                      const float *x, const float *xsum) {
+    float r;
+    q4_k_row_nt(row, blocks, 1, &x, &xsum, &r);
+    return r;
+}
 
 static void q4k_f32_rows(const unsigned char *w, size_t rows, size_t blocks,
                          const float *x, const float *xsum, float *out) {
@@ -1065,15 +1576,104 @@ static void q4k_f32_rows(const unsigned char *w, size_t rows, size_t blocks,
         out[r] = q4_k_row(w + r * blocks * 144, blocks, x, xsum);
 }
 
+/* Run a token-group template over `nt` tokens in groups of QK_WS_GROUP, the
+ * group size a constant at each call so the per-token state stays in
+ * registers. Rows outermost: a row's bytes come from memory once, and the
+ * second group of a wide batch re-reads them from L1. */
+#define QK_WS_GROUPS(NT, CALL)                                                 \
+    for (size_t t0_ = 0; t0_ < (NT); t0_ += QK_WS_GROUP) {                     \
+        const size_t g_ = (NT) - t0_ < QK_WS_GROUP ? (NT) - t0_ : QK_WS_GROUP; \
+        float res_[QK_WS_GROUP];                                               \
+        switch (g_) {                                                          \
+        case 4:  CALL(4); break;                                               \
+        case 3:  CALL(3); break;                                               \
+        case 2:  CALL(2); break;                                               \
+        default: CALL(1); break;                                               \
+        }                                                                      \
+        for (size_t t_ = 0; t_ < g_; t_++) out[t0_ + t_][r] = res_[t_];        \
+    }
+
+static void q4k_f32_ws_rows(const unsigned char *w, size_t rows, size_t blocks, size_t nt,
+                            const float *const *x, const float *const *xsum,
+                            float *const *out) {
+    for (size_t r = 0; r < rows; r++) {
+        const unsigned char *row = w + r * blocks * 144;
+#define QK_CALL(G) q4_k_row_nt(row, blocks, G, x + t0_, xsum + t0_, res_)
+        QK_WS_GROUPS(nt, QK_CALL)
+#undef QK_CALL
+    }
+}
+
+#if QK_SCALAR
+/* The int8 weight-stationary twins: the single-token twins, token by token.
+ * The scalar table is the definition, not a path anybody ships for speed. */
+static void q4k_i8_ws_scalar(const unsigned char *w, size_t rows, size_t blocks, size_t nt,
+                             const int8_t *const *xq, const float *const *xscale,
+                             const float *const *xsum, float *const *out) {
+    for (size_t t = 0; t < nt; t++)
+        q4k_i8_rows_scalar(w, rows, blocks, xq[t], xscale[t], xsum[t], out[t]);
+}
+
+static void q80_i8_ws_scalar(const unsigned char *w, size_t rows, size_t nb, size_t nt,
+                             const int8_t *const *xq, const float *const *xscale,
+                             float *const *out) {
+    for (size_t t = 0; t < nt; t++) q80_i8_rows_scalar(w, rows, nb, xq[t], xscale[t], out[t]);
+}
+
+static void q6k_i8_ws_scalar(const unsigned char *w, size_t rows, size_t nb, size_t nt,
+                             const int8_t *const *xq, const float *const *xscale,
+                             float *const *out) {
+    for (size_t t = 0; t < nt; t++) q6k_i8_rows_scalar(w, rows, nb, xq[t], xscale[t], out[t]);
+}
+#endif
+
+#if defined(QK_INT8)
+static void q4k_i8_ws_rows(const unsigned char *w, size_t rows, size_t blocks, size_t nt,
+                           const int8_t *const *xq, const float *const *xscale,
+                           const float *const *xsum, float *const *out) {
+    for (size_t r = 0; r < rows; r++) {
+        const unsigned char *row = w + r * blocks * 144;
+#define QK_CALL(G) Q4K_I8_WS_KERNEL(row, G, blocks, xq + t0_, xscale + t0_, xsum + t0_, res_)
+        QK_WS_GROUPS(nt, QK_CALL)
+#undef QK_CALL
+    }
+}
+
+static void q80_i8_ws_rows(const unsigned char *w, size_t rows, size_t nb, size_t nt,
+                           const int8_t *const *xq, const float *const *xscale,
+                           float *const *out) {
+    for (size_t r = 0; r < rows; r++) {
+        const unsigned char *row = w + r * nb * 34;
+#define QK_CALL(G) Q80_I8_WS_KERNEL(row, G, nb, xq + t0_, xscale + t0_, res_)
+        QK_WS_GROUPS(nt, QK_CALL)
+#undef QK_CALL
+    }
+}
+
+static void q6k_i8_ws_rows(const unsigned char *w, size_t rows, size_t nb, size_t nt,
+                           const int8_t *const *xq, const float *const *xscale,
+                           float *const *out) {
+    for (size_t r = 0; r < rows; r++) {
+        const unsigned char *row = w + r * nb * 210;
+#define QK_CALL(G) Q6K_I8_WS_KERNEL(row, G, nb, xq + t0_, xscale + t0_, res_)
+        QK_WS_GROUPS(nt, QK_CALL)
+#undef QK_CALL
+    }
+}
+#endif
+
 /* The table this TU exports (kern.h). The scalar table carries the int8 TWINS
  * with int8 = 0: they define the contract, they are not shipped as a path. */
 const mynah_slm_qmat_kern MYNAH_SLM_KERN_SYM(mynah_slm_qmat_kern) = {
     MYNAH_SLM_KERN_NAME, MYNAH_SLM_KERN_ID,
 #if QK_SCALAR
     0, "none", q4k_f32_rows, q4k_i8_rows_scalar, q80_i8_rows_scalar, q6k_i8_rows_scalar,
+    q4k_f32_ws_rows, q4k_i8_ws_scalar, q80_i8_ws_scalar, q6k_i8_ws_scalar,
 #elif defined(QK_INT8)
     1, MYNAH_SLM_INT8_ISA, q4k_f32_rows, q4k_i8_rows, q80_i8_rows, q6k_i8_rows,
+    q4k_f32_ws_rows, q4k_i8_ws_rows, q80_i8_ws_rows, q6k_i8_ws_rows,
 #else
     0, "none", q4k_f32_rows, NULL, NULL, NULL,
+    q4k_f32_ws_rows, NULL, NULL, NULL,
 #endif
 };

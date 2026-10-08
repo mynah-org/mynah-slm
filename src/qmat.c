@@ -298,6 +298,72 @@ int mynah_slm_matvec(int type, const void *weights, size_t rows, size_t cols,
     return 0;
 }
 
+/* ── weight-stationary: several tokens per weight read (K7) ──────────────── */
+
+/* Which kernel family the solo path would take for every token, or 0 when
+ * they would not all take the SAME one of ours (then the caller runs the
+ * solo path per token, so nothing about a token's result can change). */
+enum { WS_NONE = 0, WS_F32 = 1, WS_INT8 = 2 };
+
+static int ws_path(const mynah_slm_qmat_kern *k, int type, size_t cols, size_t ntok,
+                   const mynah_slm_matvec_in *prep) {
+    if (!prep || ntok == 0 || !use_own_kernels()) return WS_NONE;
+    const int typed = int8_type_on(type);
+    int path = WS_NONE;
+    for (size_t t = 0; t < ntok; t++) {
+        if (prep[t].cols != cols) return WS_NONE;
+        const int p = (prep[t].have_int8 && k->int8 && typed) ? WS_INT8 : WS_F32;
+        if (t > 0 && p != path) return WS_NONE;
+        path = p;
+    }
+    switch (type) {
+    case INGOT_TYPE_Q4_K:
+        if (cols % 256 != 0) return WS_NONE;
+        return (path == WS_INT8 ? k->q4k_i8_ws != NULL : k->q4k_f32_ws != NULL) ? path : WS_NONE;
+    case INGOT_TYPE_Q8_0:
+        return path == WS_INT8 && cols % 32 == 0 && k->q80_i8_ws ? path : WS_NONE;
+    case INGOT_TYPE_Q6_K:
+        return path == WS_INT8 && cols % 256 == 0 && k->q6k_i8_ws ? path : WS_NONE;
+    default:
+        return WS_NONE;
+    }
+}
+
+int mynah_slm_matvec_ws_ok(int type, size_t cols, size_t ntok,
+                           const mynah_slm_matvec_in *prep) {
+    return ws_path(mynah_slm_kern_qmat(), type, cols, ntok, prep) != WS_NONE;
+}
+
+int mynah_slm_matvec_ws(int type, const void *weights, size_t rows, size_t cols,
+                        size_t ntok, const float *in, size_t ldx,
+                        const mynah_slm_matvec_in *prep, float *out, size_t ldo) {
+    if (!weights || !out || (!in && type == INGOT_TYPE_Q4_K)) return -1;
+    const mynah_slm_qmat_kern *k = mynah_slm_kern_qmat();
+    const int path = ws_path(k, type, cols, ntok, prep);
+    if (path == WS_NONE) return -1;
+    const unsigned char *w = (const unsigned char *)weights;
+
+    for (size_t t0 = 0; t0 < ntok; t0 += MYNAH_SLM_WS_MAX) {
+        const size_t nt = ntok - t0 < MYNAH_SLM_WS_MAX ? ntok - t0 : MYNAH_SLM_WS_MAX;
+        const float  *x[MYNAH_SLM_WS_MAX], *xs[MYNAH_SLM_WS_MAX], *xm[MYNAH_SLM_WS_MAX];
+        const int8_t *xq[MYNAH_SLM_WS_MAX];
+        float        *o[MYNAH_SLM_WS_MAX];
+        for (size_t t = 0; t < nt; t++) {
+            const mynah_slm_matvec_in *p = &prep[t0 + t];
+            x[t]  = in ? in + (t0 + t) * ldx : NULL;
+            xs[t] = p->xscale;
+            xm[t] = p->xsum;
+            xq[t] = p->xq;
+            o[t]  = out + (t0 + t) * ldo;
+        }
+        if (type == INGOT_TYPE_Q8_0)      k->q80_i8_ws(w, rows, cols / 32, nt, xq, xs, o);
+        else if (type == INGOT_TYPE_Q6_K) k->q6k_i8_ws(w, rows, cols / 256, nt, xq, xs, o);
+        else if (path == WS_INT8)         k->q4k_i8_ws(w, rows, cols / 256, nt, xq, xs, xm, o);
+        else                              k->q4k_f32_ws(w, rows, cols / 256, nt, x, xm, o);
+    }
+    return 0;
+}
+
 /* One strip's dequantization, split across the pool. Each chunk decodes a
  * disjoint run of rows into a disjoint slice of the scratch, so the result
  * does not depend on how many threads ran. */

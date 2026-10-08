@@ -64,9 +64,57 @@ static double rel_diff(const float *a, const float *b, size_t n) {
 
 /* ── qmat ──────────────────────────────────────────────────────────────────*/
 
+enum { VR = 6, VC = 512, VC8 = 96, VNT = 5 };   /* 5 tokens: a group of 4 + a tail */
+
+/* The weight-stationary entries (K7) against the SAME table's single-token
+ * ones, token by token, memcmp: that equality is their whole contract (the
+ * f32 kernel is per-ISA, so the reference is k's own, not the scalar one).
+ * Two distinct activation vectors alternate over the five tokens, so a token
+ * reading its neighbour's activations shows up. */
+static int verify_ws(const mynah_slm_qmat_kern *k, const unsigned char *w4,
+                     const unsigned char *w6, const unsigned char *w8,
+                     const float *x, const mynah_slm_matvec_in *p,
+                     const float *x8, const mynah_slm_matvec_in *p8, char *why, size_t n) {
+    static float xr[VC], xr8[VC8];
+    static mynah_slm_matvec_in q, q8;
+    for (int i = 0; i < VC; i++)  xr[i]  = x[VC - 1 - i];
+    for (int i = 0; i < VC8; i++) xr8[i] = x8[VC8 - 1 - i];
+    mynah_slm_matvec_prepare_int8(xr, VC, &q);
+    mynah_slm_matvec_prepare_int8(xr8, VC8, &q8);
+
+    float got[VNT][VR], want[VNT][VR];
+    const float  *xs[VNT], *sm[VNT], *sc[VNT], *sc8[VNT];
+    const int8_t *xq[VNT], *xq8[VNT];
+    float        *o[VNT];
+    for (int t = 0; t < VNT; t++) {
+        const mynah_slm_matvec_in *pt = (t & 1) ? &q : p, *pt8 = (t & 1) ? &q8 : p8;
+        xs[t] = (t & 1) ? xr : x;
+        sm[t] = pt->xsum;  sc[t] = pt->xscale;  xq[t] = pt->xq;
+        sc8[t] = pt8->xscale; xq8[t] = pt8->xq;
+        o[t] = got[t];
+    }
+
+    if (!k->q4k_f32_ws) { snprintf(why, n, "no q4_k f32 ws kernel"); return -1; }
+    k->q4k_f32_ws(w4, VR, VC / 256, VNT, xs, sm, o);
+    for (int t = 0; t < VNT; t++) k->q4k_f32(w4, VR, VC / 256, xs[t], sm[t], want[t]);
+    if (memcmp(got, want, sizeof got) != 0) { snprintf(why, n, "q4_k f32 ws != single"); return -1; }
+
+    if (!k->int8) return 0;
+    k->q4k_i8_ws(w4, VR, VC / 256, VNT, xq, sc, sm, o);
+    for (int t = 0; t < VNT; t++) k->q4k_i8(w4, VR, VC / 256, xq[t], sc[t], sm[t], want[t]);
+    if (memcmp(got, want, sizeof got) != 0) { snprintf(why, n, "q4_k int8 ws != single"); return -1; }
+    k->q80_i8_ws(w8, VR, VC8 / 32, VNT, xq8, sc8, o);
+    for (int t = 0; t < VNT; t++) k->q80_i8(w8, VR, VC8 / 32, xq8[t], sc8[t], want[t]);
+    if (memcmp(got, want, sizeof got) != 0) { snprintf(why, n, "q8_0 int8 ws != single"); return -1; }
+    k->q6k_i8_ws(w6, VR, VC / 256, VNT, xq, sc, o);
+    for (int t = 0; t < VNT; t++) k->q6k_i8(w6, VR, VC / 256, xq[t], sc[t], want[t]);
+    if (memcmp(got, want, sizeof got) != 0) { snprintf(why, n, "q6_k int8 ws != single"); return -1; }
+    return 0;
+}
+
 int mynah_slm_isa_verify_qmat(const mynah_slm_qmat_kern *k, char *why, size_t n) {
     const mynah_slm_qmat_kern *ref = &mynah_slm_qmat_kern_scalar;
-    enum { R = 6, C = 512, C8 = 96 };            /* 4 + 2 rows; 3 Q8_0 blocks */
+    enum { R = VR, C = VC, C8 = VC8 };           /* 4 + 2 rows; 3 Q8_0 blocks */
     static unsigned char w4[R * (C / 256) * 144], w6[R * (C / 256) * 210],
                          w8[R * (C8 / 32) * 34];
     static mynah_slm_matvec_in p, p8;            /* ~22 KB each: not on a stack */
@@ -99,7 +147,7 @@ int mynah_slm_isa_verify_qmat(const mynah_slm_qmat_kern *k, char *why, size_t n)
     const double rel = rel_diff(a, b, R);
     if (!(rel < 1e-4)) { snprintf(why, n, "q4_k f32 rel %.1e", rel); return -1; }
 
-    if (!k->int8) return 0;
+    if (!k->int8) return verify_ws(k, w4, w6, w8, x, &p, x8, &p8, why, n);
     k->q4k_i8(w4, R, C / 256, p.xq, p.xscale, p.xsum, a);
     ref->q4k_i8(w4, R, C / 256, p.xq, p.xscale, p.xsum, b);
     if (memcmp(a, b, sizeof a) != 0) { snprintf(why, n, "q4_k int8 != twin"); return -1; }
@@ -109,7 +157,7 @@ int mynah_slm_isa_verify_qmat(const mynah_slm_qmat_kern *k, char *why, size_t n)
     k->q6k_i8(w6, R, C / 256, p.xq, p.xscale, a);
     ref->q6k_i8(w6, R, C / 256, p.xq, p.xscale, b);
     if (memcmp(a, b, sizeof a) != 0) { snprintf(why, n, "q6_k int8 != twin"); return -1; }
-    return 0;
+    return verify_ws(k, w4, w6, w8, x, &p, x8, &p8, why, n);
 }
 
 /* ── attn ──────────────────────────────────────────────────────────────────*/

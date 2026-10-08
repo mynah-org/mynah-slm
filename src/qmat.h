@@ -96,6 +96,25 @@ int mynah_slm_matvec(int type, const void *weights, size_t rows, size_t cols,
                      const float *input, const mynah_slm_matvec_in *prep,
                      float *output);
 
+/* ── decode: several tokens, one weight read (K7) ──────────────────────────
+ * out[t * ldo + r] = weights[r] . in[t * ldx], for t < ntok and a slice of
+ * the rows — the weight-stationary product batched decode runs. Each weight
+ * unit is decoded once and applied to every token. `prep[t]` is token t's
+ * mynah_slm_matvec_prepare() of in + t * ldx (`in` may be NULL for the int8
+ * types, which read only `prep`).
+ *
+ * The contract that makes it usable for decode: for every token the result
+ * is BIT-IDENTICAL to mynah_slm_matvec on the same rows with prep[t]. So it
+ * only runs when the single-token call would have taken ONE of our kernels
+ * for every token alike (_ws_ok); otherwise it returns -1 and the caller does
+ * the tokens one by one. Rows may be split across threads freely: a row's
+ * result does not depend on which call computed it. Returns 0, or -1. */
+int mynah_slm_matvec_ws(int type, const void *weights, size_t rows, size_t cols,
+                        size_t ntok, const float *in, size_t ldx,
+                        const mynah_slm_matvec_in *prep, float *out, size_t ldo);
+int mynah_slm_matvec_ws_ok(int type, size_t cols, size_t ntok,
+                           const mynah_slm_matvec_in *prep);
+
 /* Fill `prep` from the input. Does the int8 half only when that path is on. */
 void mynah_slm_matvec_prepare(const float *input, size_t cols,
                               mynah_slm_matvec_in *prep);

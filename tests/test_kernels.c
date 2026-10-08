@@ -749,6 +749,133 @@ done:
 /* The contract at EVERY level this CPU can run (src/isa.c), not only the one
  * it picks by default: since K5 a single binary carries every variant, so a
  * kernel nobody's default machine selects still ships. */
+/* ── weight-stationary (K7) ────────────────────────────────────────────────
+ * B tokens against one matrix in one pass must give EVERY token exactly the
+ * bytes the single-token kernel of the same ISA gives it: that is what keeps
+ * batched decode memcmp-identical to solo decode. Checked for B = 1..18
+ * (past MYNAH_SLM_WS_MAX = 16, so the API's own split runs too), rows that
+ * leave a tail, an odd Q8_0 block count, every token different (and carrying
+ * the quantizer's hostile blocks), and rows split raggedly over the pool. */
+typedef struct {
+    int type;
+    const unsigned char *w;
+    size_t rows, cols, row_bytes, per, ntok;
+    const float *x;
+    const mynah_slm_matvec_in *prep;
+    float *out;
+    int rc;
+} ws_job;
+
+static void ws_chunk(void *ctx, int i) {
+    ws_job *j = ctx;
+    const size_t first = (size_t)i * j->per;
+    if (first >= j->rows) return;
+    size_t n = j->per;
+    if (first + n > j->rows) n = j->rows - first;
+    if (mynah_slm_matvec_ws(j->type, j->w + first * j->row_bytes, n, j->cols, j->ntok,
+                            j->x, j->cols, j->prep, j->out + first, j->rows) != 0)
+        j->rc = -1;
+}
+
+static void ws_case(const char *name, int type, int int8, size_t rows, size_t cols,
+                    uint64_t seed) {
+    enum { BMAX = 18 };
+    size_t elems = 0, bytes = 0;
+    qfx_geometry(type, &elems, &bytes);
+    const size_t row_bytes = cols / elems * bytes;
+    unsigned char *w = malloc(rows * row_bytes);
+    float *x = malloc(BMAX * cols * sizeof *x);
+    float *ref = malloc(BMAX * rows * sizeof *ref), *got = malloc(BMAX * rows * sizeof *got);
+    mynah_slm_matvec_in *prep = malloc(BMAX * sizeof *prep);
+    char what[160], detail[160];
+    if (!w || !x || !ref || !got || !prep) { check("ws allocations", 0, "oom"); goto done; }
+
+    qfx_fill(type, w, rows, cols, seed);
+    for (size_t t = 0; t < BMAX; t++) {
+        float *xt = x + t * cols;
+        qfx_activations(xt, cols, seed * 31 + t);
+        if (cols >= 96 && t % 3 == 1) {          /* the quantizer's edges, some tokens */
+            for (size_t i = 32; i < 64; i++) xt[i] = (float)((int)(i % 5) - 2) * 1e-37f;
+            for (size_t i = 64; i < 96; i++) xt[i] = (i & 1) ? -7.25f : 7.25f;
+        }
+    }
+    mynah_slm_matvec_set_enabled(1);
+    mynah_slm_matvec_set_int8(int8);
+    for (size_t t = 0; t < BMAX; t++) mynah_slm_matvec_prepare(x + t * cols, cols, &prep[t]);
+
+    /* the single-token kernel, token by token: the definition */
+    int single = 1;
+    for (size_t t = 0; t < BMAX; t++)
+        if (mynah_slm_matvec(type, w, rows, cols, x + t * cols, &prep[t], ref + t * rows) != 0)
+            single = 0;
+    if (!single) {
+        /* no kernel of ours for this token on this level: ws must decline too */
+        snprintf(what, sizeof what, "%s %zux%zu: ws declines where the single kernel does", name,
+                 rows, cols);
+        check(what, !mynah_slm_matvec_ws_ok(type, cols, 2, prep) &&
+              mynah_slm_matvec_ws(type, w, rows, cols, 2, x, cols, prep, got, rows) != 0,
+              "ws ran a kernel solo would not");
+        goto done;
+    }
+
+    int all_b = 1, first_bad = 0;
+    for (size_t B = 1; B <= BMAX; B++) {
+        memset(got, 0xff, BMAX * rows * sizeof *got);
+        if (mynah_slm_matvec_ws(type, w, rows, cols, B, x, cols, prep, got, rows) != 0 ||
+            memcmp(got, ref, B * rows * sizeof *got) != 0) {
+            if (all_b) first_bad = (int)B;
+            all_b = 0;
+        }
+    }
+    snprintf(what, sizeof what, "%s %s %zux%zu: ws == single-token kernel per token, B=1..%d",
+             name, mynah_slm_kern_qmat()->name, rows, cols, BMAX);
+    snprintf(detail, sizeof detail, "first failing B = %d", first_bad);
+    check(what, all_b, detail);
+
+    /* threads: ragged row chunks of a B = 7 and a B = 16 call */
+    const size_t pers[] = { 1, 3, 7, 64 }, bs[] = { 7, 16 };
+    int same = 1;
+    for (size_t bi = 0; bi < 2; bi++)
+        for (size_t k = 0; k < sizeof pers / sizeof *pers; k++) {
+            memset(got, 0xff, BMAX * rows * sizeof *got);
+            ws_job j = { type, w, rows, cols, row_bytes, pers[k], bs[bi], x, prep, got, 0 };
+            mynah_slm_parallel_for((int)((rows + pers[k] - 1) / pers[k]), ws_chunk, &j);
+            if (j.rc != 0 || memcmp(got, ref, bs[bi] * rows * sizeof *got) != 0) same = 0;
+        }
+    snprintf(what, sizeof what, "%s %zux%zu: %d threads, ragged row chunks == single, bit for bit",
+             name, rows, cols, mynah_slm_threads_count());
+    check(what, same, "a thread split changed a token's row");
+
+    /* a non-finite token drops to f32 alone; a batch mixing it with int8
+     * tokens is not one kernel family, so ws must hand it back */
+    if (int8 && prep[0].have_int8) {
+        float keep = x[cols + 5];
+        x[cols + 5] = NAN;
+        mynah_slm_matvec_prepare(x + cols, cols, &prep[1]);
+        snprintf(what, sizeof what, "%s: ws declines a batch mixing int8 and f32 tokens", name);
+        check(what, mynah_slm_matvec_ws(type, w, rows, cols, 3, x, cols, prep, got, rows) != 0,
+              "it ran a mixed batch");
+        x[cols + 5] = keep;
+    }
+done:
+    mynah_slm_matvec_set_int8(0);
+    free(w); free(x); free(ref); free(got); free(prep);
+}
+
+static void test_ws_here(void) {
+    ws_case("Q4_K f32", INGOT_TYPE_Q4_K, 0, 37, 512, 41);
+    ws_case("Q4_K f32", INGOT_TYPE_Q4_K, 0, 6, 3072, 42);
+    ws_case("Q4_K int8", INGOT_TYPE_Q4_K, 1, 37, 512, 43);
+    ws_case("Q4_K int8", INGOT_TYPE_Q4_K, 1, 6, 3072, 44);
+    ws_case("Q8_0 int8", INGOT_TYPE_Q8_0, 1, 37, 96, 45);      /* 3 blocks: odd */
+    ws_case("Q8_0 int8", INGOT_TYPE_Q8_0, 1, 19, 1024, 46);
+    ws_case("Q6_K int8", INGOT_TYPE_Q6_K, 1, 37, 256, 47);
+    ws_case("Q6_K int8", INGOT_TYPE_Q6_K, 1, 6, 3072, 48);
+    /* with f32 activations Q8_0 / Q6_K are ingot's on the solo path */
+    ws_case("Q6_K f32", INGOT_TYPE_Q6_K, 0, 8, 256, 49);
+    ws_case("Q8_0 f32", INGOT_TYPE_Q8_0, 0, 8, 256, 50);
+}
+
 static void test_int8_contracts(void) {
     static const char *const levels[] = { "avx512vnni", "avx512", "avx2", "dotprod",
                                           "neon", "scalar" };
@@ -757,6 +884,7 @@ static void test_int8_contracts(void) {
         if (id < 0 || mynah_slm_isa_narrow(levels[i]) != id) continue;
         printf("  [ISA ceiling %s]\n", levels[i]);
         test_int8_contracts_here();
+        test_ws_here();
     }
     mynah_slm_isa_narrow(NULL);
 }
