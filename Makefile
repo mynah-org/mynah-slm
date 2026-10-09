@@ -229,6 +229,24 @@ build/kern/sgemm_%.o: src/sgemm.c $(HDR)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(KERN_TU_FLAGS) -c $< -o $@
 
+# clang-tidy over every translation unit WITH the flags the build gives it.
+# The kernel TUs (src/kern.h) only compile as one ISA at a time, so a plain
+# `clang-tidy src/*.c` sees them without their -m flags and stops on an
+# error; here each is analysed once per ISA it is built for. The CI job
+# (codeql.yml) calls this target so the two cannot drift apart.
+TIDY        ?= clang-tidy
+TIDY_CHECKS := clang-analyzer-core.*,clang-analyzer-unix.*,clang-analyzer-security.*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,-clang-analyzer-deadcode.DeadStores,bugprone-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions,-bugprone-implicit-widening-of-multiplication-result,-bugprone-suspicious-realloc-usage,-bugprone-multi-level-implicit-pointer-conversion,-bugprone-misplaced-widening-cast,-bugprone-branch-clone
+TIDY_FLAGS  := -std=c11 -Iinclude -I$(INGOT_DIR)/include -iquote src -iquote server \
+               -D_DEFAULT_SOURCE -D$(BLAS_DEF) -DMYNAH_SLM_BUILD='"tidy"'
+TIDY_KERN   = $(KF_$(KERN_ARCH)_$(1)) -DMYNAH_SLM_KERN_TU=$(1) -DMYNAH_SLM_KERN_ID=$(KID_$(1))
+
+tidy:
+	$(TIDY) -checks='$(TIDY_CHECKS)' -warnings-as-errors='' \
+	  $(SRC) cli/*.c server/*.c -- $(TIDY_FLAGS)
+	$(foreach t,$(KERN_QMAT_$(KERN_ARCH)),$(TIDY) -checks='$(TIDY_CHECKS)' -warnings-as-errors='' src/qmat_kern.c -- $(TIDY_FLAGS) $(call TIDY_KERN,$(t)) &&) true
+	$(foreach t,$(KERN_ATTN_$(KERN_ARCH)),$(TIDY) -checks='$(TIDY_CHECKS)' -warnings-as-errors='' src/attn_kern.c -- $(TIDY_FLAGS) $(call TIDY_KERN,$(t)) &&) true
+	$(foreach t,$(KERN_SGEMM_$(KERN_ARCH)),$(TIDY) -checks='$(TIDY_CHECKS)' -warnings-as-errors='' src/sgemm.c -- $(TIDY_FLAGS) $(call TIDY_KERN,$(t)) &&) true
+
 # What dispatch resolved on this machine, and why. No model needed.
 dispatch: mynah-slm
 	@./mynah-slm --dispatch
@@ -589,4 +607,4 @@ dist: mynah-slm mynah-slm-server libmynah_slm.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot bench-qmat dispatch bench-decode test-server-cancel tsan test-server-slots test-device
+.PHONY: tidy all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot bench-qmat dispatch bench-decode test-server-cancel tsan test-server-slots test-device
