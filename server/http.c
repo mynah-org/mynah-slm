@@ -119,13 +119,22 @@ int http_fd_probe(int fd) {
     const int ready = poll(&p, 1, 0);       /* zero timeout: never blocks */
     if (ready < 0) return (errno != EINTR && errno != EAGAIN) ? 2 : 0;
     if (ready == 0) return 0;
-    /* A reset (or our own write after the peer closed, answered with one)
-     * sets POLLERR and POLLHUP; a FIN alone sets neither. */
-    if (p.revents & (POLLHUP | POLLERR | POLLNVAL)) return 2;
+    if (p.revents & (POLLERR | POLLNVAL)) return 2;
+    /* POLLHUP is NOT "gone" on its own. On Linux it comes with a reset (and
+     * then POLLERR too), but on macOS and the BSDs a plain FIN — a client
+     * that only half-closed — already sets it, and treating it as gone
+     * cancelled exactly the clients the R2 fix exists for (macOS CI caught
+     * it). Gone needs evidence of a reset: a pending socket error, or the
+     * peek below failing; a FIN alone is EOF. */
+    if (p.revents & POLLHUP) {
+        int err = 0;
+        socklen_t el = sizeof err;
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err != 0) return 2;
+    }
 #ifdef POLLRDHUP
     if (p.revents & POLLRDHUP) return 1;     /* FIN: half-close or close */
 #endif
-    if (p.revents & POLLIN) {
+    if (p.revents & (POLLIN | POLLHUP)) {
         /* Readable is either a pipelined byte or EOF; only a zero-length
          * peek tells them apart, and it cannot block: poll said readable. */
         char b;
