@@ -21,6 +21,14 @@ typedef struct {
     uint32_t n_prompt;
     uint32_t n_gen;
     int      n_threads;
+    /* Stopped because nobody wanted the rest (generate.h cancel hook); n_gen
+     * then says after how many tokens. */
+    int      cancelled;
+    /* Which device ran the forward pass, when it was not the default CPU
+     * path (`--device`): printed in the summary so a number taken on one
+     * device cannot be quoted as the other's. NULL = the CPU reference path,
+     * and the line is unchanged. */
+    const char *device;
 
     /* internal marks */
     double t0_;

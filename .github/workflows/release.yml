@@ -44,14 +44,18 @@ jobs:
             arch: x86_64
             suffix: '-avx2'
             arch_flags: '-march=x86-64-v3 -mtune=generic'
-          # dotprod (SDOT, what --fast uses) is compile-time on ARM:
-          # armv8.2+dotprod covers Graviton2+, Ampere, Snapdragon, RPi5 — not
-          # the RPi4's Cortex-A72.
+          # Baseline armv8-a, NOT armv8.2-a+dotprod. Since K5 the SDOT kernels
+          # live in their own TU (built with +dotprod by the Makefile) and are
+          # picked at run time, so the baseline buys nothing there — and an
+          # armv8.2 baseline lets gcc inline LSE atomics (ldadd/cas/swp) into
+          # threads.c and everything else, which SIGILLs on a Cortex-A53/A72
+          # (RPi 3/4) before dispatch ever runs. armv8-a keeps gcc's outlined
+          # atomics, which pick LSE at run time.
           - runner: ubuntu-24.04-arm
             os: linux
             arch: aarch64
             suffix: ''
-            arch_flags: '-march=armv8.2-a+dotprod'
+            arch_flags: '-march=armv8-a'
           # Apple clang defaults to apple-m1: NEON and dotprod are always there.
           - runner: macos-latest
             os: darwin
@@ -110,6 +114,11 @@ jobs:
           # the version string must carry the tag, not a stale git describe
           "$D/bin/mynah-slm" --version | tee /dev/stderr | grep -q "${{ steps.v.outputs.name }}"
           "$D/bin/mynah-slm-server" --help > /dev/null
+          # which SIMD kernels the PACKAGED binary resolves on this runner, and
+          # that every vector table passed its verify-on-first-use (exit 1 if
+          # one fell back): a portable tarball is only worth shipping if it
+          # still reaches the fast kernels (.work/isa-runtime-dispatch.md)
+          "$D/bin/mynah-slm" --dispatch
           test -f "$D/lib/libmynah_slm.a"
           test -f "$D/include/mynah_slm.h"
 

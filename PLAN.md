@@ -77,6 +77,46 @@ instrumentation, M3 CLI polish, M5b quantization & footprint, M6 release.
 
 - [~] M0-M6 → [`.work/archive-2026-08-tasks.md`](.work/archive-2026-08-tasks.md)
 
+### P / K / S / G — porting from mynah-tts and mynah-asr (cloud branch, 2026-10)
+
+Written on a cloud VM with no model weights and no GPU: every item below is
+proven only as far as unit tests, sanitizers, cross-ISA runs under qemu and
+synthetic benchmarks go. Real-model and hardware validation is downstream,
+per commit, listed in the matrix note.
+
+- [x] **P1** — what transfers from the sibling engines, what does not, and why
+      → [`.work/sibling-port-map.md`](.work/sibling-port-map.md)
+- [~] **V1** — per-commit validation matrix for this branch: what was proven
+      here, what to run on real hardware → [`.work/cloud-branch-validation.md`](.work/cloud-branch-validation.md)
+- [~] **K1** — our own f32 GEMM, opt-in `BLAS=none`; 0.3-0.85x OpenBLAS on the
+      prefill shapes here, default flip gated → [`.work/no-blas.md`](.work/no-blas.md)
+- [~] **K2** — pool: atomic claim, bounded spin, affinity width; 4x on a
+      synthetic region, decode tok/s unmeasured → [`.work/thread-pool-spin.md`](.work/thread-pool-spin.md)
+- [~] **K3** — Q4_K int8 kernel restructure (4 rows per activation load, one
+      reduction per row), opt-in `--fast`; 1.9-2.4x per tensor here, ppl
+      unmeasured → [`.work/q4k-int8-4row.md`](.work/q4k-int8-4row.md)
+- [~] **K4** — int8-activation Q8_0 and Q6_K kernels under `--fast`
+      (`MYNAH_SLM_INT8_TYPES` narrows per type); Q6_K head 1.6x here, ppl
+      unmeasured → [`.work/int8-q8_0-q6_k.md`](.work/int8-q8_0-q6_k.md)
+- [~] **K5** — runtime ISA dispatch for our kernels (qmat, attention, sgemm),
+      `mynah-slm --dispatch`, verify-on-first-use; ingot itself still
+      compile-time → [`.work/isa-runtime-dispatch.md`](.work/isa-runtime-dispatch.md)
+- [x] **K7** — weight-stationary batched decode kernel (`ws`, now the
+      `forward_multi` default): every sequence byte-identical to solo, 1.2-2.5x
+      over `matvec` at B >= 2 here, real weights unmeasured → [`.work/batched-decode-kernel.md`](.work/batched-decode-kernel.md)
+- [-] **K6** — native BF16 weight matvec: REJECTED, ingot already at
+      0.87-0.94x of the read roof → [`.work/bf16-native-matvec.md`](.work/bf16-native-matvec.md)
+- [~] **S1** — serving foundation: synthetic fixture, per-sequence state,
+      batched decode, client-disconnect cancellation, scheduler, `--slots N`
+      (default serialized). Correct here; no throughput win yet — needs a
+      weight-stationary batched kernel (K7, now landed) → [`.work/serving-continuous-batching.md`](.work/serving-continuous-batching.md)
+- [~] **G1** — CUDA backend foundation for Qwen3 (GQA, head_dim 128, NeoX RoPE,
+      RMSNorm / QK-norm): vtable + CPU backend + kernels compiled for sm_80/89/90,
+      never run on a GPU; forward pass not wired yet → [`.work/cuda-backend.md`](.work/cuda-backend.md)
+- [~] **G2** — backend-driven forward (decode, prefill, multi-sequence over
+      slots) and `run --device cpu|cuda`; memcmp-equal to the CPU path on the
+      CPU backend, never run on a GPU; server not wired yet → [`.work/cuda-backend.md`](.work/cuda-backend.md)
+
 ### R — research items
 
 - [~] **R1** — can a pretrained Qwen3-0.6B be post-training ternarized and still

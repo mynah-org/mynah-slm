@@ -202,4 +202,28 @@ void mynah_slm_attention_kv_batch(float *out, const float *q,
                                   uint32_t q_stride, float scale, float *scores,
                                   float *kscratch, float *vscratch);
 
+/* ── attention for SEVERAL sequences, one query each ─────────────────────
+ * A batched decode step: B independent sequences, each with one new query
+ * and its OWN history. Every (sequence, head) pair is one task of ONE pool
+ * region, and each task runs exactly the per-head code the single-sequence
+ * _mt forms run — so a sequence's output is bit-identical to its solo decode,
+ * and a step costs one dispatch per layer whatever B is.
+ *
+ * Per sequence: `k`/`v` non-NULL = an f32 cache (layer base, [n_kv][kv_dim]);
+ * otherwise `cache` + `layer` = a packed one. `scratch` holds n_heads * n_kv
+ * floats for that sequence alone. */
+typedef struct {
+    float       *out;            /* [n_heads * head_dim] */
+    const float *q;              /* [n_heads * head_dim], post-RoPE */
+    const float *k, *v;          /* f32 cache, or NULL */
+    const struct mynah_slm_kv *cache;
+    uint32_t     layer;
+    uint32_t     n_kv;           /* positions to attend over, this one included */
+    float       *scratch;
+} mynah_slm_attn_seq;
+
+void mynah_slm_attention_multi(const mynah_slm_attn_seq *seqs, uint32_t n_seq,
+                               uint32_t n_heads, uint32_t n_kv_heads,
+                               uint32_t head_dim, float scale);
+
 #endif /* MYNAH_SLM_KERNELS_H */

@@ -2,139 +2,183 @@
  * SPDX-License-Identifier: MIT */
 #include "qmat.h"
 
+#include "kern.h"
+#include "sgemm.h"
 #include "threads.h"
 
 #include "ingot/dtype.h"
 #include "ingot/quant.h"
 
 #include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
-#if defined(MYNAH_SLM_BLAS_ACCELERATE)
-#include <Accelerate/Accelerate.h>
-#else
-#include <cblas.h>
-#endif
+/* The kernels themselves live in qmat_kern.c, compiled once per ISA; this
+ * file is the API, the activation prep and the dispatch through the table
+ * src/isa.c resolved (kern.h). */
 
-/* ── our Q4_K matvec ────────────────────────────────────────────────────────
- * Q4_K stores 256 weights in 144 bytes: two f16 (d, dmin), eight 6-bit
- * scale/min pairs packed into 12 bytes, and 128 bytes of nibbles. A weight is
+/* The three switches below come from the environment, read ONCE: getenv in a
+ * matvec called ~200 times per token would be its own measurement problem.
  *
- *     w = d * scale[s] * q  -  dmin * min[s]
- *
- * and the obvious kernel — the one ingot ships, and the one we shipped before
- * this — materializes that value per element: unpack the nibble, widen it,
- * multiply by d*scale, subtract dmin*min, then FMA against the input. Three
- * vector ops per four weights before the multiply-add that actually matters.
- *
- * Distribute the sum instead:
- *
- *     SUM_j w_j x_j  =  d*scale * SUM_j (q_j x_j)  -  dmin*min * SUM_j x_j
- *
- * Two consequences, and the second is the one worth having:
- *
- *   - the per-element multiply and subtract disappear. The inner loop is
- *     unpack + widen + FMA, and the scales are applied once per 32-weight
- *     sub-block instead of 32 times.
- *   - SUM_j x_j does not depend on the row. It is a property of the INPUT, so
- *     it is computed once per matvec and reused across every row — 2048 of
- *     them for attn_q. That hoist is why this lives in the engine and not in
- *     a container library: it needs a per-call preamble the row kernel then
- *     reads, which is a different API shape, not a faster loop.
- *
- * Measured against ingot's kernel, same tensors, `make bench`: see docs/perf.md.
- *
- * The arithmetic is the same, the rounding is not — fewer roundings, in fact,
- * since the min term is now one subtraction per sub-block rather than one per
- * weight. The parity gate judges that, at 1e-4 on layer 0. */
+ * Once means pthread_once, not "if (g < 0) g = ...": the first matvec of a
+ * process can run inside the pool's workers, and several of them resolving
+ * the same plain int at once is a data race (ThreadSanitizer reported it,
+ * review R2) — benign in practice, undefined in C. After the once, the values
+ * are relaxed atomics: the setters below exist for tests and benches that
+ * flip a switch between calls, with the pool idle, and a relaxed load is a
+ * plain load on every target we build. */
+enum { INT8_Q4_K = MYNAH_SLM_INT8_Q4_K, INT8_Q8_0 = MYNAH_SLM_INT8_Q8_0,
+       INT8_Q6_K = MYNAH_SLM_INT8_Q6_K, INT8_ALL = 7 };
 
-/* The stored scales are IEEE half. Read as bytes, not through a native _Float16
- * load: the block is not guaranteed to be 2-byte aligned inside the mapping,
- * and on a strict-alignment target that is a fault rather than a slow path. */
-static float mynah_slm_f16_to_f32(const unsigned char *p) {
-    const uint16_t h = (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
-    const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
-    const uint32_t exp  = (h >> 10) & 0x1fu;
-    const uint32_t mant = h & 0x3ffu;
-    uint32_t bits;
+static pthread_once_t g_env_once = PTHREAD_ONCE_INIT;
+static _Atomic int g_own = 1;           /* our kernels (0: MYNAH_SLM_KERNELS=ingot) */
+static _Atomic int g_int8 = 0;          /* int8 requested (MYNAH_SLM_INT8 / --fast) */
+static _Atomic int g_int8_types = INT8_ALL;
 
-    if (exp == 0) {
-        if (mant == 0) { bits = sign; }
-        else {
-            /* Subnormal half: renormalize into a normal float. */
-            uint32_t e = 0, m = mant;
-            while ((m & 0x400u) == 0) { m <<= 1; e++; }
-            m &= 0x3ffu;
-            bits = sign | ((127u - 15u - e + 1u) << 23) | (m << 13);
-        }
-    } else if (exp == 31u) {
-        bits = sign | 0x7f800000u | (mant << 13);
-    } else {
-        bits = sign | ((exp + 127u - 15u) << 23) | (mant << 13);
-    }
+static int parse_int8_types(const char *e);
 
-    float out;
-    memcpy(&out, &bits, sizeof out);
-    return out;
+static void env_init(void) {
+    const char *e = getenv("MYNAH_SLM_KERNELS");
+    atomic_store_explicit(&g_own, (e && strcmp(e, "ingot") == 0) ? 0 : 1,
+                          memory_order_relaxed);
+    /* Off unless asked for. It trades accuracy for speed, and a default that
+     * quietly does that is how a quantization claim stops meaning anything.
+     * `mynah-slm ppl` is what decides, not this. */
+    e = getenv("MYNAH_SLM_INT8");
+    atomic_store_explicit(&g_int8, (e && strcmp(e, "0") != 0) ? 1 : 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&g_int8_types, parse_int8_types(getenv("MYNAH_SLM_INT8_TYPES")),
+                          memory_order_relaxed);
 }
 
-static int g_own = -1;      /* -1 = not resolved yet */
+static void env_resolve(void) { pthread_once(&g_env_once, env_init); }
 
-static int use_own_kernels(void) {
-    /* Read once. getenv in a matvec called ~200 times per token would be its
-     * own measurement problem. */
-    if (g_own < 0) {
-        const char *e = getenv("MYNAH_SLM_KERNELS");
-        g_own = (e && strcmp(e, "ingot") == 0) ? 0 : 1;
-    }
-    return g_own;
+static int env_get(_Atomic int *v) {
+    env_resolve();
+    return atomic_load_explicit(v, memory_order_relaxed);
 }
 
-void mynah_slm_matvec_set_enabled(int on) { g_own = on ? 1 : 0; }
+/* A setter resolves first, so a later lazy init cannot overwrite it. */
+static void env_set(_Atomic int *v, int value) {
+    env_resolve();
+    atomic_store_explicit(v, value, memory_order_relaxed);
+}
 
-/* Every kernel below exists in three forms: NEON, AVX2, and a scalar
- * reference. The scalar one is not a fallback nobody runs — it is the
- * definition the other two have to agree with, and it is what a machine
- * without either instruction set actually gets.
+static int use_own_kernels(void) { return env_get(&g_own); }
+
+void mynah_slm_matvec_set_enabled(int on) { env_set(&g_own, on ? 1 : 0); }
+
+/* Every kernel exists in a vector form per ISA and a scalar reference. The
+ * scalar one is not a fallback nobody runs — it is the definition the others
+ * have to agree with, and it is what a machine without the instructions gets.
  *
- * x86 cannot be executed natively here (this is an M1), so it is verified two
- * ways: `make check-x86` cross-compiles it, and `make test-x86-rosetta` builds
- * the suite as x86_64 and RUNS it under Rosetta, which translates AVX2. */
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-#define MYNAH_SLM_HAVE_SDOT 1
-#elif defined(__AVX2__)
-#define MYNAH_SLM_HAVE_SDOT 1     /* maddubs + madd, no VNNI required */
-#endif
+ * x86 cannot be executed natively on the M1, so it is verified two ways there:
+ * `make check-x86` cross-compiles every x86 kernel TU, and `make
+ * test-x86-rosetta` builds the suite as x86_64 and RUNS it under Rosetta.
+ * `mynah-slm --dispatch` says which tables actually resolved. */
 
-static int g_int8 = -1;
-
+/* Requested (MYNAH_SLM_INT8 / --fast) AND the resolved ISA has vector int8
+ * kernels. On a CPU without them the request is not honoured, and
+ * `--dispatch` says so: int8 through a scalar twin would be slower than the
+ * f32 path it replaces. */
 int mynah_slm_matvec_int8_enabled(void) {
-#if defined(MYNAH_SLM_HAVE_SDOT)
-    if (g_int8 < 0) {
-        /* Off unless asked for. It trades accuracy for speed, and a default
-         * that quietly does that is how a quantization claim stops meaning
-         * anything. `mynah-slm ppl` is what decides, not this. */
-        const char *e = getenv("MYNAH_SLM_INT8");
-        g_int8 = (e && strcmp(e, "0") != 0) ? 1 : 0;
-    }
-    return g_int8;
-#else
-    return 0;
-#endif
+    return env_get(&g_int8) && mynah_slm_kern_qmat()->int8;
 }
 
-void mynah_slm_matvec_set_int8(int on) { g_int8 = on ? 1 : 0; }
+int mynah_slm_matvec_int8_requested(void) { return env_get(&g_int8) > 0; }
+
+void mynah_slm_matvec_set_int8(int on) { env_set(&g_int8, on ? 1 : 0); }
+
+/* Which types the int8 switch applies to: MYNAH_SLM_INT8_TYPES, a comma list
+ * of q4_k / q8_0 / q6_k, default all three. It can only NARROW the switch,
+ * never turn int8 on by itself. It exists so the perplexity gate can price
+ * each type on ONE binary — the Q6_K head in front of the softmax is a
+ * different quality question from the Q4_K layers (.work/int8-q8_0-q6_k.md). */
+/*
+ * Exact tokens, not substrings: "q4_k_m" or "noq6_k" used to match, and a
+ * typo silently selected nothing. Case-insensitive, blanks around a token
+ * ignored, an unknown token reported (once: the environment is read once).
+ * An empty or unset value means all three; a value with no known token means
+ * none — narrow is the safe direction. */
+int mynah_slm_matvec_int8_types_parse(const char *e, FILE *warn) {
+    if (!e || !*e) return INT8_ALL;
+    static const struct { const char *name; int bit; } known[] = {
+        { "q4_k", INT8_Q4_K }, { "q8_0", INT8_Q8_0 }, { "q6_k", INT8_Q6_K },
+    };
+    int mask = 0;
+    const char *p = e;
+    for (;;) {
+        const char *end = strchr(p, ',');
+        if (!end) end = p + strlen(p);
+        const char *a = p, *b = end;
+        while (a < b && (*a == ' ' || *a == '\t')) a++;
+        while (b > a && (b[-1] == ' ' || b[-1] == '\t')) b--;
+        const size_t n = (size_t)(b - a);
+        int hit = 0;
+        for (size_t k = 0; k < sizeof known / sizeof *known; k++)
+            if (n == strlen(known[k].name) && strncasecmp(a, known[k].name, n) == 0) {
+                mask |= known[k].bit;
+                hit = 1;
+            }
+        if (!hit && n > 0 && warn)
+            fprintf(warn, "mynah-slm: MYNAH_SLM_INT8_TYPES: unknown type \"%.*s\" ignored "
+                          "(known: q4_k, q8_0, q6_k)\n", (int)n, a);
+        if (!*end) break;
+        p = end + 1;
+    }
+    return mask;
+}
+
+static int parse_int8_types(const char *e) {
+    return mynah_slm_matvec_int8_types_parse(e, stderr);
+}
+
+int mynah_slm_matvec_int8_types(void) { return env_get(&g_int8_types); }
+
+static int int8_type_bit(int type) {
+    return type == INGOT_TYPE_Q4_K ? INT8_Q4_K :
+           type == INGOT_TYPE_Q8_0 ? INT8_Q8_0 :
+           type == INGOT_TYPE_Q6_K ? INT8_Q6_K : 0;
+}
+
+static int int8_type_on(int type) {
+    return (env_get(&g_int8_types) & int8_type_bit(type)) != 0;
+}
+
+void mynah_slm_matvec_set_int8_types(int q4_k, int q8_0, int q6_k) {
+    env_set(&g_int8_types,
+            (q4_k ? INT8_Q4_K : 0) | (q8_0 ? INT8_Q8_0 : 0) | (q6_k ? INT8_Q6_K : 0));
+}
 
 int mynah_slm_matvec_have(int type) {
-    return type == INGOT_TYPE_Q4_K && use_own_kernels();
+    if (!use_own_kernels()) return 0;
+    if (type == INGOT_TYPE_Q4_K) return 1;
+    /* Q8_0 and Q6_K: ours only as int8 (K4). Their f32 kernels are ingot's,
+     * and docs/perf.md is why — ours tied or lost and went upstream. */
+    return (type == INGOT_TYPE_Q8_0 || type == INGOT_TYPE_Q6_K) &&
+           mynah_slm_matvec_int8_enabled() && int8_type_on(type);
 }
 
-void mynah_slm_matvec_prepare(const float *input, size_t cols,
-                              mynah_slm_matvec_in *prep) {
-    if (!input || !prep) return;
-    prep->have_int8 = mynah_slm_matvec_int8_enabled() && cols <= MYNAH_SLM_XQ_MAX;
+/* The smallest block maximum the int8 quantizer scales: 127 / 2^-120 is
+ * ~1.7e38, still finite. FLT_MIN would not do — 127 / FLT_MIN overflows. */
+#define MYNAH_SLM_XQ_AMAX_MIN 0x1p-120f
+
+static void matvec_prepare(const float *input, size_t cols,
+                           mynah_slm_matvec_in *prep, int want_int8) {
+    if (!prep) return;
+    /* The arrays are fixed-size: a wider vector is refused, not overrun, and
+     * `cols` says what was prepared so a product can check it (review N7). */
+    prep->cols = 0;
+    prep->have_int8 = 0;
+    if (!input || cols / 32 > MYNAH_SLM_XSUM_MAX) return;
+    prep->cols = cols;
+    prep->have_int8 = want_int8 && cols <= MYNAH_SLM_XQ_MAX;
+    int finite = 1;
 
     for (size_t s = 0; s < cols / 32; s++) {
         const float *x = input + s * 32;
@@ -145,325 +189,187 @@ void mynah_slm_matvec_prepare(const float *input, size_t cols,
             if (a > amax) amax = a;
         }
         prep->xsum[s] = acc;
+        if (!isfinite(acc)) finite = 0;     /* a NaN or inf in the block */
 
         if (prep->have_int8) {
-            const float scale = amax / 127.0f;
-            prep->xscale[s] = scale;
-            const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
             int8_t *q = prep->xq + s * 32;
+            /* A block that is all zeros, too small for 127/amax to be
+             * finite, or not finite at all quantizes to zero with a zero
+             * scale. The old form took inv = 1/(amax/127): for amax under
+             * ~3.7e-37 the scale went subnormal and inv +inf, every nonzero
+             * value saturated to -128/127 and 0*inf cast a NaN to int8 (UB).
+             * -128 then broke AVX2's sign(xq, w), which assumes |xq| <= 127.
+             * Such a block contributes < 1e-35 per unit weight: zero is the
+             * honest answer, and it is the same answer on every ISA. */
+            if (!(amax >= MYNAH_SLM_XQ_AMAX_MIN) || !isfinite(acc)) {
+                prep->xscale[s] = 0.0f;
+                memset(q, 0, 32);
+                continue;
+            }
+            prep->xscale[s] = amax / 127.0f;
+            const float inv = 127.0f / amax;      /* finite: amax >= 2^-120 */
             for (int i = 0; i < 32; i++) {
                 float v = nearbyintf(x[i] * inv);
+                /* |x * inv| <= 127 up to one rounding; clamp SYMMETRICALLY
+                 * so -128 can never be emitted (the AVX2 Q8_0 kernel and
+                 * the 128*127*2 int16 bound both rely on it). */
                 if (v >  127.0f) v =  127.0f;
-                if (v < -128.0f) v = -128.0f;
+                if (v < -127.0f) v = -127.0f;
                 q[i] = (int8_t)v;
             }
         }
     }
+
+    /* A non-finite activation must stay visible. int8 cannot carry it: the
+     * block above became zeros, and Q8_0/Q6_K (which never read xsum) would
+     * return a FINITE dot from a NaN input — a broken layer that samples
+     * normally. So the whole vector takes the f32 path, where ingot's and our
+     * f32 kernels propagate it. Costs nothing on finite input: the check is
+     * on the sums already computed. */
+    if (!finite) prep->have_int8 = 0;
 }
 
-/* The 6-bit scale/min pair for sub-block `index`, unpacked from the 12 bytes.
- * Byte-for-byte ggml's layout — this is a format detail, so it is copied and
- * not improvised. */
-static void q4_k_scale_min(const unsigned char *scales, int index,
-                           unsigned char *scale, unsigned char *minimum) {
-    if (index < 4) {
-        *scale   = scales[index] & 63u;
-        *minimum = scales[index + 4] & 63u;
-    } else {
-        *scale   = (unsigned char)((scales[index + 4] & 0x0fu) |
-                                   ((scales[index - 4] >> 6) << 4));
-        *minimum = (unsigned char)((scales[index + 4] >> 4) |
-                                   ((scales[index] >> 6) << 4));
-    }
+void mynah_slm_matvec_prepare(const float *input, size_t cols,
+                              mynah_slm_matvec_in *prep) {
+    matvec_prepare(input, cols, prep, mynah_slm_matvec_int8_enabled());
 }
 
-#if defined(MYNAH_SLM_HAVE_SDOT)
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#endif
-
-/* ── the int8 path ─────────────────────────────────────────────────────────
- * SDOT does four int8 multiply-accumulates per lane in one instruction, where
- * the f32 form needs a widen, a convert and an FMA per four values. The price
- * is that the ACTIVATIONS are quantized to int8 per 32 values.
- *
- * Both halves of the identity survive it cleanly:
- *
- *     SUM_j w_j x_j = d*scale * xs * SUM_j (q_j * xq_j)  -  dmin*min * SUM_j x_j
- *                                    ^^^^^^^^^^^^^^^^^        ^^^^^^^^^^^^^^^^
- *                                    integer, one SDOT        still exact f32
- *
- * so the min term keeps full precision and only the product term is
- * approximated. Whether that is acceptable is a question for `mynah-slm ppl`,
- * which is why this is off by default. */
-#if defined(__AVX2__)
-#include <immintrin.h>
-
-/* No VNNI required: maddubs multiplies u8 by i8 into i16 pairs and madd folds
- * those into i32. The nibbles are 0..15 and the activations fit int8, so the
- * largest partial is 15*127*2 = 3810 — far inside i16, and maddubs saturates
- * rather than wraps, which would otherwise be the trap here. */
-static inline int hsum256i(__m256i v) {
-    __m128i a = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
-    a = _mm_add_epi32(a, _mm_shuffle_epi32(a, 0x4e));
-    a = _mm_add_epi32(a, _mm_shuffle_epi32(a, 0xb1));
-    return _mm_cvtsi128_si32(a);
+void mynah_slm_matvec_prepare_int8(const float *input, size_t cols,
+                                   mynah_slm_matvec_in *prep) {
+    matvec_prepare(input, cols, prep, 1);
 }
 
-/* AVX-512 VNNI, ported from qwen-tts's int8 kernel stack (docs/prior-art.md).
- *
- * WHY THIS EXISTS. The measurement that forced it: on an AMD EPYC 9254 (Zen 4)
- * this Q4_K kernel ran at 7.8 GB/s while the SAME kernel on an Apple M1 ran at
- * 13.1 -- a server was slower than a laptop, because `grep -c _mm512 src/qmat.c
- * third_party/ingot/src/kernels.c` returned 0 and 0. Every x86 path we own was
- * AVX2 at 256 bits with the pre-VNNI `maddubs_epi16 + madd_epi16` pair, on a
- * CPU that has had a single-instruction u8xi8 dot product since 2022.
- *
- * THE LAYOUT TRICK. A Q4_K sub-block pair shares its 32 packed bytes: the low
- * nibbles are elements [base, base+32) and the high nibbles [base+32, base+64).
- * Concatenating the two unpacked halves into one 64-byte vector makes the
- * matching activations EXACTLY the contiguous 64 bytes at xq+base, so one
- * `vpdpbusd` covers both sub-blocks with a single load and no gather:
- *
- *     W = [ lo_nibbles(32B) | hi_nibbles(32B) ]     <- one insert
- *     X = xq[base .. base+64)                       <- one contiguous load
- *     acc = vpdpbusd(W, X)   lanes 0-7 -> sub-block s0, lanes 8-15 -> s1
- *
- * vpdpbusd wants an UNSIGNED first operand and the nibbles are 0..15, so no
- * correction is needed -- the same reason the ternary bench stores biased
- * codes. It also removes the one real hazard in the AVX2 path: `maddubs`
- * accumulates into int16 and saturates, which is safe here only because
- * 15*127*2 = 3810 happens to fit. VNNI accumulates in int32 and cannot. */
-#if defined(__AVX512VNNI__) && defined(__AVX512BW__) && defined(__AVX512F__)
-#define MYNAH_SLM_HAVE_AVX512VNNI 1
-
-static inline void q4_k_pair_vnni(const unsigned char *q, const int8_t *xbase,
-                                  int *sum_lo, int *sum_hi) {
-    const __m256i p  = _mm256_loadu_si256((const __m256i *)(const void *)q);
-    const __m256i m  = _mm256_set1_epi8(0x0f);
-    const __m256i nl = _mm256_and_si256(p, m);
-    const __m256i nh = _mm256_and_si256(_mm256_srli_epi16(p, 4), m);
-    const __m512i w  = _mm512_inserti64x4(_mm512_castsi256_si512(nl), nh, 1);
-    const __m512i x  = _mm512_loadu_si512((const void *)xbase);
-    const __m512i acc = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w, x);
-    *sum_lo = hsum256i(_mm512_extracti32x8_epi32(acc, 0));
-    *sum_hi = hsum256i(_mm512_extracti32x8_epi32(acc, 1));
-}
-#endif /* AVX-512 VNNI */
-#endif /* __AVX2__ */
-
-static float q4_k_row_int8(const unsigned char *row, size_t blocks,
-                           const int8_t *xq, const float *xscale,
-                           const float *xsum) {
-    float total = 0.0f, mins = 0.0f;
-
-    for (size_t b = 0; b < blocks; b++) {
-        const unsigned char *block = row + b * 144;
-        const float d    = mynah_slm_f16_to_f32(block);
-        const float dmin = mynah_slm_f16_to_f32(block + 2);
-        const unsigned char *scales = block + 4;
-        const unsigned char *q      = block + 16;
-        const size_t sub0 = b * 8;
-
-        for (int base = 0, si = 0; base < 256; base += 64, si += 2) {
-            unsigned char sc0, mn0, sc1, mn1;
-            q4_k_scale_min(scales, si,     &sc0, &mn0);
-            q4_k_scale_min(scales, si + 1, &sc1, &mn1);
-
-            const int8_t *xlo = xq + b * 256 + base;
-            const int8_t *xhi = xlo + 32;
-            int sum_lo, sum_hi;
-#if defined(__ARM_NEON)
-            int32x4_t alo = vdupq_n_s32(0), ahi = vdupq_n_s32(0);
-            for (int i = 0; i < 32; i += 16) {
-                const uint8x16_t p = vld1q_u8(q + i);
-                alo = vdotq_s32(alo, vreinterpretq_s8_u8(vandq_u8(p, vdupq_n_u8(0x0f))),
-                                vld1q_s8(xlo + i));
-                ahi = vdotq_s32(ahi, vreinterpretq_s8_u8(vshrq_n_u8(p, 4)),
-                                vld1q_s8(xhi + i));
-            }
-            sum_lo = vaddvq_s32(alo);
-            sum_hi = vaddvq_s32(ahi);
-#elif defined(MYNAH_SLM_HAVE_AVX512VNNI)
-            (void)xhi;   /* the 64-byte load at xlo covers both sub-blocks */
-            q4_k_pair_vnni(q, xlo, &sum_lo, &sum_hi);
-#else
-            const __m256i ones = _mm256_set1_epi16(1);
-            const __m256i p = _mm256_loadu_si256((const __m256i *)(const void *)q);
-            const __m256i nl = _mm256_and_si256(p, _mm256_set1_epi8(0x0f));
-            const __m256i nh = _mm256_and_si256(_mm256_srli_epi16(p, 4),
-                                                _mm256_set1_epi8(0x0f));
-            const __m256i vl = _mm256_loadu_si256((const __m256i *)(const void *)xlo);
-            const __m256i vh = _mm256_loadu_si256((const __m256i *)(const void *)xhi);
-            sum_lo = hsum256i(_mm256_madd_epi16(_mm256_maddubs_epi16(nl, vl), ones));
-            sum_hi = hsum256i(_mm256_madd_epi16(_mm256_maddubs_epi16(nh, vh), ones));
-#endif
-
-            const size_t s0 = sub0 + (size_t)base / 32;
-            total += d * (float)sc0 * xscale[s0]     * (float)sum_lo;
-            total += d * (float)sc1 * xscale[s0 + 1] * (float)sum_hi;
-            mins  += dmin * ((float)mn0 * xsum[s0] + (float)mn1 * xsum[s0 + 1]);
-            q += 32;
-        }
-    }
-    return total - mins;
-}
-#endif
-
-
-#if defined(__ARM_NEON)
-static inline float32x4_t nib_to_f32(uint8x8_t v, int high) {
-    const uint16x8_t w = vmovl_u8(v);
-    return vcvtq_f32_u32(vmovl_u16(high ? vget_high_u16(w) : vget_low_u16(w)));
+const char *mynah_slm_matvec_int8_isa(void) {
+    const mynah_slm_qmat_kern *k = mynah_slm_kern_qmat();
+    return k->int8 ? k->int8_name : "none";
 }
 
-static float q4_k_row(const unsigned char *row, size_t blocks,
-                      const float *x, const float *xsum) {
-    float32x4_t total = vdupq_n_f32(0.0f);
-    float       mins  = 0.0f;
-
-    for (size_t b = 0; b < blocks; b++) {
-        const unsigned char *block = row + b * 144;
-        const float d    = mynah_slm_f16_to_f32(block);
-        const float dmin = mynah_slm_f16_to_f32(block + 2);
-        const unsigned char *scales = block + 4;
-        const unsigned char *q      = block + 16;
-        const float         *bx     = x    + b * 256;
-        const float         *bs     = xsum + b * 8;
-
-        for (int base = 0, si = 0; base < 256; base += 64, si += 2) {
-            unsigned char sc0, mn0, sc1, mn1;
-            q4_k_scale_min(scales, si,     &sc0, &mn0);
-            q4_k_scale_min(scales, si + 1, &sc1, &mn1);
-
-            float32x4_t lo = vdupq_n_f32(0.0f), hi = vdupq_n_f32(0.0f);
-            for (int i = 0; i < 32; i += 8) {
-                const uint8x8_t packed = vld1_u8(q + i);
-                const uint8x8_t nl = vand_u8(packed, vdup_n_u8(0x0f));
-                const uint8x8_t nh = vshr_n_u8(packed, 4);
-                lo = vmlaq_f32(lo, nib_to_f32(nl, 0), vld1q_f32(bx + base + i));
-                lo = vmlaq_f32(lo, nib_to_f32(nl, 1), vld1q_f32(bx + base + i + 4));
-                hi = vmlaq_f32(hi, nib_to_f32(nh, 0), vld1q_f32(bx + base + i + 32));
-                hi = vmlaq_f32(hi, nib_to_f32(nh, 1), vld1q_f32(bx + base + i + 36));
-            }
-            /* One scale application per 32 weights instead of 32. */
-            total = vmlaq_n_f32(total, lo, d * (float)sc0);
-            total = vmlaq_n_f32(total, hi, d * (float)sc1);
-            mins += dmin * ((float)mn0 * bs[base / 32] +
-                            (float)mn1 * bs[base / 32 + 1]);
-            q += 32;
-        }
-    }
-    return vaddvq_f32(total) - mins;
+/* The scalar twins, from the scalar table whatever resolved. */
+int mynah_slm_q4k_int8_ref(const void *weights, size_t rows, size_t cols,
+                           const mynah_slm_matvec_in *prep, float *output) {
+    if (!weights || !prep || !output || !prep->have_int8 || prep->cols != cols || cols % 256 != 0)
+        return -1;
+    mynah_slm_qmat_kern_scalar.q4k_i8((const unsigned char *)weights, rows, cols / 256,
+                                      prep->xq, prep->xscale, prep->xsum, output);
+    return 0;
 }
 
-#elif defined(__AVX2__)
-#include <immintrin.h>
-
-static inline float hsum256(__m256 v) {
-    __m128 a = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
-    a = _mm_add_ps(a, _mm_movehl_ps(a, a));
-    a = _mm_add_ss(a, _mm_shuffle_ps(a, a, 0x55));
-    return _mm_cvtss_f32(a);
+int mynah_slm_q80_int8_ref(const void *weights, size_t rows, size_t cols,
+                           const mynah_slm_matvec_in *prep, float *output) {
+    if (!weights || !prep || !output || !prep->have_int8 || prep->cols != cols || cols % 32 != 0)
+        return -1;
+    mynah_slm_qmat_kern_scalar.q80_i8((const unsigned char *)weights, rows, cols / 32,
+                                      prep->xq, prep->xscale, output);
+    return 0;
 }
 
-static float q4_k_row(const unsigned char *row, size_t blocks,
-                      const float *x, const float *xsum) {
-    __m256 total = _mm256_setzero_ps();
-    float  mins  = 0.0f;
-
-    for (size_t b = 0; b < blocks; b++) {
-        const unsigned char *block = row + b * 144;
-        const float d    = mynah_slm_f16_to_f32(block);
-        const float dmin = mynah_slm_f16_to_f32(block + 2);
-        const unsigned char *scales = block + 4;
-        const unsigned char *q      = block + 16;
-        const float         *bx     = x    + b * 256;
-        const float         *bs     = xsum + b * 8;
-
-        for (int base = 0, si = 0; base < 256; base += 64, si += 2) {
-            unsigned char sc0, mn0, sc1, mn1;
-            q4_k_scale_min(scales, si,     &sc0, &mn0);
-            q4_k_scale_min(scales, si + 1, &sc1, &mn1);
-
-            __m256 lo = _mm256_setzero_ps(), hi = _mm256_setzero_ps();
-            for (int i = 0; i < 32; i += 8) {
-                const __m128i packed = _mm_loadl_epi64((const __m128i *)(const void *)(q + i));
-                const __m128i nl = _mm_and_si128(packed, _mm_set1_epi8(0x0f));
-                const __m128i nh = _mm_and_si128(_mm_srli_epi16(packed, 4),
-                                                 _mm_set1_epi8(0x0f));
-                lo = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(nl)),
-                                     _mm256_loadu_ps(bx + base + i), lo);
-                hi = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(nh)),
-                                     _mm256_loadu_ps(bx + base + i + 32), hi);
-            }
-            total = _mm256_fmadd_ps(lo, _mm256_set1_ps(d * (float)sc0), total);
-            total = _mm256_fmadd_ps(hi, _mm256_set1_ps(d * (float)sc1), total);
-            mins += dmin * ((float)mn0 * bs[base / 32] +
-                            (float)mn1 * bs[base / 32 + 1]);
-            q += 32;
-        }
-    }
-    return hsum256(total) - mins;
+int mynah_slm_q6k_int8_ref(const void *weights, size_t rows, size_t cols,
+                           const mynah_slm_matvec_in *prep, float *output) {
+    if (!weights || !prep || !output || !prep->have_int8 || prep->cols != cols || cols % 256 != 0)
+        return -1;
+    mynah_slm_qmat_kern_scalar.q6k_i8((const unsigned char *)weights, rows, cols / 256,
+                                      prep->xq, prep->xscale, output);
+    return 0;
 }
-
-#else   /* the scalar twin, and the reference for what the other two mean */
-
-static float q4_k_row(const unsigned char *row, size_t blocks,
-                      const float *x, const float *xsum) {
-    float total = 0.0f, mins = 0.0f;
-
-    for (size_t b = 0; b < blocks; b++) {
-        const unsigned char *block = row + b * 144;
-        const float d    = mynah_slm_f16_to_f32(block);
-        const float dmin = mynah_slm_f16_to_f32(block + 2);
-        const unsigned char *scales = block + 4;
-        const unsigned char *q      = block + 16;
-        const float         *bx     = x    + b * 256;
-        const float         *bs     = xsum + b * 8;
-
-        for (int base = 0, si = 0; base < 256; base += 64, si += 2) {
-            unsigned char sc0, mn0, sc1, mn1;
-            q4_k_scale_min(scales, si,     &sc0, &mn0);
-            q4_k_scale_min(scales, si + 1, &sc1, &mn1);
-
-            float lo = 0.0f, hi = 0.0f;
-            for (int i = 0; i < 32; i++) {
-                lo += (float)(q[i] & 0x0f) * bx[base + i];
-                hi += (float)(q[i] >> 4)   * bx[base + i + 32];
-            }
-            total += d * ((float)sc0 * lo + (float)sc1 * hi);
-            mins  += dmin * ((float)mn0 * bs[base / 32] +
-                             (float)mn1 * bs[base / 32 + 1]);
-            q += 32;
-        }
-    }
-    return total - mins;
-}
-
-#endif
 
 int mynah_slm_matvec(int type, const void *weights, size_t rows, size_t cols,
                      const float *input, const mynah_slm_matvec_in *prep,
                      float *output) {
-    if (!prep || !use_own_kernels()) return -1;
-    if (cols % 256 != 0) return -1;         /* K-quant super-blocks, by definition */
+    if (!prep || prep->cols != cols || !use_own_kernels()) return -1;
+    const mynah_slm_qmat_kern *k = mynah_slm_kern_qmat();
+    const unsigned char *w = (const unsigned char *)weights;
+    const int int8 = prep->have_int8 && k->int8 && int8_type_on(type);
 
-    if (type != INGOT_TYPE_Q4_K) return -1;
-
-    const size_t blocks = cols / 256;
-    const unsigned char *base = (const unsigned char *)weights;
-
-#if defined(MYNAH_SLM_HAVE_SDOT)
-    if (prep->have_int8) {
-        for (size_t r = 0; r < rows; r++)
-            output[r] = q4_k_row_int8(base + r * blocks * 144, blocks,
-                                      prep->xq, prep->xscale, prep->xsum);
+    /* int8 only: with f32 activations these two types are ingot's. */
+    if (type == INGOT_TYPE_Q8_0) {
+        if (!int8 || cols % 32 != 0) return -1;
+        k->q80_i8(w, rows, cols / 32, prep->xq, prep->xscale, output);
         return 0;
     }
-#endif
-    for (size_t r = 0; r < rows; r++)
-        output[r] = q4_k_row(base + r * blocks * 144, blocks, input, prep->xsum);
+    if (type == INGOT_TYPE_Q6_K) {
+        if (!int8 || cols % 256 != 0) return -1;
+        k->q6k_i8(w, rows, cols / 256, prep->xq, prep->xscale, output);
+        return 0;
+    }
+    if (type != INGOT_TYPE_Q4_K || cols % 256 != 0) return -1;
+
+    if (int8) k->q4k_i8(w, rows, cols / 256, prep->xq, prep->xscale, prep->xsum, output);
+    else      k->q4k_f32(w, rows, cols / 256, input, prep->xsum, output);
+    return 0;
+}
+
+/* ── weight-stationary: several tokens per weight read (K7) ──────────────── */
+
+/* Which kernel family the solo path would take for every token, or 0 when
+ * they would not all take the SAME one of ours (then the caller runs the
+ * solo path per token, so nothing about a token's result can change). */
+enum { WS_NONE = 0, WS_F32 = 1, WS_INT8 = 2 };
+
+static int ws_path(const mynah_slm_qmat_kern *k, int type, size_t cols, size_t ntok,
+                   const mynah_slm_matvec_in *prep) {
+    if (!prep || ntok == 0 || !use_own_kernels()) return WS_NONE;
+    const int typed = int8_type_on(type);
+    int path = WS_NONE;
+    for (size_t t = 0; t < ntok; t++) {
+        if (prep[t].cols != cols) return WS_NONE;
+        const int p = (prep[t].have_int8 && k->int8 && typed) ? WS_INT8 : WS_F32;
+        if (t > 0 && p != path) return WS_NONE;
+        path = p;
+    }
+    switch (type) {
+    case INGOT_TYPE_Q4_K:
+        if (cols % 256 != 0) return WS_NONE;
+        return (path == WS_INT8 ? k->q4k_i8_ws != NULL : k->q4k_f32_ws != NULL) ? path : WS_NONE;
+    case INGOT_TYPE_Q8_0:
+        return path == WS_INT8 && cols % 32 == 0 && k->q80_i8_ws ? path : WS_NONE;
+    case INGOT_TYPE_Q6_K:
+        return path == WS_INT8 && cols % 256 == 0 && k->q6k_i8_ws ? path : WS_NONE;
+    default:
+        return WS_NONE;
+    }
+}
+
+int mynah_slm_matvec_ws_ok(int type, size_t cols, size_t ntok,
+                           const mynah_slm_matvec_in *prep) {
+    return ws_path(mynah_slm_kern_qmat(), type, cols, ntok, prep) != WS_NONE;
+}
+
+/* Calls that ran a weight-stationary kernel: how a test or a benchmark proves
+ * the path it claims to measure was taken. One relaxed add per row chunk. */
+static _Atomic unsigned long g_ws_calls = 0;
+
+unsigned long mynah_slm_matvec_ws_count(void) {
+    return atomic_load_explicit(&g_ws_calls, memory_order_relaxed);
+}
+
+int mynah_slm_matvec_ws(int type, const void *weights, size_t rows, size_t cols,
+                        size_t ntok, const float *in, size_t ldx,
+                        const mynah_slm_matvec_in *prep, float *out, size_t ldo) {
+    if (!weights || !out || (!in && type == INGOT_TYPE_Q4_K)) return -1;
+    const mynah_slm_qmat_kern *k = mynah_slm_kern_qmat();
+    const int path = ws_path(k, type, cols, ntok, prep);
+    if (path == WS_NONE) return -1;
+    const unsigned char *w = (const unsigned char *)weights;
+
+    for (size_t t0 = 0; t0 < ntok; t0 += MYNAH_SLM_WS_MAX) {
+        const size_t nt = ntok - t0 < MYNAH_SLM_WS_MAX ? ntok - t0 : MYNAH_SLM_WS_MAX;
+        const float  *x[MYNAH_SLM_WS_MAX], *xs[MYNAH_SLM_WS_MAX], *xm[MYNAH_SLM_WS_MAX];
+        const int8_t *xq[MYNAH_SLM_WS_MAX];
+        float        *o[MYNAH_SLM_WS_MAX];
+        for (size_t t = 0; t < nt; t++) {
+            const mynah_slm_matvec_in *p = &prep[t0 + t];
+            x[t]  = in ? in + (t0 + t) * ldx : NULL;
+            xs[t] = p->xscale;
+            xm[t] = p->xsum;
+            xq[t] = p->xq;
+            o[t]  = out + (t0 + t) * ldo;
+        }
+        if (type == INGOT_TYPE_Q8_0)      k->q80_i8_ws(w, rows, cols / 32, nt, xq, xs, o);
+        else if (type == INGOT_TYPE_Q6_K) k->q6k_i8_ws(w, rows, cols / 256, nt, xq, xs, o);
+        else if (path == WS_INT8)         k->q4k_i8_ws(w, rows, cols / 256, nt, xq, xs, xm, o);
+        else                              k->q4k_f32_ws(w, rows, cols / 256, nt, x, xm, o);
+    }
+    atomic_fetch_add_explicit(&g_ws_calls, 1, memory_order_relaxed);
     return 0;
 }
 
@@ -522,13 +428,14 @@ int mynah_slm_qmatmat(int type, const void *weights, size_t rows, size_t cols,
         mynah_slm_parallel_for(chunks, dequant_chunk, &j);
         if (j.rc != 0) return -1;
 
-        /* BLAS is called from ONE thread with the pool idle, never from inside
-         * a parallel region: it brings its own threads, and two pools over the
-         * same cores is the throughput collapse mynah-asr measured. */
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    (int)tokens, (int)n_rows, (int)cols,
-                    1.0f, in, (int)cols, scratch, (int)cols,
-                    0.0f, out + row0, (int)rows);
+        /* Called from ONE thread with the pool idle, never from inside a
+         * parallel region: ours runs its own region on the pool, and a vendor
+         * BLAS brings its own threads — two pools over the same cores is the
+         * throughput collapse mynah-asr measured. NT: both operands are
+         * contiguous along cols, so nothing is transposed or packed. */
+        if (mynah_slm_sgemm(1, tokens, n_rows, cols, 1.0f, in, cols,
+                            scratch, cols, 0.0f, out + row0, rows) != 0)
+            return -1;
     }
     return 0;
 }

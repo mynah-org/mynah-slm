@@ -14,6 +14,7 @@
  *
  * SPDX-License-Identifier: MIT */
 #include "model.h"
+#include "isa.h"
 
 #include "mynah_slm.h"
 
@@ -315,6 +316,10 @@ const void *mynah_slm_tensor_data(const mynah_slm_model_t *m, const ingot_tensor
 
 mynah_slm_model_t *mynah_slm_load(const char *path, char *err, size_t errsz) {
     if (!path) { fail(err, errsz, "null path"); return NULL; }
+
+    /* Resolve and verify the kernel tables now, on this thread, so the cost
+     * is paid at load and not inside the first token's TTFT. */
+    mynah_slm_isa_init();
 
     mynah_slm_model_t *m = calloc(1, sizeof *m);
     if (!m) { fail(err, errsz, "out of memory"); return NULL; }

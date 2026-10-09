@@ -45,3 +45,12 @@ same way.
 | [engineering-method.md](engineering-method.md) | How we avoid fooling ourselves: cost model before code, every tool declares a refusal, the completion rule |
 | [ternary-feasibility.md](ternary-feasibility.md) | R1 — can a pretrained Qwen3-0.6B be post-training ternarized and still be worth running? |
 | [archive-2026-08-tasks.md](archive-2026-08-tasks.md) | The M0-M6 task breakdown, moved verbatim from the old `TASKS.md` |
+| [sibling-port-map.md](sibling-port-map.md) | P1 — what mynah-tts / mynah-asr have that transfers to an SLM engine, what does not, and why |
+| [no-blas.md](no-blas.md) | K1 — our own f32 GEMM (`BLAS=none`), its evidence table, and the gate for making it the Linux default |
+| [cuda-backend.md](cuda-backend.md) | G1 — backend vtable (CPU reference implementation) and the Qwen3 CUDA backend behind `make cuda`; integration plan, kernel parity gates, what transfers from mynah-tts |
+| [q4k-int8-4row.md](q4k-int8-4row.md) | K3 — the opt-in int8 Q4_K matvec: four rows per activation load, one float reduction per row, scalar twin in the same order |
+| [int8-q8_0-q6_k.md](int8-q8_0-q6_k.md) | K4 — int8-activation matvec for Q8_0 and Q6_K under `--fast`, the per-type decision and its numbers |
+| [bf16-native-matvec.md](bf16-native-matvec.md) | K6 — native BF16/F16 weight matvec: rejected, ingot is already at the read roof on the head and no shipped format has 2-byte weights |
+| [isa-runtime-dispatch.md](isa-runtime-dispatch.md) | K5 — runtime ISA dispatch for our kernels (per-ISA translation units, narrowing env, verify-on-first-use, `--dispatch`) so a portable binary is a fast one |
+| [serving-continuous-batching.md](serving-continuous-batching.md) | S1 — continuous batching: scheduler thread, per-request state, batched decode, slots behind `--slots` |
+| [batched-decode-kernel.md](batched-decode-kernel.md) | K7 — weight-stationary batched quantized matvec (`MYNAH_SLM_DECODE_PRODUCT=ws`): B tokens per weight read, bit-identical per token to the single-token kernel |

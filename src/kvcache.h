@@ -80,6 +80,11 @@ void mynah_slm_kv_gather_v(const mynah_slm_kv *c, uint32_t layer, uint32_t head,
  */
 float mynah_slm_kv_dot_k(const mynah_slm_kv *c, uint32_t layer, uint32_t pos,
                          uint32_t head, const float *q);
+
+/* One head's slice of one stored position, decoded to f32. The slow path the
+ * fused accessors fall back to for fp8. */
+void mynah_slm_kv_row_slice(const uint8_t *row, mynah_slm_kv_type t, uint32_t head,
+                            uint32_t head_dim, float *out);
 void  mynah_slm_kv_axpy_v(const mynah_slm_kv *c, uint32_t layer, uint32_t pos,
                           uint32_t head, float w, float *out);
 

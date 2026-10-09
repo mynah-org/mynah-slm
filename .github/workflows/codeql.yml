@@ -51,15 +51,11 @@ jobs:
 
       # Same check set as ingot, so a finding means the same thing in both
       # repos. Sources only: third_party/ is not ours to fix from here.
+      # `make tidy` analyses every translation unit with the flags the build
+      # gives it: the per-ISA kernel TUs (src/kern.h) do not compile without
+      # their -m flags, so a plain src/*.c glob would stop on them.
       - name: Run clang-tidy over the sources
-        run: |
-          clang-tidy \
-            -checks='clang-analyzer-core.*,clang-analyzer-unix.*,clang-analyzer-security.*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,-clang-analyzer-deadcode.DeadStores,bugprone-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions,-bugprone-implicit-widening-of-multiplication-result,-bugprone-suspicious-realloc-usage,-bugprone-multi-level-implicit-pointer-conversion,-bugprone-misplaced-widening-cast,-bugprone-branch-clone' \
-            -warnings-as-errors='' \
-            src/*.c cli/*.c server/*.c \
-            -- -std=c11 -Iinclude -Ithird_party/ingot/include \
-               -iquote src -iquote server -D_DEFAULT_SOURCE \
-               -DMYNAH_SLM_BLAS_OPENBLAS -DMYNAH_SLM_BUILD='"ci"'
+        run: make tidy BLAS=openblas
 
   # tools/ is offline-only and never runs at inference time, but the oracle in
   # it is what every numeric stage of the C engine is measured against — an

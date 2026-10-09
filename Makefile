@@ -1,4 +1,5 @@
-# mynah-slm — build. CPU-first: BLAS = Accelerate (macOS) / OpenBLAS (Linux).
+# mynah-slm — build. CPU-first: BLAS = Accelerate (macOS) / OpenBLAS (Linux),
+# or our own GEMM with BLAS=none (no vendor dependency, see below).
 CC      ?= cc
 # NOTE: deliberately NO -ffast-math (mynah-asr uses it, we don't). A decoder
 # runs expf over logits and softmax over attention scores; under -ffast-math an
@@ -15,21 +16,53 @@ LDFLAGS ?=
 CFLAGS += -fPIC
 
 UNAME_S := $(shell uname -s)
+
+# BLAS: which f32 GEMM prefill and batched attention run on. Four values:
+#
+#   auto        `openblas` on Linux, `accelerate` on macOS — the default, and
+#               unchanged from before src/sgemm.c existed.
+#   none        OUR src/sgemm.c, no vendor BLAS in the process and no -dev
+#               package to install. Deterministic (bit-identical across
+#               thread counts) and on our own thread pool — the reasons
+#               mynah-tts made the same move (its .work/no-blas.md). OPT-IN,
+#               NOT THE DEFAULT: on the prefill shapes that dominate
+#               (T=256 batches) it measured 0.5-0.65x OpenBLAS on a 4-vCPU
+#               Cascade Lake VM. The flip is gated in .work/no-blas.md.
+#   openblas    Linux vendor BLAS.
+#   accelerate  macOS.
+#
+# With a vendor linked, MYNAH_SLM_SGEMM=own routes to ours at run time, so the
+# A/B runs interleaved in one process (`tests/test_sgemm bench`). Whatever
+# links, src/sgemm.c owns the one entry point (mynah_slm_sgemm).
+BLAS ?= auto
 ifeq ($(UNAME_S),Darwin)
+  BLAS_RESOLVED := $(if $(filter auto,$(BLAS)),accelerate,$(BLAS))
+else
+  BLAS_RESOLVED := $(if $(filter auto,$(BLAS)),openblas,$(BLAS))
+endif
+
+ifeq ($(BLAS_RESOLVED),none)
+  BLAS_DEF := MYNAH_SLM_BLAS_NONE
+else ifeq ($(BLAS_RESOLVED),accelerate)
+  ifneq ($(UNAME_S),Darwin)
+    $(error BLAS=accelerate is macOS-only; this host is $(UNAME_S))
+  endif
   LDFLAGS += -framework Accelerate
   BLAS_DEF := MYNAH_SLM_BLAS_ACCELERATE
-  CFLAGS  += -DMYNAH_SLM_BLAS_ACCELERATE -DACCELERATE_NEW_LAPACK
-else
+  CFLAGS  += -DACCELERATE_NEW_LAPACK
+else ifeq ($(BLAS_RESOLVED),openblas)
   LDFLAGS += -lopenblas
   BLAS_DEF := MYNAH_SLM_BLAS_OPENBLAS
-  CFLAGS  += -DMYNAH_SLM_BLAS_OPENBLAS
   # fail early with a clear hint instead of "cblas.h: No such file or directory"
   ifeq ($(filter clean help,$(MAKECMDGOALS)),)
     ifeq ($(shell printf '\043include <cblas.h>\n' | $(CC) -E -xc - >/dev/null 2>&1 && echo ok),)
-      $(error OpenBLAS headers not found. Install them first: `sudo apt install libopenblas-dev` (Debian/Ubuntu) or `sudo dnf install openblas-devel` (Fedora))
+      $(error OpenBLAS headers not found. Install them first (`sudo apt install libopenblas-dev`), or build without a vendor BLAS: `make BLAS=none`)
     endif
   endif
+else
+  $(error BLAS=$(BLAS) is not a profile. Use auto, none, openblas or accelerate)
 endif
+CFLAGS += -D$(BLAS_DEF)
 LDFLAGS += -lpthread -lm
 
 # hook for recursive variant builds: these ADD to the flags this Makefile
@@ -44,8 +77,71 @@ INGOT_LIB := $(INGOT_DIR)/libingot.a
 CFLAGS  += -I$(INGOT_DIR)/include
 LDFLAGS += $(INGOT_LIB)
 
-SRC := $(wildcard src/*.c)
-OBJ := $(SRC:%.c=build/%.o)
+# ── kernel TUs: runtime ISA dispatch (src/kern.h, .work/isa-runtime-dispatch.md)
+# Every SIMD kernel we own is compiled ONCE PER ISA into its own object, and
+# src/isa.c picks one table per family at run time (CPUID / getauxval /
+# sysctl, narrowed by MYNAH_SLM_ISA, verified against the scalar table). So a
+# portable build (ARCH_FLAGS=-march=x86-64-v2 or armv8-a) still runs the
+# AVX2 / AVX-512 VNNI / dotprod kernels where the CPU has them, and
+# `mynah-slm --dispatch` proves which ones resolved.
+#
+# The architecture comes from the COMPILER, not the host: a cross build with
+# CC=aarch64-linux-gnu-gcc gets the arm64 set.
+KERN_MACHINE := $(shell $(CC) $(ARCH_FLAGS) -dumpmachine 2>/dev/null)
+ifneq ($(filter x86_64% amd64%,$(KERN_MACHINE)),)
+  KERN_ARCH := x86
+else ifneq ($(filter aarch64% arm64%,$(KERN_MACHINE)),)
+  KERN_ARCH := arm64
+else
+  KERN_ARCH := generic
+endif
+
+# which TUs each family has, per architecture (src/isa.c lists the same sets)
+KERN_QMAT_x86      := scalar avx2 avx512vnni
+KERN_ATTN_x86      := scalar avx2
+KERN_SGEMM_x86     := scalar avx2 avx512
+KERN_QMAT_arm64    := scalar neon neon_dotprod
+KERN_ATTN_arm64    := scalar neon
+KERN_SGEMM_arm64   := scalar neon
+KERN_QMAT_generic  := scalar
+KERN_ATTN_generic  := scalar
+KERN_SGEMM_generic := scalar
+
+# per-TU ISA flags, added AFTER ARCH_FLAGS so they win. The x86 "scalar" and
+# "avx2" TUs also switch the wider ISAs OFF, so a -march=native build's
+# MYNAH_SLM_ISA=scalar really is a pre-AVX2 run and not one the compiler
+# quietly auto-vectorized with AVX-512. The scalar TU drops AVX itself (and
+# with it F16C): the twins are what a pre-AVX machine runs, so not a single
+# VEX/ymm instruction may appear in them (objdump-checked, review N1).
+KF_x86_scalar      := -mno-avx -mno-avx2 -mno-fma -mno-f16c
+KF_x86_avx2        := -mavx2 -mfma -mf16c -mno-avx512f
+KF_x86_avx512      := -mavx2 -mfma -mf16c -mavx512f -mavx512bw -mavx512vl -mavx512dq
+KF_x86_avx512vnni  := $(KF_x86_avx512) -mavx512vnni
+KF_arm64_scalar    :=
+KF_arm64_neon      :=
+# only when the baseline lacks it. With an -mcpu in ARCH_FLAGS the feature is
+# added to THAT cpu (-mcpu=cortex-a72+dotprod): a -march next to an -mcpu is a
+# "switch conflicts" warning in gcc, which -Werror turns into a failed build
+# (review N3), and it would also drop the -mcpu's tuning for this TU.
+KF_ARM_MCPU := $(lastword $(filter -mcpu=%,$(ARCH_FLAGS)))
+KF_arm64_neon_dotprod := $(if $(findstring __ARM_FEATURE_DOTPROD,$(shell $(CC) $(ARCH_FLAGS) -dM -E -xc /dev/null 2>/dev/null)),,$(if $(KF_ARM_MCPU),$(KF_ARM_MCPU)+dotprod,-march=armv8.2-a+dotprod))
+KF_generic_scalar  :=
+
+KID_scalar       := 0
+KID_neon         := 1
+KID_neon_dotprod := 2
+KID_avx2         := 3
+KID_avx512       := 4
+KID_avx512vnni   := 5
+
+KERN_SRC := src/qmat_kern.c src/attn_kern.c
+KERN_OBJ := $(foreach t,$(KERN_QMAT_$(KERN_ARCH)),build/kern/qmat_$(t).o) \
+            $(foreach t,$(KERN_ATTN_$(KERN_ARCH)),build/kern/attn_$(t).o) \
+            $(foreach t,$(KERN_SGEMM_$(KERN_ARCH)),build/kern/sgemm_$(t).o)
+KERN_TU_FLAGS = $(KF_$(KERN_ARCH)_$*) -DMYNAH_SLM_KERN_TU=$* -DMYNAH_SLM_KERN_ID=$(KID_$*)
+
+SRC := $(filter-out $(KERN_SRC),$(wildcard src/*.c))
+OBJ := $(SRC:%.c=build/%.o) $(KERN_OBJ)
 HDR := $(wildcard src/*.h) $(wildcard include/*.h)
 
 CFLAGS += -Iinclude
@@ -71,14 +167,23 @@ help:
 	@echo "  shared       libmynah_slm.{dylib,so}"
 	@echo "  test         unit tests + parity (exit 77 = skipped, model missing)"
 	@echo "  test-parity  C forward pass vs the numpy oracle, stage by stage"
+	@echo "  test-device  run --device: cpu-backend == cpu, cuda refused cleanly (no model)"
 	@echo "  test-server  end-to-end HTTP checks (needs a minute of generation)"
+	@echo "  test-server-cancel  disconnects cost no CPU, 503 at the cap (no model needed)"
+	@echo "  test-server-slots   --slots 4 continuous batching end to end (no model needed)"
 	@echo "  bench        per-tensor matvec throughput"
+	@echo "  cuda         opt-in CUDA build in build/cuda/ (CUDA_ARCH=sm_89; needs nvcc)"
+	@echo "  cuda-test    build and run the CUDA self-test (skips without a device)"
+	@echo "  bench-qmat   kernel A/B on synthetic matrices (no model)"
+	@echo "  dispatch     which kernels resolved on this CPU (mynah-slm --dispatch)"
+	@echo "  bench-decode one decode step for B streams: solo vs matvec vs ws (S1-c, K7)"
 	@echo "  check-x86    cross-compile the AVX2 paths"
 	@echo "  test-x86-rosetta  build x86_64 and RUN the suite under Rosetta"
 	@echo "  golden-dump  regenerate the oracle's reference activations"
 	@echo "  debug        -O0 -g rebuild"
 	@echo "  ubsan        UBSan rebuild + test, then clean"
 	@echo "  asan         ASan+UBSan rebuild + test (LINUX CI ONLY, see below)"
+	@echo "  tsan         ThreadSanitizer: scheduler, queue, pool, batched decode"
 	@echo "  leaks        macOS native leak check (no rebuild)"
 	@echo "  warnings     the CI -Werror gate, same flags (your CC: see caveat)"
 	@echo "  update-ingot refresh the vendored ingot subtree"
@@ -93,7 +198,7 @@ help:
 mynah-slm: $(OBJ) build/cli/main.o $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
-SERVER_OBJ := build/server/main.o build/server/http.o
+SERVER_OBJ := build/server/main.o build/server/http.o build/server/slots.o
 mynah-slm-server: $(OBJ) $(SERVER_OBJ) $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
@@ -102,10 +207,49 @@ build/server/%.o: server/%.c $(HDR) $(wildcard server/*.h)
 	$(CC) $(CFLAGS) -iquote server -c $< -o $@
 
 # objects in build/ (never next to the sources: the variant builds — ubsan,
-# asan — must not pollute the normal one)
+# asan — must not pollute the normal one). Test objects also depend on the
+# test-side headers (tests/fixture_model.h); listed first so make 3.81, which
+# takes the first matching pattern, picks it for them.
+build/tests/%.o: tests/%.c $(HDR) $(wildcard tests/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 build/%.o: %.c $(HDR)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# the kernel TUs: one source, one object per ISA (see KERN_* above)
+build/kern/qmat_%.o: src/qmat_kern.c $(HDR)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(KERN_TU_FLAGS) -c $< -o $@
+build/kern/attn_%.o: src/attn_kern.c $(HDR)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(KERN_TU_FLAGS) -c $< -o $@
+build/kern/sgemm_%.o: src/sgemm.c $(HDR)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(KERN_TU_FLAGS) -c $< -o $@
+
+# clang-tidy over every translation unit WITH the flags the build gives it.
+# The kernel TUs (src/kern.h) only compile as one ISA at a time, so a plain
+# `clang-tidy src/*.c` sees them without their -m flags and stops on an
+# error; here each is analysed once per ISA it is built for. The CI job
+# (codeql.yml) calls this target so the two cannot drift apart.
+TIDY        ?= clang-tidy
+TIDY_CHECKS := clang-analyzer-core.*,clang-analyzer-unix.*,clang-analyzer-security.*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,-clang-analyzer-deadcode.DeadStores,bugprone-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions,-bugprone-implicit-widening-of-multiplication-result,-bugprone-suspicious-realloc-usage,-bugprone-multi-level-implicit-pointer-conversion,-bugprone-misplaced-widening-cast,-bugprone-branch-clone
+TIDY_FLAGS  := -std=c11 -Iinclude -I$(INGOT_DIR)/include -iquote src -iquote server \
+               -D_DEFAULT_SOURCE -D$(BLAS_DEF) -DMYNAH_SLM_BUILD='"tidy"'
+TIDY_KERN   = $(KF_$(KERN_ARCH)_$(1)) -DMYNAH_SLM_KERN_TU=$(1) -DMYNAH_SLM_KERN_ID=$(KID_$(1))
+
+tidy:
+	$(TIDY) -checks='$(TIDY_CHECKS)' -warnings-as-errors='' \
+	  $(SRC) cli/*.c server/*.c -- $(TIDY_FLAGS)
+	$(foreach t,$(KERN_QMAT_$(KERN_ARCH)),$(TIDY) -checks='$(TIDY_CHECKS)' -warnings-as-errors='' src/qmat_kern.c -- $(TIDY_FLAGS) $(call TIDY_KERN,$(t)) &&) true
+	$(foreach t,$(KERN_ATTN_$(KERN_ARCH)),$(TIDY) -checks='$(TIDY_CHECKS)' -warnings-as-errors='' src/attn_kern.c -- $(TIDY_FLAGS) $(call TIDY_KERN,$(t)) &&) true
+	$(foreach t,$(KERN_SGEMM_$(KERN_ARCH)),$(TIDY) -checks='$(TIDY_CHECKS)' -warnings-as-errors='' src/sgemm.c -- $(TIDY_FLAGS) $(call TIDY_KERN,$(t)) &&) true
+
+# What dispatch resolved on this machine, and why. No model needed.
+dispatch: mynah-slm
+	@./mynah-slm --dispatch
 
 $(INGOT_LIB):
 	$(MAKE) -C $(INGOT_DIR) lib CC="$(CC)" CFLAGS="-O2 $(ARCH_FLAGS)"
@@ -116,7 +260,7 @@ $(OBJ): | $(INGOT_LIB)
 # test_ingot needs no model: it pins the container-layer contract (block
 # geometry, dequant coverage) so a bad subtree update fails here and not
 # three modules later.
-TESTS := tests/test_batch tests/test_ingot tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer tests/test_tools
+TESTS := tests/test_backend tests/test_forward_backend tests/test_batch tests/test_ingot tests/test_sgemm tests/test_threads tests/test_inspect tests/test_kernels tests/test_model tests/test_think tests/test_tokenizer tests/test_tools tests/test_isa tests/test_synth tests/test_http tests/test_sched tests/test_qmat_init
 
 # The parity harness is built like the others but driven separately: it dumps
 # activations, and tools/eval/compare.py is what judges them.
@@ -125,16 +269,24 @@ GOLDEN_DIR := tests/golden/it_hello
 DUMP_DIR   := build/dump/it_hello
 PROMPT     ?= Ciao! Come stai?
 
-tests/%: build/tests/%.o build/tests/npy.o $(OBJ) $(INGOT_LIB)
+# fixture_model.o is the synthetic checkpoint writer (tests/fixture_model.h):
+# linked into every test so any of them can build a model with no download.
+TEST_SUPPORT := build/tests/npy.o build/tests/fixture_model.o
+
+# The peer-gone probe lives in the server's HTTP layer; its test links it.
+tests/test_http: build/tests/test_http.o build/server/http.o $(TEST_SUPPORT) $(OBJ) $(INGOT_LIB)
+	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
+tests/%: build/tests/%.o $(TEST_SUPPORT) $(OBJ) $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
-test: $(TESTS) mynah-slm
+test: $(TESTS) mynah-slm tests/write_fixture
 	@for t in $(TESTS); do \
 	  $$t; rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP $$t: model missing"; \
 	  elif [ $$rc -ne 0 ]; then exit $$rc; fi; \
 	done
 	@./mynah-slm --version >/dev/null || exit 1
+	@bash tests/test_device.sh ./mynah-slm tests/write_fixture || exit 1
 	@python3 tools/check_plan.py || exit 1
 	@if [ -e "$(MODEL)" ]; then ./mynah-slm inspect "$(MODEL)" >/dev/null || exit 1; \
 	 else echo "SKIP inspect: $(MODEL) not found (scripts/download_model.sh --list)"; fi
@@ -159,13 +311,55 @@ bench: $(BENCH)
 	  if [ $$rc -eq 77 ]; then echo "SKIP bench: model missing (scripts/use_model.sh)"; exit 0; \
 	  else exit $$rc; fi
 
+# The same discipline on SYNTHETIC matrices of the real shapes, no checkpoint:
+# kernel before/after (K3, K4), interleaved in one process with a control row.
+# It answers "is the kernel faster here", never "is decode faster".
+BENCH_QMAT := tests/bench_qmat
+bench-qmat: $(BENCH_QMAT)
+	@$(BENCH_QMAT) all
+# One decode step for B streams, interleaved in one process: B solo steps / one
+# forward_multi step with B matvecs per weight / one with a weight-stationary
+# pass per weight (K7); `tests/bench_decode - 128 7 1,4 all` adds the qmatmat
+# arm. With no MODEL it writes a 0.6B-GEOMETRY fixture with noise weights
+# (~400 MB in TMPDIR) — real shapes, so real costs, no quality claim. Not part
+# of `test`: it measures. .work/serving-continuous-batching.md S1-c,
+# .work/batched-decode-kernel.md.
+BENCH_DECODE := tests/bench_decode
+bench-decode: $(BENCH_DECODE)
+	@if [ -e "$(MODEL)" ]; then $(BENCH_DECODE) "$(MODEL)"; else $(BENCH_DECODE) - 128 7 1,0; fi
+
+# `run --device`, model-free (also part of `test`): cpu-backend output ==
+# the default path byte for byte, the speed line names the device, and
+# --device cuda is refused with its reason when it cannot run. In a CUDA
+# build: make test-device MYNAH_SLM_BIN=build/cuda/mynah-slm
+MYNAH_SLM_BIN ?= ./mynah-slm
+test-device: mynah-slm tests/write_fixture
+	@bash tests/test_device.sh $(MYNAH_SLM_BIN) tests/write_fixture
+
 # End-to-end server checks: shape, determinism (sequential and concurrent),
 # SSE framing, and that reasoning never reaches content. Separate from `test`
 # because it spends a minute of real generation.
 test-server: mynah-slm-server
-	@sh tests/test_server.sh "$(MODEL)"; rc=$$?; \
+	@bash tests/test_server.sh "$(MODEL)"; rc=$$?; \
 	  if [ $$rc -eq 77 ]; then echo "SKIP test-server: model missing"; exit 0; \
 	  else exit $$rc; fi
+
+# No zombie work, model-free: a client that leaves (streaming, non-streaming,
+# during its prompt, while queued) stops costing CPU at the next step and the
+# next request is served at once; the connection cap answers 503 +
+# Retry-After. Writes tests/fixture_model.c's "slow" fixture (~25 MB, noise
+# weights). About a minute; Linux adds a CPU-idle check from /proc.
+test-server-cancel: mynah-slm-server tests/write_fixture
+	@bash tests/test_server_cancel.sh; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP test-server-cancel"; exit 0; else exit $$rc; fi
+
+# Continuous batching end to end (--slots 4), model-free on the "slow"
+# fixture: concurrent answers == the serialized server's, byte for byte;
+# steps really batched; first token beside 3 long streams; 503 + Retry-After
+# when slots and queue are full; leavers free their slots. ~2 minutes.
+test-server-slots: mynah-slm-server tests/write_fixture
+	@bash tests/test_server_slots.sh; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP test-server-slots"; exit 0; else exit $$rc; fi
 
 # Regenerate the oracle's reference activations. Slow (no KV cache, on purpose)
 # and only needed when the prompt or the dumped stages change.
@@ -174,6 +368,79 @@ golden-dump:
 	@mkdir -p $(GOLDEN_DIR)
 	cd tools && uv run python -m oracle.generate ../$(MODEL) \
 	  --prompt "$(PROMPT)" --dump-dir ../$(GOLDEN_DIR) -n 1
+
+# ── CUDA, opt-in ───────────────────────────────────────────────────────────
+# The default build never needs nvcc and never sees gpu/. `make cuda` builds a
+# SEPARATE tree, build/cuda/: every C source again with -DMYNAH_SLM_ENABLE_CUDA
+# (which is what lets src/backend.c reach the CUDA backend at all), plus the
+# .cu files through nvcc, linked by nvcc so the CUDA runtime comes from the
+# toolkit and no -lcuda driver library is named. Structure from mynah-tts
+# Makefile:836-922.
+#
+#   make cuda CUDA_ARCH=sm_89     the CLI and the self-test binary
+#   make cuda-test                build and run the self-test (77 = no device)
+#
+# CUDA_ARCH defaults to `native`, which asks the installed GPU — so on a
+# machine without one (every CI runner) it must be named. It is part of the
+# object ABI and goes through a stamp file: switching sm_80 -> sm_89 rebuilds
+# the .cu objects instead of silently relinking the old cubin.
+NVCC      ?= nvcc
+CUDA_ARCH ?= native
+NVCCFLAGS ?= -O2 -std=c++17
+CUDA_BUILD := build/cuda
+ifeq ($(CUDA_ARCH),native)
+  CUDA_ARCH_FLAGS := -arch=native
+else
+  CUDA_ARCH_FLAGS := -arch=$(CUDA_ARCH)
+endif
+CUDA_HDR        := $(HDR) $(wildcard gpu/cuda/*.h)
+CUDA_CU_OBJ     := $(patsubst %.cu,$(CUDA_BUILD)/%.o,$(wildcard gpu/cuda/*.cu))
+# + the per-ISA kernel TUs (src/kern.h). They carry no CUDA code, so they are
+# shared with the CPU build rather than rebuilt under build/cuda/.
+CUDA_SRC_OBJ    := $(SRC:%.c=$(CUDA_BUILD)/%.o) $(KERN_OBJ)
+# + the synthetic checkpoint writer: the self-test runs a whole decode step
+# on a fixture it writes itself (check_forward).
+CUDA_TEST_OBJ   := $(CUDA_BUILD)/gpu/cuda/self_test.o $(CUDA_BUILD)/gpu/cuda/test_cuda.o \
+                   $(CUDA_BUILD)/tests/fixture_model.o
+CUDA_ARCH_STAMP := $(CUDA_BUILD)/.cuda-arch
+
+$(CUDA_BUILD)/%.o: %.c $(CUDA_HDR) $(wildcard tests/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -DMYNAH_SLM_ENABLE_CUDA -iquote gpu/cuda -c $< -o $@
+
+# -ffp-contract=off for the HOST half of each .cu: g++ contracts a*b - c into
+# an FMA even in -std=c++17 (GCC only turns contraction off for ISO *C*), so
+# on any target with FMA (aarch64, x86 with -mfma) the host check would run a
+# different rounding than the device's __fmul_rn/__fsub_rn and the CPU's
+# gcc -std=c11 code, and stop being bitwise.
+$(CUDA_BUILD)/gpu/cuda/%.o: gpu/cuda/%.cu $(CUDA_HDR) $(CUDA_ARCH_STAMP)
+	@mkdir -p $(@D)
+	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc is required for make cuda; install the NVIDIA CUDA toolkit" >&2; exit 2; }
+	$(NVCC) $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) -Isrc -Igpu/cuda -I$(INGOT_DIR)/include -Iinclude \
+	  -Xcompiler -Wall,-Wextra,-fPIC,-ffp-contract=off -c $< -o $@
+
+.PHONY: cuda-arch-stamp-force
+cuda-arch-stamp-force:
+$(CUDA_ARCH_STAMP): cuda-arch-stamp-force
+	@mkdir -p $(@D)
+	@if test ! -f "$@" || ! grep -Fqx '$(CUDA_ARCH)' "$@"; then printf '%s\n' '$(CUDA_ARCH)' > "$@"; fi
+
+$(CUDA_SRC_OBJ) $(CUDA_TEST_OBJ) $(CUDA_BUILD)/cli/main.o: | $(INGOT_LIB)
+
+$(CUDA_BUILD)/mynah-slm: $(CUDA_SRC_OBJ) $(CUDA_BUILD)/cli/main.o $(CUDA_CU_OBJ) $(INGOT_LIB)
+	$(NVCC) $(CUDA_ARCH_FLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
+
+$(CUDA_BUILD)/test_cuda: $(CUDA_SRC_OBJ) $(CUDA_TEST_OBJ) $(CUDA_CU_OBJ) $(INGOT_LIB)
+	$(NVCC) $(CUDA_ARCH_FLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
+
+cuda: $(CUDA_BUILD)/mynah-slm $(CUDA_BUILD)/test_cuda
+	@echo "CUDA build ready ($(CUDA_ARCH)): $(CUDA_BUILD)/mynah-slm $(CUDA_BUILD)/test_cuda"
+
+# Every CUDA kernel against the CPU backend (gpu/cuda/self_test.c). Without a
+# device it says so and skips, like the model-backed tests do.
+cuda-test: $(CUDA_BUILD)/test_cuda
+	@$(CUDA_BUILD)/test_cuda; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "SKIP cuda-test: no CUDA device"; exit 0; else exit $$rc; fi
 
 # ── x86, from an arm64 laptop ──────────────────────────────────────────────
 # The AVX2 paths in src/qmat.c, src/kvcache.c and src/kernels.c would otherwise
@@ -189,14 +456,22 @@ golden-dump:
 X86_TARGET ?= x86_64-apple-macos13.3
 X86_SRC := $(SRC) $(wildcard tests/*.c)
 
+X86_CHECK = $(CC) -target $(X86_TARGET) -std=c11 -O2 -Wall -Wextra -D_DEFAULT_SOURCE -iquote src -Iinclude \
+	    -I$(INGOT_DIR)/include -DMYNAH_SLM_BUILD='"x86check"' -D$(BLAS_DEF) -DACCELERATE_NEW_LAPACK
 check-x86:
 	@mkdir -p build/x86
-	@for f in $(X86_SRC); do \
-	  $(CC) -target $(X86_TARGET) -std=c11 -O2 -Wall -Wextra -iquote src -Iinclude \
-	    -I$(INGOT_DIR)/include -DMYNAH_SLM_BUILD='"x86check"' -D$(BLAS_DEF) -DACCELERATE_NEW_LAPACK \
-	    -mavx2 -mfma -mf16c -c $$f -o build/x86/$$(basename $$f .c).avx2.o || exit 1; \
+	@for f in $(filter-out $(KERN_SRC),$(X86_SRC)); do \
+	  $(X86_CHECK) -mavx2 -mfma -mf16c -c $$f -o build/x86/$$(basename $$f .c).avx2.o || exit 1; \
 	done
-	@echo "x86-64 cross-compile OK (avx2 + fma + f16c)"
+	@# every x86 kernel TU, each with its own flags: AVX-512 included, which
+	@# Rosetta cannot run but a compiler can still check
+	@$(foreach t,$(KERN_QMAT_x86),$(X86_CHECK) $(KF_x86_$(t)) -DMYNAH_SLM_KERN_TU=$(t) \
+	  -DMYNAH_SLM_KERN_ID=$(KID_$(t)) -c src/qmat_kern.c -o build/x86/qmat_$(t).o &&) true
+	@$(foreach t,$(KERN_ATTN_x86),$(X86_CHECK) $(KF_x86_$(t)) -DMYNAH_SLM_KERN_TU=$(t) \
+	  -DMYNAH_SLM_KERN_ID=$(KID_$(t)) -c src/attn_kern.c -o build/x86/attn_$(t).o &&) true
+	@$(foreach t,$(KERN_SGEMM_x86),$(X86_CHECK) $(KF_x86_$(t)) -DMYNAH_SLM_KERN_TU=$(t) \
+	  -DMYNAH_SLM_KERN_ID=$(KID_$(t)) -c src/sgemm.c -o build/x86/sgemm_$(t).o &&) true
+	@echo "x86-64 cross-compile OK (baseline avx2 + every x86 kernel TU)"
 
 # INGOT_CAPS_ASSUME is not optional here, it is what makes this target mean
 # something. Rosetta EXECUTES AVX2 but does not advertise it in CPUID, and
@@ -262,6 +537,17 @@ asan:
 	$(MAKE) clean && $(MAKE) EXTRA_CFLAGS="$(SAN_ADD) -O1 -fsanitize=address,undefined" \
 	  EXTRA_LDFLAGS="-fsanitize=address,undefined" all test && $(MAKE) clean
 
+# The concurrency the server runs on — the first qmat dispatch from pool
+# workers (test_qmat_init), the pending queue, the scheduler loop
+# with producer threads, and the pool — under ThreadSanitizer. BLAS=none so no
+# uninstrumented vendor threads are in the process. Linux/clang or gcc.
+tsan:
+	$(MAKE) clean && $(MAKE) BLAS=none EXTRA_CFLAGS="$(SAN_ADD) -O1 -fsanitize=thread" \
+	  EXTRA_LDFLAGS="-fsanitize=thread" tests/test_qmat_init tests/test_sched tests/test_threads tests/test_synth
+	TSAN_OPTIONS=halt_on_error=1 tests/test_qmat_init && TSAN_OPTIONS=halt_on_error=1 tests/test_sched \
+	  && TSAN_OPTIONS=halt_on_error=1 tests/test_threads \
+	  && TSAN_OPTIONS=halt_on_error=1 tests/test_synth; rc=$$?; $(MAKE) clean; exit $$rc
+
 leaks: mynah-slm $(TESTS)
 	@# test_inspect is the one that allocates (the census grows by realloc and
 	@# the fixture writer holds buffers): it is the real subject here.
@@ -275,7 +561,7 @@ leaks: mynah-slm $(TESTS)
 	 else echo "SKIP leaks/inspect: $(MODEL) not found"; fi
 
 clean:
-	rm -rf build mynah-slm mynah-slm-server libmynah_slm.a libmynah_slm$(SOEXT) $(TESTS) $(PARITY) $(BENCH) dist
+	rm -rf build mynah-slm mynah-slm-server libmynah_slm.a libmynah_slm$(SOEXT) $(TESTS) $(PARITY) $(BENCH) $(BENCH_QMAT) $(BENCH_DECODE) tests/write_fixture dist
 	@# Without this, libingot.a survives a clean: update the subtree and the
 	@# next build silently links the previous library.
 	@test -d $(INGOT_DIR) && $(MAKE) -C $(INGOT_DIR) clean || true
@@ -321,4 +607,4 @@ dist: mynah-slm mynah-slm-server libmynah_slm.a
 	@echo "" && echo "-> dist/$(DIST_NAME).tar.gz"
 	@cd dist && shasum -a 256 $(DIST_NAME).tar.gz 2>/dev/null || (cd dist && sha256sum $(DIST_NAME).tar.gz)
 
-.PHONY: all help lib shared test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot
+.PHONY: tidy all help lib shared cuda cuda-test test test-parity test-server bench check-x86 test-x86-rosetta golden-dump debug ubsan asan leaks warnings clean install dist update-ingot bench-qmat dispatch bench-decode test-server-cancel tsan test-server-slots test-device

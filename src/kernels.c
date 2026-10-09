@@ -1,13 +1,17 @@
 /* kernels.c — f32 reference implementations.
  *
- * Ported in shape from qwen-tts (docs/prior-art.md), stripped of the TTS half
- * and of the SIMD for now. Correctness first: these are what the parity gate
- * judges, and a vectorized kernel that is wrong costs far more to find than a
- * scalar one that is slow. The SIMD paths land behind these same signatures.
+ * Ported in shape from qwen-tts (docs/prior-art.md), stripped of the TTS half.
+ * Correctness first: these are what the parity gate judges, and a vectorized
+ * kernel that is wrong costs far more to find than a scalar one that is slow.
+ * The attention inner loops — the only part that is vectorized, because it is
+ * the only part whose cost grows with the context — live in attn_kern.c,
+ * compiled once per ISA, and are reached through the table src/isa.c
+ * resolved (kern.h).
  *
  * SPDX-License-Identifier: MIT */
 #include "kernels.h"
 
+#include "kern.h"
 #include "kvcache.h"
 
 #include "threads.h"
@@ -17,97 +21,9 @@
 #include <string.h>
 
 /* Attention over a batch is two GEMMs per head against the KV cache — both
- * operands f32, so this is BLAS's job and not a hand-written loop's. */
-#if defined(MYNAH_SLM_BLAS_ACCELERATE)
-#include <Accelerate/Accelerate.h>
-#else
-#include <cblas.h>
-#endif
-
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#define MYNAH_SLM_NEON 1
-#elif defined(__AVX2__)
-#include <immintrin.h>
-#define MYNAH_SLM_AVX2 1
-#endif
-
-/* dot and scaled-accumulate over head_dim, the two inner loops of attention.
- *
- * Worth vectorizing and nothing else is, which took a measurement to learn:
- * at n_kv = 32 the whole non-matvec half of a decode step is 1.6 ms against
- * ~120 ms of matvec, i.e. 1.4%, and RMSNorm/RoPE/SwiGLU are a rounding error
- * inside that. Attention is the only one whose cost grows with the context,
- * and it grows fast — per token, across 28 layers:
- *
- *   n_kv    32 ->   1.4 ms      n_kv   512 ->  20 ms
- *   n_kv   128 ->   5.1 ms      n_kv  2048 -> 106 ms
- *
- * A 37 ms decode step is 4% attention at n_kv 32 and 287% at n_kv 2048. Every
- * benchmark in docs/perf.md so far used a 19-token prompt, which is precisely
- * where this does not show. Summarizing a meeting transcript is not. */
-static inline float dot_f32(const float *a, const float *b, uint32_t n) {
-#if defined(MYNAH_SLM_NEON)
-    float32x4_t s0 = vdupq_n_f32(0.0f), s1 = vdupq_n_f32(0.0f);
-    float32x4_t s2 = vdupq_n_f32(0.0f), s3 = vdupq_n_f32(0.0f);
-    uint32_t i = 0;
-    for (; i + 16 <= n; i += 16) {
-        s0 = vfmaq_f32(s0, vld1q_f32(a + i),      vld1q_f32(b + i));
-        s1 = vfmaq_f32(s1, vld1q_f32(a + i + 4),  vld1q_f32(b + i + 4));
-        s2 = vfmaq_f32(s2, vld1q_f32(a + i + 8),  vld1q_f32(b + i + 8));
-        s3 = vfmaq_f32(s3, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
-    }
-    float sum = vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3)));
-    for (; i < n; i++) sum += a[i] * b[i];
-    return sum;
-#elif defined(MYNAH_SLM_AVX2)
-    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
-    uint32_t i = 0;
-    for (; i + 16 <= n; i += 16) {
-        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
-        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), s1);
-    }
-    const __m256 t = _mm256_add_ps(s0, s1);
-    __m128 v = _mm_add_ps(_mm256_castps256_ps128(t), _mm256_extractf128_ps(t, 1));
-    v = _mm_hadd_ps(v, v);
-    v = _mm_hadd_ps(v, v);
-    float sum = _mm_cvtss_f32(v);
-    for (; i < n; i++) sum += a[i] * b[i];
-    return sum;
-#else
-    /* The scalar reference keeps a double accumulator; the vector paths above
-     * use four (NEON) or two (AVX2) f32 lanes, which is pairwise summation and
-     * so no worse in practice — the parity gate agrees, and it is the gate
-     * that decides, not the argument. */
-    double sum = 0.0;
-    for (uint32_t i = 0; i < n; i++) sum += (double)a[i] * (double)b[i];
-    return (float)sum;
-#endif
-}
-
-/* y[i] += w * x[i] */
-static inline void axpy_f32(float *y, const float *x, float w, uint32_t n) {
-#if defined(MYNAH_SLM_NEON)
-    const float32x4_t vw = vdupq_n_f32(w);
-    uint32_t i = 0;
-    for (; i + 16 <= n; i += 16) {
-        vst1q_f32(y + i,      vfmaq_f32(vld1q_f32(y + i),      vld1q_f32(x + i),      vw));
-        vst1q_f32(y + i + 4,  vfmaq_f32(vld1q_f32(y + i + 4),  vld1q_f32(x + i + 4),  vw));
-        vst1q_f32(y + i + 8,  vfmaq_f32(vld1q_f32(y + i + 8),  vld1q_f32(x + i + 8),  vw));
-        vst1q_f32(y + i + 12, vfmaq_f32(vld1q_f32(y + i + 12), vld1q_f32(x + i + 12), vw));
-    }
-    for (; i < n; i++) y[i] += w * x[i];
-#elif defined(MYNAH_SLM_AVX2)
-    const __m256 vw = _mm256_set1_ps(w);
-    uint32_t i = 0;
-    for (; i + 8 <= n; i += 8)
-        _mm256_storeu_ps(y + i, _mm256_fmadd_ps(_mm256_loadu_ps(x + i), vw,
-                                                _mm256_loadu_ps(y + i)));
-    for (; i < n; i++) y[i] += w * x[i];
-#else
-    for (uint32_t i = 0; i < n; i++) y[i] += w * x[i];
-#endif
-}
+ * operands f32, so this goes through mynah_slm_sgemm (ours, or a vendor BLAS
+ * when the build linked one) and not a hand-written loop. */
+#include "sgemm.h"
 
 /* ── allocation ───────────────────────────────────────────────────────────── */
 
@@ -294,47 +210,10 @@ void mynah_slm_add(float *y, const float *x, size_t n) {
 void mynah_slm_attention(float *out, const float *q, const float *k, const float *v,
                          uint32_t n_kv, uint32_t n_heads, uint32_t n_kv_heads,
                          uint32_t head_dim, float scale, float *scratch) {
-    const uint32_t group   = n_heads / n_kv_heads;
-    const uint32_t kv_dim  = n_kv_heads * head_dim;
-
-    for (uint32_t h = 0; h < n_heads; h++) {
-        const float   *qh  = q + (size_t)h * head_dim;
-        const uint32_t kvh = h / group;
-
-        for (uint32_t t = 0; t < n_kv; t++)
-            scratch[t] = dot_f32(qh, k + (size_t)t * kv_dim + (size_t)kvh * head_dim,
-                                 head_dim) * scale;
-        mynah_slm_softmax(scratch, n_kv);
-
-        float *oh = out + (size_t)h * head_dim;
-        memset(oh, 0, head_dim * sizeof *oh);
-        for (uint32_t t = 0; t < n_kv; t++)
-            axpy_f32(oh, v + (size_t)t * kv_dim + (size_t)kvh * head_dim,
-                     scratch[t], head_dim);
-    }
-}
-
-/* One head of the loop above, factored out so it can be a task. */
-static void attention_head(float *out, const float *q, const float *k, const float *v,
-                           uint32_t h, uint32_t n_kv, uint32_t n_heads,
-                           uint32_t n_kv_heads, uint32_t head_dim, float scale,
-                           float *scratch) {
-    const uint32_t group  = n_heads / n_kv_heads;
-    const uint32_t kv_dim = n_kv_heads * head_dim;
-
-    const float   *qh  = q + (size_t)h * head_dim;
-    const uint32_t kvh = h / group;
-
-    for (uint32_t t = 0; t < n_kv; t++)
-        scratch[t] = dot_f32(qh, k + (size_t)t * kv_dim + (size_t)kvh * head_dim,
-                             head_dim) * scale;
-    mynah_slm_softmax(scratch, n_kv);
-
-    float *oh = out + (size_t)h * head_dim;
-    memset(oh, 0, head_dim * sizeof *oh);
-    for (uint32_t t = 0; t < n_kv; t++)
-        axpy_f32(oh, v + (size_t)t * kv_dim + (size_t)kvh * head_dim,
-                 scratch[t], head_dim);
+    const mynah_slm_attn_kern *a = mynah_slm_kern_attn();
+    for (uint32_t h = 0; h < n_heads; h++)
+        a->f32_head(out, q, k, v, h, n_kv, n_heads, n_kv_heads, head_dim, scale,
+                    scratch);
 }
 
 typedef struct {
@@ -346,9 +225,9 @@ typedef struct {
 
 static void attn_task(void *ctx, int i) {
     attn_job *j = ctx;
-    attention_head(j->out, j->q, j->k, j->v, (uint32_t)i, j->n_kv,
-                   j->n_heads, j->n_kv_heads, j->head_dim, j->scale,
-                   j->scratch + (size_t)i * j->n_kv);
+    mynah_slm_kern_attn()->f32_head(j->out, j->q, j->k, j->v, (uint32_t)i, j->n_kv,
+                                    j->n_heads, j->n_kv_heads, j->head_dim, j->scale,
+                                    j->scratch + (size_t)i * j->n_kv);
 }
 
 void mynah_slm_attention_mt(float *out, const float *q, const float *k, const float *v,
@@ -367,7 +246,7 @@ void mynah_slm_attention_batch(float *out, const float *q,
     const uint32_t kv_dim = n_kv_heads * head_dim;
     const uint32_t n_kv   = pos0 + n_q;
 
-    /* Heads run one after another and BLAS threads inside each, rather than one
+    /* Heads run one after another and the GEMM threads inside each, rather than one
      * head per pool thread: a per-head scores buffer would be n_q * n_kv floats
      * EACH, which at a 2000-token prompt is 19 MB of scratch to save a
      * dispatch. The sgemms here are large enough to keep the cores busy on
@@ -380,11 +259,10 @@ void mynah_slm_attention_batch(float *out, const float *q,
          * Both operands are STRIDED views, not copies: a query row is
          * q_stride apart and a cached position is kv_dim apart, and the head's
          * slice sits inside each. lda/ldb say so, so nothing is gathered. */
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    (int)n_q, (int)n_kv, (int)head_dim, scale,
-                    q + (size_t)h * head_dim, (int)q_stride,
-                    k + (size_t)kvh * head_dim, (int)kv_dim,
-                    0.0f, scores, (int)n_kv);
+        mynah_slm_sgemm(1, n_q, n_kv, head_dim, scale,
+                        q + (size_t)h * head_dim, q_stride,
+                        k + (size_t)kvh * head_dim, kv_dim,
+                        0.0f, scores, n_kv);
 
         for (uint32_t t = 0; t < n_q; t++) {
             float *row = scores + (size_t)t * n_kv;
@@ -396,11 +274,10 @@ void mynah_slm_attention_batch(float *out, const float *q,
             memset(row + len, 0, (size_t)(n_kv - len) * sizeof *row);
         }
 
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    (int)n_q, (int)head_dim, (int)n_kv, 1.0f,
-                    scores, (int)n_kv,
-                    v + (size_t)kvh * head_dim, (int)kv_dim,
-                    0.0f, out + (size_t)h * head_dim, (int)q_stride);
+        mynah_slm_sgemm(0, n_q, head_dim, n_kv, 1.0f,
+                        scores, n_kv,
+                        v + (size_t)kvh * head_dim, kv_dim,
+                        0.0f, out + (size_t)h * head_dim, q_stride);
     }
 }
 
@@ -414,24 +291,25 @@ typedef struct {
     float scale;
 } attn_kv_job;
 
+/* One head over a packed cache, factored out so the single-sequence and the
+ * multi-sequence forms run the same code. */
+static void attention_kv_head(float *out, const float *q, const mynah_slm_kv *cache,
+                              uint32_t layer, uint32_t h, uint32_t n_kv,
+                              uint32_t n_heads, uint32_t n_kv_heads,
+                              uint32_t head_dim, float scale, float *scores) {
+    /* The per-head body is the ISA-dispatched kernel (src/attn_kern.c), the
+     * same one the single-sequence path ran before this was factored out. */
+    const uint32_t group = n_heads / n_kv_heads;
+    mynah_slm_kern_attn()->kv_head(out + (size_t)h * head_dim,
+                                   q + (size_t)h * head_dim, cache,
+                                   layer, h / group, n_kv, scale, scores);
+}
+
 static void attn_kv_task(void *ctx, int i) {
     attn_kv_job *j = ctx;
-    const uint32_t h = (uint32_t)i;
-    const uint32_t group = j->n_heads / j->n_kv_heads;
-    const uint32_t kvh = h / group;
-    const float scale = j->scale;
-
-    const float *qh = j->q + (size_t)h * j->head_dim;
-    float *scores = j->scratch + (size_t)h * j->n_kv;
-
-    for (uint32_t t = 0; t < j->n_kv; t++)
-        scores[t] = mynah_slm_kv_dot_k(j->cache, j->layer, t, kvh, qh) * scale;
-    mynah_slm_softmax(scores, j->n_kv);
-
-    float *oh = j->out + (size_t)h * j->head_dim;
-    memset(oh, 0, j->head_dim * sizeof *oh);
-    for (uint32_t t = 0; t < j->n_kv; t++)
-        mynah_slm_kv_axpy_v(j->cache, j->layer, t, kvh, scores[t], oh);
+    attention_kv_head(j->out, j->q, j->cache, j->layer, (uint32_t)i, j->n_kv,
+                      j->n_heads, j->n_kv_heads, j->head_dim, j->scale,
+                      j->scratch + (size_t)i * j->n_kv);
 }
 
 void mynah_slm_attention_kv_mt(float *out, const float *q,
@@ -465,11 +343,10 @@ void mynah_slm_attention_kv_batch(float *out, const float *q,
             gathered = kvh;
         }
 
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    (int)n_q, (int)n_kv, (int)head_dim, scale,
-                    q + (size_t)h * head_dim, (int)q_stride,
-                    kscratch, (int)head_dim,
-                    0.0f, scores, (int)n_kv);
+        mynah_slm_sgemm(1, n_q, n_kv, head_dim, scale,
+                        q + (size_t)h * head_dim, q_stride,
+                        kscratch, head_dim,
+                        0.0f, scores, n_kv);
 
         for (uint32_t t = 0; t < n_q; t++) {
             float *row = scores + (size_t)t * n_kv;
@@ -478,9 +355,40 @@ void mynah_slm_attention_kv_batch(float *out, const float *q,
             memset(row + len, 0, (size_t)(n_kv - len) * sizeof *row);
         }
 
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    (int)n_q, (int)head_dim, (int)n_kv, 1.0f,
-                    scores, (int)n_kv, vscratch, (int)head_dim,
-                    0.0f, out + (size_t)h * head_dim, (int)q_stride);
+        mynah_slm_sgemm(0, n_q, head_dim, n_kv, 1.0f,
+                        scores, n_kv, vscratch, head_dim,
+                        0.0f, out + (size_t)h * head_dim, q_stride);
     }
+}
+
+/* ── attention for several sequences, one query each ─────────────────────── */
+
+typedef struct {
+    const mynah_slm_attn_seq *seqs;
+    uint32_t n_heads, n_kv_heads, head_dim;
+    float scale;
+} attn_multi_job;
+
+/* Task i is head (i % n_heads) of sequence (i / n_heads): the same per-head
+ * code, the same per-head scratch slice, the same arguments as that
+ * sequence's own _mt call would pass. */
+static void attn_multi_task(void *ctx, int i) {
+    const attn_multi_job *j = ctx;
+    const mynah_slm_attn_seq *s = &j->seqs[(uint32_t)i / j->n_heads];
+    const uint32_t h = (uint32_t)i % j->n_heads;
+    float *scratch = s->scratch + (size_t)h * s->n_kv;
+    if (s->k)
+        mynah_slm_kern_attn()->f32_head(s->out, s->q, s->k, s->v, h, s->n_kv, j->n_heads,
+                                        j->n_kv_heads, j->head_dim, j->scale, scratch);
+    else
+        attention_kv_head(s->out, s->q, (const mynah_slm_kv *)s->cache, s->layer, h,
+                          s->n_kv, j->n_heads, j->n_kv_heads, j->head_dim,
+                          j->scale, scratch);
+}
+
+void mynah_slm_attention_multi(const mynah_slm_attn_seq *seqs, uint32_t n_seq,
+                               uint32_t n_heads, uint32_t n_kv_heads,
+                               uint32_t head_dim, float scale) {
+    attn_multi_job j = { seqs, n_heads, n_kv_heads, head_dim, scale };
+    mynah_slm_parallel_for((int)(n_seq * n_heads), attn_multi_task, &j);
 }

@@ -30,6 +30,7 @@ jobs:
           - runner: ubuntu-latest
             name: linux-x86_64 (native)
             extra: ''
+            blas: auto
           # src/kernels.c is NEON / AVX2 / scalar. On a hosted x86 runner the
           # default -march=native always picks AVX2, so the scalar fallback —
           # the path any older CPU takes — would never once be compiled, let
@@ -37,12 +38,27 @@ jobs:
           - runner: ubuntu-latest
             name: linux-x86_64 (no AVX2, scalar fallback)
             extra: '-march=x86-64-v2'
+            blas: auto
           - runner: ubuntu-24.04-arm
             name: linux-aarch64 (neon)
             extra: ''
+            blas: auto
           - runner: macos-latest
             name: macos-arm64 (accelerate)
             extra: ''
+            blas: auto
+          # BLAS=none: our src/sgemm.c and NO vendor BLAS — the OpenBLAS
+          # package is deliberately not installed, so a stray cblas include or
+          # -lopenblas fails here instead of on a user's minimal machine.
+          # x86 and aarch64, because the GEMM micro-kernels differ by ISA.
+          - runner: ubuntu-latest
+            name: linux-x86_64 (BLAS=none, no vendor BLAS)
+            extra: ''
+            blas: none
+          - runner: ubuntu-24.04-arm
+            name: linux-aarch64 (BLAS=none, no vendor BLAS)
+            extra: ''
+            blas: none
 
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.name }}
@@ -52,7 +68,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install OpenBLAS (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.blas != 'none'
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
 
       # EXTRA_CFLAGS, never CFLAGS=. A command-line CFLAGS overrides everything
@@ -60,13 +76,13 @@ jobs:
       # -DMYNAH_SLM_BUILD='"..."' — and the build stops compiling. EXTRA_CFLAGS
       # is appended last, so a later -march still wins over -march=native.
       - name: Build CLI and server
-        run: make EXTRA_CFLAGS="${{ matrix.extra }}"
+        run: make BLAS=${{ matrix.blas }} EXTRA_CFLAGS="${{ matrix.extra }}"
 
       - name: Tests (model-dependent cases report SKIP)
-        run: make test EXTRA_CFLAGS="${{ matrix.extra }}"
+        run: make test BLAS=${{ matrix.blas }} EXTRA_CFLAGS="${{ matrix.extra }}"
 
       - name: Static and shared library
-        run: make lib shared EXTRA_CFLAGS="${{ matrix.extra }}"
+        run: make lib shared BLAS=${{ matrix.blas }} EXTRA_CFLAGS="${{ matrix.extra }}"
 
       - name: Binaries answer
         run: |
@@ -78,8 +94,67 @@ jobs:
       # somebody else's build.
       - name: Install into a staging prefix
         run: |
-          make install DESTDIR="$PWD/staging" PREFIX=/usr
+          make install BLAS=${{ matrix.blas }} DESTDIR="$PWD/staging" PREFIX=/usr
           test -x staging/usr/bin/mynah-slm
           test -x staging/usr/bin/mynah-slm-server
           test -f staging/usr/lib/libmynah_slm.a
           test -f staging/usr/include/mynah_slm.h
+
+  # ------------------------------------------------------------------ GPU
+  #
+  # COMPILE ONLY. No GPU exists on these runners, and nothing here proves a
+  # kernel correct, fast, or even that it launches. It proves the CUDA sources
+  # still compile and the CUDA build still links — the thing that rots
+  # silently when nobody builds it (mynah-tts found a link error on this job's
+  # first run). Pattern from mynah-tts build.yml.
+  #
+  # It also runs the self-test binary, which must (1) pass its HOST half —
+  # the kernels' __host__ __device__ block decode, bf16 rounding and RoPE
+  # mapping executed on the CPU against ingot and src/ — and (2) report "no
+  # CUDA device" and exit 77 instead of crashing. Device parity is
+  # downstream, on a real GPU: `make cuda-test CUDA_ARCH=sm_89`.
+  cuda-compile:
+    name: "compile-only: CUDA ${{ matrix.arch }} (no GPU)"
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.6.2-devel-ubuntu24.04
+    timeout-minutes: 20
+    env:
+      # apt in a bare container: no debconf prompt may block the job.
+      DEBIAN_FRONTEND: noninteractive
+    strategy:
+      fail-fast: false
+      matrix:
+        # Ampere (A100), Ada (L4 / L40S), Hopper. CUDA_ARCH must be named:
+        # the Makefile's default `native` asks the installed GPU, and there
+        # is none.
+        arch: [sm_80, sm_89, sm_90]
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential git ca-certificates
+          nvcc --version
+
+      - uses: actions/checkout@v7
+
+      # The container runs as root over a checkout owned by the runner user,
+      # so git refuses the repository ("dubious ownership") and the
+      # Makefile's `git describe` build stamp comes out empty.
+      - name: Trust the checkout for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # BLAS=none: no vendor package to install in the container, and the
+      # CUDA build does not care which CPU GEMM the reference path links.
+      - name: Compile and link the CUDA build
+        run: make cuda CUDA_ARCH=${{ matrix.arch }} BLAS=none
+
+      - name: Self-test binary runs its host half and refuses cleanly without a GPU
+        run: |
+          set +e
+          ./build/cuda/test_cuda > selftest.txt 2>&1
+          rc=$?
+          set -e
+          cat selftest.txt
+          if grep -q '^FAIL' selftest.txt; then echo 'a self-test check failed' >&2; exit 1; fi
+          grep -q 'no CUDA device' selftest.txt
+          test "$rc" -eq 77
